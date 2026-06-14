@@ -45,6 +45,24 @@ jobs:
       - name: Test (C++ gtests + Python plugin)
         run: ctest --test-dir build --output-on-failure -j
 
+  rdma-compile:
+    name: RDMA build (compile-check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install deps incl. RDMA dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ git ca-certificates libibverbs-dev librdmacm-dev
+      - name: Configure + build with DFKV_WITH_RDMA=ON (no device at runtime)
+        run: |
+          cmake -S . -B build-rdma -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DDFKV_WITH_RDMA=ON -DDFKV_BUILD_TESTS=OFF
+          cmake --build build-rdma -j
+      - name: Verify ibverbs/rdmacm linked
+        run: ldd build-rdma/dfkv_server | grep -E 'ibverbs|rdmacm'
+
   portable-static-build:
     name: portable static artifacts
     runs-on: ubuntu-latest

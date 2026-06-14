@@ -9,8 +9,14 @@
 #include <cstring>
 #include <string>
 
+#include <memory>
+#include <vector>
+
 #include "kv_node_server.h"
 #include "log.h"
+#ifdef DFKV_WITH_RDMA
+#include "rdma_server.h"
+#endif
 
 using dfkv::KvNodeServer;
 using dfkv::Status;
@@ -20,13 +26,15 @@ static void OnSig(int) { g_stop = 1; }
 
 int main(int argc, char** argv) {
   std::string dir = "/tmp/dfkv_node";
-  int port = 0;
+  int port = 0, rdma_port = -1;
   unsigned long long cap = 1ull << 30;
   for (int i = 1; i + 1 < argc; i += 2) {
     if (!std::strcmp(argv[i], "--dir")) dir = argv[i + 1];
     else if (!std::strcmp(argv[i], "--port")) port = std::atoi(argv[i + 1]);
     else if (!std::strcmp(argv[i], "--cap")) cap = std::strtoull(argv[i + 1], nullptr, 10);
+    else if (!std::strcmp(argv[i], "--rdma-port")) rdma_port = std::atoi(argv[i + 1]);
   }
+  (void)rdma_port;
   std::signal(SIGINT, OnSig);
   std::signal(SIGTERM, OnSig);
 
@@ -47,8 +55,27 @@ int main(int argc, char** argv) {
   std::printf("PORT %d\n", srv.port());
   std::fflush(stdout);
   DFKV_LOG_INFO("dfkv_server listening on port " + std::to_string(srv.port()) + ", dir=" + dir);
+
+#ifdef DFKV_WITH_RDMA
+  std::unique_ptr<dfkv::RdmaServer> rsrv;
+  if (rdma_port >= 0) {
+    rsrv = std::make_unique<dfkv::RdmaServer>(
+        [&srv](uint8_t op, uint64_t id, uint32_t idx, uint32_t ks, uint64_t off,
+               uint64_t len, const char* pl, uint64_t pll, std::string* out) {
+          return srv.ProcessRequest(op, id, idx, ks, off, len, pl, pll, out);
+        });
+    if (rsrv->Start(rdma_port) == Status::kOk)
+      DFKV_LOG_INFO("dfkv_server RDMA listening on port " + std::to_string(rsrv->port()));
+    else
+      DFKV_LOG_WARN("dfkv_server RDMA listener failed to start (no device?)");
+  }
+#endif
+
   while (!g_stop) { struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); }
   DFKV_LOG_INFO("dfkv_server shutting down");
+#ifdef DFKV_WITH_RDMA
+  if (rsrv) rsrv->Stop();
+#endif
   srv.Stop();
   return 0;
 }

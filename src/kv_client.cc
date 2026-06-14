@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "key_map.h"
-#include "tcp_transport.h"
+#include "transport_factory.h"
 
 namespace dfkv {
 
@@ -36,7 +36,7 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
   if (transport) {
     t_ = transport;
   } else {
-    owned_ = std::make_unique<TcpTransport>();
+    owned_ = MakeClientTransport();  // RDMA if available+requested, else TCP
     t_ = owned_.get();
   }
 }

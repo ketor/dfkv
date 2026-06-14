@@ -12,26 +12,42 @@ add_compile_options(-Wall -Wextra)
 
 option(DFKV_BUILD_TESTS "Build dfkv tests" ON)
 option(DFKV_STATIC_LIBSTDCXX "Statically link libstdc++/libgcc for portable artifacts" OFF)
+option(DFKV_WITH_RDMA "Build the RDMA transport (needs libibverbs + librdmacm)" OFF)
 if(DFKV_STATIC_LIBSTDCXX)
   add_link_options(-static-libstdc++ -static-libgcc)
 endif()
 
-# --- portable core library (everything in src/ except the *_main.cc entrypoints) ---
+# --- portable core library (everything in src/ except *_main.cc + gated rdma) ---
 file(GLOB DFKV_SRCS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc)
 list(REMOVE_ITEM DFKV_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_server_main.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_smoke_main.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkvctl_main.cc)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkvctl_main.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_transport.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_server.cc)
+if(DFKV_WITH_RDMA)
+  list(APPEND DFKV_SRCS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_transport.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_server.cc)
+endif()
 
 add_library(dfkv_core STATIC ${DFKV_SRCS})
 target_include_directories(dfkv_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 find_package(Threads REQUIRED)
 target_link_libraries(dfkv_core PUBLIC Threads::Threads)
+if(DFKV_WITH_RDMA)
+  target_compile_definitions(dfkv_core PUBLIC DFKV_WITH_RDMA)
+  target_link_libraries(dfkv_core PUBLIC ibverbs rdmacm)
+endif()
 
 # C ABI shared lib for the Python (ctypes) plugin
 add_library(dfkv SHARED ${DFKV_SRCS})
 target_include_directories(dfkv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dfkv PUBLIC Threads::Threads)
+if(DFKV_WITH_RDMA)
+  target_compile_definitions(dfkv PUBLIC DFKV_WITH_RDMA)
+  target_link_libraries(dfkv PUBLIC ibverbs rdmacm)
+endif()
 
 # standalone cache-node daemon + CLI tools
 add_executable(dfkv_server ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_server_main.cc)

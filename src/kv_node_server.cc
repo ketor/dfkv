@@ -94,51 +94,57 @@ void KvNodeServer::AcceptLoop() {
   }
 }
 
+// Transport-agnostic request processing + metrics (shared by TCP and RDMA).
+Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
+                                    uint32_t ksize, uint64_t offset,
+                                    uint64_t length, const char* payload,
+                                    uint64_t payload_len, std::string* out_data) {
+  WireOp op = static_cast<WireOp>(op_raw);
+  BlockKey key{id, index, ksize};
+  Status st = Status::kInvalid;
+  switch (op) {
+    case WireOp::kCache:
+      st = group_.Cache(key, payload, payload_len);
+      if (st == Status::kOk) {
+        cache_put_.fetch_add(1, std::memory_order_relaxed);
+        bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
+      }
+      break;
+    case WireOp::kRange:
+      st = group_.Range(key, offset, length, out_data);
+      if (st == Status::kOk) {
+        cache_hit_.fetch_add(1, std::memory_order_relaxed);
+        bytes_read_.fetch_add(out_data->size(), std::memory_order_relaxed);
+      } else if (st == Status::kNotFound) {
+        cache_miss_.fetch_add(1, std::memory_order_relaxed);
+      }
+      break;
+    case WireOp::kExist:
+      if (group_.IsCached(key)) { st = Status::kOk; exist_hit_.fetch_add(1, std::memory_order_relaxed); }
+      else { st = Status::kNotFound; exist_miss_.fetch_add(1, std::memory_order_relaxed); }
+      break;
+    case WireOp::kStats:
+      *out_data = MetricsText();
+      st = Status::kOk;
+      break;
+  }
+  return st;
+}
+
 // Keep-alive: serve requests on this connection until the peer closes it.
 void KvNodeServer::Handle(int fd) {
   while (running_) {
     char prefix[kReqPrefix];
     if (!net::ReadAll(fd, prefix, kReqPrefix)) return;  // peer closed / error
-    WireOp op = static_cast<WireOp>(static_cast<uint8_t>(prefix[0]));
-    BlockKey key;
-    key.id = net::GetU64(prefix + 1);
-    key.index = net::GetU32(prefix + 9);
-    key.size = net::GetU32(prefix + 13);
-    uint64_t offset = net::GetU64(prefix + 17);
-    uint64_t length = net::GetU64(prefix + 25);
     uint64_t payload_len = net::GetU64(prefix + 33);
-
     std::vector<char> payload(payload_len);
     if (payload_len && !net::ReadAll(fd, payload.data(), payload_len)) return;
 
-    Status st = Status::kInvalid;
     std::string data;
-    switch (op) {
-      case WireOp::kCache:
-        st = group_.Cache(key, payload.data(), payload_len);
-        if (st == Status::kOk) {
-          cache_put_.fetch_add(1, std::memory_order_relaxed);
-          bytes_written_.fetch_add(payload_len, std::memory_order_relaxed);
-        }
-        break;
-      case WireOp::kRange:
-        st = group_.Range(key, offset, length, &data);
-        if (st == Status::kOk) {
-          cache_hit_.fetch_add(1, std::memory_order_relaxed);
-          bytes_read_.fetch_add(data.size(), std::memory_order_relaxed);
-        } else if (st == Status::kNotFound) {
-          cache_miss_.fetch_add(1, std::memory_order_relaxed);
-        }
-        break;
-      case WireOp::kExist:
-        if (group_.IsCached(key)) { st = Status::kOk; exist_hit_.fetch_add(1, std::memory_order_relaxed); }
-        else { st = Status::kNotFound; exist_miss_.fetch_add(1, std::memory_order_relaxed); }
-        break;
-      case WireOp::kStats:
-        data = MetricsText();
-        st = Status::kOk;
-        break;
-    }
+    Status st = ProcessRequest(
+        static_cast<uint8_t>(prefix[0]), net::GetU64(prefix + 1),
+        net::GetU32(prefix + 9), net::GetU32(prefix + 13), net::GetU64(prefix + 17),
+        net::GetU64(prefix + 25), payload.data(), payload_len, &data);
 
     char rp[kRespPrefix];
     rp[0] = static_cast<char>(st);

@@ -43,6 +43,12 @@ class KvNodeServer {
   size_t m_exist_miss() const { return exist_miss_.load(std::memory_order_relaxed); }
   std::string MetricsText() const;  // Prometheus text format
 
+  // Transport-agnostic request processing (shared by the TCP handler and, when
+  // built with DFKV_WITH_RDMA, the RDMA handler). Returns status; fills out_data.
+  Status ProcessRequest(uint8_t op, uint64_t id, uint32_t index, uint32_t ksize,
+                        uint64_t offset, uint64_t length, const char* payload,
+                        uint64_t payload_len, std::string* out_data);
+
  private:
   void AcceptLoop();
   void Handle(int fd);
