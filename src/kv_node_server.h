@@ -8,6 +8,8 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,6 +33,7 @@ class KvNodeServer {
   size_t Count() const { return group_.Count(); }
   uint64_t UsedBytes() const { return group_.UsedBytes(); }
   size_t DiskCount() const { return group_.DiskCount(); }
+  size_t AcceptCount() const { return accept_count_.load(std::memory_order_relaxed); }
 
  private:
   void AcceptLoop();
@@ -40,7 +43,13 @@ class KvNodeServer {
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> running_{false};
+  std::atomic<size_t> accept_count_{0};
   std::thread accept_thread_;
+  // connection drain: track per-connection handler threads + their fds so Stop()
+  // can unblock (shutdown) and join them before group_ is destroyed.
+  std::mutex conn_mu_;
+  std::set<int> conn_fds_;
+  std::vector<std::thread> conn_threads_;
 };
 
 }  // namespace dfkv

@@ -1,20 +1,39 @@
 #ifndef DFKV_TCP_TRANSPORT_H_
 #define DFKV_TCP_TRANSPORT_H_
 
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include "transport.h"
 
 namespace dfkv {
 
-// One short-lived TCP connection per call (simple, correct; the real build
-// uses brpc connection pooling).
+// TCP transport with a per-node connection pool (keep-alive). Idle connections
+// are reused; a stale pooled connection is transparently re-dialed once.
+// Thread-safe.
 class TcpTransport : public Transport {
  public:
+  TcpTransport() = default;
+  ~TcpTransport() override;
+
   Status Cache(const std::string& node, const BlockKey& key, const void* data,
                size_t len) override;
   Status Range(const std::string& node, const BlockKey& key, uint64_t offset,
                uint64_t length, std::string* out) override;
   Status Exist(const std::string& node, const BlockKey& key,
                bool* exist) override;
+
+ private:
+  Status RoundTrip(const std::string& node, WireOp op, const BlockKey& key,
+                   uint64_t offset, uint64_t length, const void* payload,
+                   uint64_t payload_len, std::string* out);
+  int Acquire(const std::string& node, bool* from_pool);
+  void Release(const std::string& node, int fd);
+
+  std::mutex mu_;
+  std::unordered_map<std::string, std::vector<int>> pool_;  // node -> idle fds
 };
 
 }  // namespace dfkv
