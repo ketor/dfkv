@@ -22,7 +22,7 @@ jobs:
     env:
       CXX: ${{ matrix.compiler }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install build & test deps
         run: |
@@ -31,7 +31,7 @@ jobs:
             cmake ninja-build g++ clang python3 python3-numpy git ca-certificates
 
       - name: Cache FetchContent (googletest)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: build/_deps
           key: deps-${{ runner.os }}-${{ matrix.compiler }}-gtest-1.12.1
@@ -49,7 +49,7 @@ jobs:
     name: portable static artifacts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install deps
         run: |
           sudo apt-get update
@@ -64,7 +64,7 @@ jobs:
           ldd build-static/dfkv_server || true
           ls -la build-static/dfkv_server build-static/libdfkv.so
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dfkv-linux-x86_64
           path: |
