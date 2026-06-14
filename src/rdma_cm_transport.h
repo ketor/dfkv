@@ -1,14 +1,9 @@
-/* RDMA client transport — native libibverbs RC, two-sided SEND/RECV.
- * Built only when DFKV_WITH_RDMA is defined. Mirrors the TCP wire frames so the
- * server request logic is shared. Connection-pooled per node.
- *
- * Device is selected BY NAME (env DFKV_RDMA_DEV, e.g. "ib7s400p0"), not by IP,
- * so the data plane can ride a 400G IB fabric that has no IP and is separate
- * from the IP network. The QP is bootstrapped over a small TCP channel to the
- * node's member address (an IP on the shared 200G/bond0 network). See
- * rdma_verbs.h for the control-plane/data-plane split rationale. */
-#ifndef DFKV_RDMA_TRANSPORT_H_
-#define DFKV_RDMA_TRANSPORT_H_
+/* RDMA client transport (RC, two-sided SEND/RECV via librdmacm). Built only when
+ * DFKV_WITH_RDMA is defined. Mirrors the TCP wire frames so the server logic is
+ * shared. Connection-pooled per node. Verified to COMPILE against libibverbs/
+ * librdmacm; runtime verification pending RDMA hardware. */
+#ifndef DFKV_RDMA_CM_TRANSPORT_H_
+#define DFKV_RDMA_CM_TRANSPORT_H_
 
 #include <cstddef>
 #include <mutex>
@@ -20,13 +15,12 @@
 
 namespace dfkv {
 
-class RdmaTransport : public Transport {
+class RdmaCmTransport : public Transport {
  public:
   static bool Available();  // true if at least one RDMA device is present
 
-  // dev_name empty => env DFKV_RDMA_DEV, else first device.
-  explicit RdmaTransport(size_t max_msg = (8u << 20), const std::string& dev_name = "");
-  ~RdmaTransport() override;
+  explicit RdmaCmTransport(size_t max_msg = (8u << 20));
+  ~RdmaCmTransport() override;
 
   Status Cache(const std::string& node, const BlockKey& key, const void* data,
                size_t len) override;
@@ -47,9 +41,8 @@ class RdmaTransport : public Transport {
   std::mutex mu_;
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
   size_t max_msg_;
-  std::string dev_name_;
 };
 
 }  // namespace dfkv
 
-#endif  // DFKV_RDMA_TRANSPORT_H_
+#endif  // DFKV_RDMA_CM_TRANSPORT_H_

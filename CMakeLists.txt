@@ -24,12 +24,18 @@ list(REMOVE_ITEM DFKV_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_smoke_main.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkvctl_main.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/src/dfkv_bench_main.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_verbs.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_transport.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_server.cc)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_server.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_cm_transport.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_cm_server.cc)
 if(DFKV_WITH_RDMA)
   list(APPEND DFKV_SRCS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_verbs.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_transport.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_server.cc)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_server.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_cm_transport.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/rdma_cm_server.cc)
 endif()
 
 add_library(dfkv_core STATIC ${DFKV_SRCS})

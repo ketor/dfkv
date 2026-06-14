@@ -26,6 +26,7 @@ static void OnSig(int) { g_stop = 1; }
 
 int main(int argc, char** argv) {
   std::string dir = "/tmp/dfkv_node";
+  std::string rdma_dev;
   int port = 0, rdma_port = -1;
   unsigned long long cap = 1ull << 30;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -33,6 +34,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--port")) port = std::atoi(argv[i + 1]);
     else if (!std::strcmp(argv[i], "--cap")) cap = std::strtoull(argv[i + 1], nullptr, 10);
     else if (!std::strcmp(argv[i], "--rdma-port")) rdma_port = std::atoi(argv[i + 1]);
+    else if (!std::strcmp(argv[i], "--rdma-dev")) rdma_dev = argv[i + 1];
   }
   (void)rdma_port;
   std::signal(SIGINT, OnSig);
@@ -63,9 +65,12 @@ int main(int argc, char** argv) {
         [&srv](uint8_t op, uint64_t id, uint32_t idx, uint32_t ks, uint64_t off,
                uint64_t len, const char* pl, uint64_t pll, std::string* out) {
           return srv.ProcessRequest(op, id, idx, ks, off, len, pl, pll, out);
-        });
+        },
+        /*max_msg=*/8u << 20, rdma_dev);
     if (rsrv->Start(rdma_port) == Status::kOk)
-      DFKV_LOG_INFO("dfkv_server RDMA listening on port " + std::to_string(rsrv->port()));
+      DFKV_LOG_INFO("dfkv_server RDMA listening (TCP bootstrap) on port " +
+                    std::to_string(rsrv->port()) +
+                    (rdma_dev.empty() ? "" : ", dev=" + rdma_dev));
     else
       DFKV_LOG_WARN("dfkv_server RDMA listener failed to start (no device?)");
   }

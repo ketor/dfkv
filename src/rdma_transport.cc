@@ -1,11 +1,12 @@
 #include "rdma_transport.h"
 
-#include <rdma/rdma_cma.h>
-#include <rdma/rdma_verbs.h>
+#include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 
-#include "net_util.h"  // EncodePrefix-style codec (PutU64/GetU64)
+#include "net_util.h"     // Dial / WriteAll / ReadAll / Put*/Get*
+#include "rdma_verbs.h"   // RcEndpoint, QpInfo
 
 namespace dfkv {
 
@@ -23,12 +24,7 @@ void EncodePrefix(char* p, WireOp op, const BlockKey& k, uint64_t offset,
 }  // namespace
 
 struct RdmaTransport::Conn {
-  rdma_cm_id* id = nullptr;
-  char* sbuf = nullptr;
-  char* rbuf = nullptr;
-  ibv_mr* smr = nullptr;
-  ibv_mr* rmr = nullptr;
-  size_t cap = 0;
+  rdma::RcEndpoint ep;
 };
 
 bool RdmaTransport::Available() {
@@ -38,7 +34,13 @@ bool RdmaTransport::Available() {
   return n > 0;
 }
 
-RdmaTransport::RdmaTransport(size_t max_msg) : max_msg_(max_msg) {}
+RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
+    : max_msg_(max_msg), dev_name_(dev_name) {
+  if (dev_name_.empty()) {
+    const char* e = std::getenv("DFKV_RDMA_DEV");
+    if (e && *e) dev_name_ = e;
+  }
+}
 
 RdmaTransport::~RdmaTransport() {
   std::lock_guard<std::mutex> lk(mu_);
@@ -46,21 +48,7 @@ RdmaTransport::~RdmaTransport() {
     for (Conn* c : cs) Destroy(c);
 }
 
-void RdmaTransport::Destroy(Conn* c) {
-  if (!c) return;
-  if (c->smr) ibv_dereg_mr(c->smr);
-  if (c->rmr) ibv_dereg_mr(c->rmr);
-  // NOTE: do NOT call rdma_disconnect() here. With synchronous rdma_create_ep
-  // endpoints (no CM event channel on either side) rdma_disconnect blocks
-  // forever waiting for the peer's disconnect reply, which never comes because
-  // the server thread sits in rdma_get_recv_comp. rdma_destroy_ep tears down the
-  // QP locally; the peer observes the RC connection drop as an error completion
-  // and cleans up its own endpoint. (Validated on hd03 InfiniBand, 2026-06-14.)
-  if (c->id) rdma_destroy_ep(c->id);
-  delete[] c->sbuf;
-  delete[] c->rbuf;
-  delete c;
-}
+void RdmaTransport::Destroy(Conn* c) { delete c; }  // RcEndpoint dtor tears down QP/MRs
 
 RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_pool) {
   {
@@ -72,30 +60,28 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
     }
   }
   *from_pool = false;
-  // parse host:port
-  auto pos = node.rfind(':');
-  if (pos == std::string::npos) return nullptr;
-  std::string host = node.substr(0, pos), port = node.substr(pos + 1);
-
-  rdma_addrinfo hints{}; hints.ai_port_space = RDMA_PS_TCP;
-  rdma_addrinfo* res = nullptr;
-  if (rdma_getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0) return nullptr;
-
-  ibv_qp_init_attr attr{};
-  attr.cap.max_send_wr = 4; attr.cap.max_recv_wr = 4;
-  attr.cap.max_send_sge = 1; attr.cap.max_recv_sge = 1;
-  attr.sq_sig_all = 1;
-  rdma_cm_id* id = nullptr;
-  if (rdma_create_ep(&id, res, nullptr, &attr) != 0) { rdma_freeaddrinfo(res); return nullptr; }
-  rdma_freeaddrinfo(res);
+  // Bootstrap the QP over a short-lived TCP connection to the node's member
+  // address (control plane). The data plane then rides the named RDMA device.
+  int fd = net::Dial(node, /*connect_ms=*/3000, /*io_ms=*/10000);
+  if (fd < 0) return nullptr;
 
   auto* c = new Conn();
-  c->id = id; c->cap = max_msg_;
-  c->sbuf = new char[c->cap]; c->rbuf = new char[c->cap];
-  c->smr = rdma_reg_msgs(id, c->sbuf, c->cap);
-  c->rmr = rdma_reg_msgs(id, c->rbuf, c->cap);
-  if (!c->smr || !c->rmr) { Destroy(c); return nullptr; }
-  if (rdma_connect(id, nullptr) != 0) { Destroy(c); return nullptr; }
+  if (!c->ep.Open(dev_name_.empty() ? nullptr : dev_name_.c_str(), max_msg_, 1)) {
+    ::close(fd); delete c; return nullptr;
+  }
+  char mine[rdma::kQpInfoBytes], peer[rdma::kQpInfoBytes];
+  rdma::SerializeQpInfo(c->ep.Local(), mine);
+  // client sends its Qp info, then reads the server's; symmetric to the server.
+  if (!net::WriteAll(fd, mine, rdma::kQpInfoBytes) ||
+      !net::ReadAll(fd, peer, rdma::kQpInfoBytes)) {
+    ::close(fd); delete c; return nullptr;
+  }
+  if (!c->ep.Connect(rdma::ParseQpInfo(peer))) { ::close(fd); delete c; return nullptr; }
+  // Wait for the server's "ready" byte: it has posted its recvs, so our first
+  // SEND won't hit RNR.
+  char ready = 0;
+  if (!net::ReadAll(fd, &ready, 1) || ready != 1) { ::close(fd); delete c; return nullptr; }
+  ::close(fd);  // bootstrap done; QP is RTS
   return c;
 }
 
@@ -113,33 +99,34 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     bool from_pool = false;
     Conn* c = Acquire(node, &from_pool);
     if (!c) return Status::kIOError;
+    rdma::RcEndpoint& ep = c->ep;
 
-    // build request in send buffer
-    EncodePrefix(c->sbuf, op, k, offset, length, payload_len);
-    if (payload_len) std::memcpy(c->sbuf + kReqPrefix, payload, payload_len);
+    EncodePrefix(ep.sbuf(0), op, k, offset, length, payload_len);
+    if (payload_len) std::memcpy(ep.sbuf(0) + kReqPrefix, payload, payload_len);
 
-    bool ok = true;
-    ibv_wc wc{};
-    // pre-post recv, then send, then reap completions
-    if (rdma_post_recv(c->id, nullptr, c->rbuf, c->cap, c->rmr) != 0) ok = false;
-    if (ok && rdma_post_send(c->id, nullptr, c->sbuf, kReqPrefix + payload_len,
-                             c->smr, IBV_SEND_SIGNALED) != 0) ok = false;
-    if (ok && rdma_get_send_comp(c->id, &wc) <= 0) ok = false;
-    int rn = ok ? rdma_get_recv_comp(c->id, &wc) : -1;
-    if (rn <= 0) ok = false;
+    bool ok = ep.PostRecv(0) && ep.PostSend(0, kReqPrefix + payload_len);
+    // Reap both the send and the recv completion (shared CQ; either order).
+    uint32_t recv_bytes = 0;
+    bool need_send = ok, need_recv = ok;
+    while (ok && (need_send || need_recv)) {
+      ibv_wc wc{};
+      int g = ep.WaitComp(&wc, 1);
+      if (g <= 0 || wc.status != IBV_WC_SUCCESS) { ok = false; break; }
+      if (wc.opcode == IBV_WC_SEND) need_send = false;
+      else if (wc.opcode == IBV_WC_RECV) { need_recv = false; recv_bytes = wc.byte_len; }
+    }
 
     if (!ok) {
       Destroy(c);
       if (!from_pool) return Status::kIOError;
       continue;  // stale pooled conn -> retry fresh
     }
-    // parse response: status(1) data_len(8) data...
-    if (wc.byte_len < kRespPrefix) { Destroy(c); return Status::kIOError; }
-    Status st = static_cast<Status>(static_cast<uint8_t>(c->rbuf[0]));
-    uint64_t dlen = net::GetU64(c->rbuf + 1);
+    if (recv_bytes < kRespPrefix) { Destroy(c); return Status::kIOError; }
+    Status st = static_cast<Status>(static_cast<uint8_t>(ep.rbuf(0)[0]));
+    uint64_t dlen = net::GetU64(ep.rbuf(0) + 1);
     if (out) {
-      if (kRespPrefix + dlen > wc.byte_len) { Destroy(c); return Status::kIOError; }
-      out->assign(c->rbuf + kRespPrefix, dlen);
+      if (kRespPrefix + dlen > recv_bytes) { Destroy(c); return Status::kIOError; }
+      out->assign(ep.rbuf(0) + kRespPrefix, dlen);
     }
     Release(node, c);
     return st;

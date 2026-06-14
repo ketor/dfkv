@@ -1,77 +1,103 @@
 #include "rdma_server.h"
 
-#include <rdma/rdma_cma.h>
-#include <rdma/rdma_verbs.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
-#include "net_util.h"  // GetU64/GetU32/PutU64
-#include "transport.h"  // kReqPrefix, kRespPrefix
+#include "net_util.h"     // ReadAll / WriteAll / Get*/Put*
+#include "rdma_verbs.h"   // RcEndpoint, QpInfo
+#include "transport.h"    // kReqPrefix, kRespPrefix
 
 namespace dfkv {
 
-RdmaServer::RdmaServer(Handler handler, size_t max_msg)
-    : handler_(std::move(handler)), max_msg_(max_msg) {}
+RdmaServer::RdmaServer(Handler handler, size_t max_msg, const std::string& dev_name)
+    : handler_(std::move(handler)), max_msg_(max_msg), dev_name_(dev_name) {
+  if (dev_name_.empty()) {
+    const char* e = std::getenv("DFKV_RDMA_DEV");
+    if (e && *e) dev_name_ = e;
+  }
+}
 
 RdmaServer::~RdmaServer() { Stop(); }
 
 Status RdmaServer::Start(int port) {
-  rdma_addrinfo hints{};
-  hints.ai_flags = RAI_PASSIVE;
-  hints.ai_port_space = RDMA_PS_TCP;
-  rdma_addrinfo* res = nullptr;
-  std::string p = std::to_string(port);
-  if (rdma_getaddrinfo(nullptr, p.c_str(), &hints, &res) != 0) return Status::kIOError;
-  rdma_cm_id* lid = nullptr;
-  ibv_qp_init_attr attr{};
-  attr.cap.max_send_wr = 4; attr.cap.max_recv_wr = 4;
-  attr.cap.max_send_sge = 1; attr.cap.max_recv_sge = 1;
-  attr.sq_sig_all = 1;
-  if (rdma_create_ep(&lid, res, nullptr, &attr) != 0) { rdma_freeaddrinfo(res); return Status::kIOError; }
-  rdma_freeaddrinfo(res);
-  if (rdma_listen(lid, 128) != 0) { rdma_destroy_ep(lid); return Status::kIOError; }
-  listen_id_ = lid;
-  port_ = ntohs(rdma_get_src_port(lid));
+  listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (listen_fd_ < 0) return Status::kIOError;
+  int one = 1;
+  ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in sa{};
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = htonl(INADDR_ANY);  // bootstrap reachable on any IP net
+  sa.sin_port = htons(static_cast<uint16_t>(port));
+  if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+    ::close(listen_fd_); listen_fd_ = -1; return Status::kIOError;
+  }
+  if (::listen(listen_fd_, 128) != 0) {
+    ::close(listen_fd_); listen_fd_ = -1; return Status::kIOError;
+  }
+  socklen_t sl = sizeof(sa);
+  ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&sa), &sl);
+  port_ = ntohs(sa.sin_port);
   running_ = true;
   accept_thread_ = std::thread([this] { AcceptLoop(); });
   return Status::kOk;
 }
 
 void RdmaServer::Stop() {
-  bool was = running_.exchange(false);
-  if (listen_id_) {
-    rdma_destroy_ep(static_cast<rdma_cm_id*>(listen_id_));  // unblocks rdma_get_request
-    listen_id_ = nullptr;
-  }
-  if (was && accept_thread_.joinable()) accept_thread_.join();
+  if (!running_.exchange(false)) return;
+  if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);  // wake accept()
+  if (accept_thread_.joinable()) accept_thread_.join();
+  if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
+  // Per-connection serve threads are detached: they block in RDMA completion
+  // waits and are reclaimed on process exit. We intentionally do not join them
+  // (no clean interrupt for a blocked CQ wait), which keeps Stop() bounded.
 }
 
 void RdmaServer::AcceptLoop() {
-  auto* lid = static_cast<rdma_cm_id*>(listen_id_);
   while (running_) {
-    rdma_cm_id* cid = nullptr;
-    if (rdma_get_request(lid, &cid) != 0) { if (!running_) break; continue; }
-    std::thread([this, cid] { Serve(cid); }).detach();
+    int fd = ::accept(listen_fd_, nullptr, nullptr);
+    if (fd < 0) { if (!running_) break; continue; }
+    int one = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    std::thread([this, fd] { Serve(fd); }).detach();
   }
 }
 
-void RdmaServer::Serve(void* cm_id) {
-  auto* id = static_cast<rdma_cm_id*>(cm_id);
-  std::vector<char> rbuf(max_msg_), sbuf(max_msg_);
-  ibv_mr* rmr = rdma_reg_msgs(id, rbuf.data(), rbuf.size());
-  ibv_mr* smr = rdma_reg_msgs(id, sbuf.data(), sbuf.size());
-  if (!rmr || !smr) { if (rmr) ibv_dereg_mr(rmr); if (smr) ibv_dereg_mr(smr); rdma_destroy_ep(id); return; }
-  if (rdma_post_recv(id, nullptr, rbuf.data(), rbuf.size(), rmr) != 0 ||
-      rdma_accept(id, nullptr) != 0) {
-    ibv_dereg_mr(rmr); ibv_dereg_mr(smr); rdma_destroy_ep(id); return;
+void RdmaServer::Serve(int boot_fd) {
+  rdma::RcEndpoint ep;
+  if (!ep.Open(dev_name_.empty() ? nullptr : dev_name_.c_str(), max_msg_, 1)) {
+    ::close(boot_fd); return;
   }
+  // QP bootstrap: read client's info, send ours (symmetric to the client).
+  char peer[rdma::kQpInfoBytes], mine[rdma::kQpInfoBytes];
+  rdma::SerializeQpInfo(ep.Local(), mine);
+  if (!net::ReadAll(boot_fd, peer, rdma::kQpInfoBytes) ||
+      !net::WriteAll(boot_fd, mine, rdma::kQpInfoBytes)) {
+    ::close(boot_fd); return;
+  }
+  if (!ep.Connect(rdma::ParseQpInfo(peer))) { ::close(boot_fd); return; }
+  if (!ep.PostRecv(0)) { ::close(boot_fd); return; }
+  // Tell the client we are ready (recv posted) so its first SEND won't hit RNR.
+  char ready = 1;
+  bool ok = net::WriteAll(boot_fd, &ready, 1);
+  ::close(boot_fd);  // bootstrap done
+  if (!ok) return;
+
+  // Serve loop: one request in flight (depth 1). RC two-sided ping-pong.
   while (running_) {
     ibv_wc wc{};
-    int rn = rdma_get_recv_comp(id, &wc);
-    if (rn <= 0 || wc.byte_len < kReqPrefix) break;
-    const char* req = rbuf.data();
+    int g = ep.WaitComp(&wc, 1);
+    if (g <= 0 || wc.status != IBV_WC_SUCCESS || wc.opcode != IBV_WC_RECV) break;
+    if (wc.byte_len < kReqPrefix) break;
+
+    const char* req = ep.rbuf(0);
     uint64_t payload_len = net::GetU64(req + 33);
     const char* payload = (payload_len && wc.byte_len >= kReqPrefix + payload_len)
                               ? req + kReqPrefix : nullptr;
@@ -80,22 +106,29 @@ void RdmaServer::Serve(void* cm_id) {
                          net::GetU32(req + 9), net::GetU32(req + 13),
                          net::GetU64(req + 17), net::GetU64(req + 25),
                          payload, payload_len, &data);
-    // re-arm recv for the next request before sending the reply
-    if (rdma_post_recv(id, nullptr, rbuf.data(), rbuf.size(), rmr) != 0) break;
-    if (kRespPrefix + data.size() > sbuf.size()) break;
-    sbuf[0] = static_cast<char>(st);
-    net::PutU64(sbuf.data() + 1, data.size());
-    if (!data.empty()) std::memcpy(sbuf.data() + kRespPrefix, data.data(), data.size());
-    if (rdma_post_send(id, nullptr, sbuf.data(), kRespPrefix + data.size(), smr,
-                       IBV_SEND_SIGNALED) != 0) break;
-    ibv_wc sc{};
-    if (rdma_get_send_comp(id, &sc) <= 0) break;
+
+    // Re-arm recv (request consumed) before sending so the client's next SEND
+    // always finds a posted receive — no RNR.
+    if (!ep.PostRecv(0)) break;
+    if (kRespPrefix + data.size() > ep.cap()) break;
+    char* sb = ep.sbuf(0);
+    sb[0] = static_cast<char>(st);
+    net::PutU64(sb + 1, data.size());
+    if (!data.empty()) std::memcpy(sb + kRespPrefix, data.data(), data.size());
+    if (!ep.PostSend(0, kRespPrefix + data.size())) break;
+
+    // Reap the send completion (a re-armed recv may also be pending; with a
+    // synchronous client it won't fire until it gets this reply).
+    bool sent = false, fail = false;
+    while (!sent && !fail) {
+      ibv_wc sc{};
+      int s = ep.WaitComp(&sc, 1);
+      if (s <= 0 || sc.status != IBV_WC_SUCCESS) fail = true;
+      else if (sc.opcode == IBV_WC_SEND) sent = true;
+    }
+    if (fail) break;
   }
-  ibv_dereg_mr(rmr); ibv_dereg_mr(smr);
-  // No rdma_disconnect(): synchronous endpoints have no CM event loop to ack the
-  // disconnect, so it would block. rdma_destroy_ep tears down locally; the client
-  // sees the drop as an error completion. (See rdma_transport.cc Destroy note.)
-  rdma_destroy_ep(id);
+  // ep dtor tears down the QP; the peer observes the drop as an error completion.
 }
 
 }  // namespace dfkv

@@ -1,7 +1,12 @@
-/* RDMA cache-node listener (RC two-sided via librdmacm). Built only when
+/* RDMA cache-node listener — native libibverbs RC. Built only when
  * DFKV_WITH_RDMA is defined. Reuses the wire frames + a request handler so the
  * cache logic (DiskCacheGroup + metrics) is shared with the TCP server.
- * COMPILE-verified; runtime verification pending RDMA hardware. */
+ *
+ * The "listener" is a plain TCP accept socket used only to bootstrap QPs
+ * (exchange LID/GID/QPN over a few bytes). Each accepted connection opens an RC
+ * QP on the named RDMA device (--rdma-dev / DFKV_RDMA_DEV) and serves requests
+ * over RDMA. Using TCP accept (not rdma_get_request) makes Stop() interruptible:
+ * shutdown(listen_fd) wakes accept() instantly — no shutdown hang. */
 #ifndef DFKV_RDMA_SERVER_H_
 #define DFKV_RDMA_SERVER_H_
 
@@ -23,20 +28,23 @@ class RdmaServer {
       uint64_t length, const char* payload, uint64_t payload_len,
       std::string* out_data)>;
 
-  explicit RdmaServer(Handler handler, size_t max_msg = (8u << 20));
+  // dev_name empty => env DFKV_RDMA_DEV, else first device.
+  explicit RdmaServer(Handler handler, size_t max_msg = (8u << 20),
+                      const std::string& dev_name = "");
   ~RdmaServer();
 
-  Status Start(int port);
+  Status Start(int port);  // TCP bootstrap port
   void Stop();
   int port() const { return port_; }
 
  private:
   void AcceptLoop();
-  void Serve(void* cm_id);  // void* = rdma_cm_id*
+  void Serve(int boot_fd);
 
   Handler handler_;
   size_t max_msg_;
-  void* listen_id_ = nullptr;  // rdma_cm_id*
+  std::string dev_name_;
+  int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
