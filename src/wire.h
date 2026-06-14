@@ -16,7 +16,7 @@
 namespace dfkv {
 
 // Wire op codes (shared by TcpTransport, RdmaTransport and the server).
-// kMembers (legacy static-list query) is removed in M3 once the MDS replaces it.
+// kMembers is the legacy static-list discovery query, superseded by the MDS (kListMembers).
 // kRegister/kHeartbeat/kListMembers are the MDS membership ops (M0+): the op byte
 // reuses the existing request framing; variable content rides the payload/data blob.
 enum class WireOp : uint8_t {

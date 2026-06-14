@@ -137,6 +137,11 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
       *out_data = members_;  // advertised cluster membership (for client discovery)
       st = Status::kOk;
       break;
+    case WireOp::kRegister:
+    case WireOp::kHeartbeat:
+    case WireOp::kListMembers:
+      st = Status::kInvalid;  // MDS ops are not served by a cache node
+      break;
   }
   return st;
 }

@@ -14,7 +14,7 @@ std::string PrefixRangeEnd(const std::string& prefix) {
   for (size_t i = end.size(); i-- > 0;) {
     if (uint8_t(end[i]) < 0xFF) { end[i] = char(uint8_t(end[i]) + 1); end.resize(i + 1); return end; }
   }
-  return std::string();  // all 0xFF => open-ended
+  return std::string("\0", 1);  // all 0xFF => use "\0" for scan-to-end (empty would mean single-key get)
 }
 }  // namespace
 

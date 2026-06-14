@@ -80,6 +80,16 @@ TEST(EtcdClient, Non200OrTransportFailureReturnsNullopt) {
   EXPECT_FALSE(c.LeaseGrant(30).has_value());
 }
 
+TEST(EtcdClient, PrefixRangeEndAll0xFFScansToEnd) {
+  // All-0xFF prefix => range_end must be "\0" (scan to keyspace end), NOT empty
+  // (empty range_end == single-key get in etcd).
+  FakeHttp h;
+  h.canned.push_back({200, R"({"header":{"revision":"1"}})"});
+  EtcdClient c(&h);
+  ASSERT_TRUE(c.RangePrefix(std::string("\xff\xff", 2)).has_value());
+  EXPECT_NE(h.calls[0].body.find(Base64Encode(std::string("\0", 1))), std::string::npos);
+}
+
 TEST(EtcdClient, IntegrationRealEtcd) {
   const char* ep = std::getenv("DFKV_TEST_ETCD");
   if (!ep) GTEST_SKIP() << "set DFKV_TEST_ETCD=host:port to run";
