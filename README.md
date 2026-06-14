@@ -53,5 +53,19 @@ tests/      gtest suites + tests/python (unittest + no-torch sglang shim)
 docs/       DEPLOY.md (standalone rollout) · INTEGRATION.md (fuse into dingo-cache)
 ```
 
+## Operability & performance features
+- **Connection pooling + keep-alive** (TCP_NODELAY): ~250× lower latency vs dial-per-call.
+- **Batch APIs** with concurrent fan-out across nodes (`BatchPut/Get/Exist`, C ABI + plugin).
+- **Connect/IO timeouts + stale-connection retry**: a hung node fails fast, never hangs.
+- **Metrics**: server counters + Prometheus text (`dfkvctl stat <node>` / `kStats` op).
+- **Dynamic membership**: `SetMembers()` hot-swaps the ring (no client restart).
+- **CLI tools**: `dfkv_smoke` (roundtrip check), `dfkvctl` (put/get/exist/stat).
+- **RDMA transport** (gated `-DDFKV_WITH_RDMA=ON`, RC two-sided via librdmacm) with
+  **automatic TCP fallback** (env `DFKV_RDMA=1`); runtime verification pending hardware.
+- **HiCache v2** (PoolTransfer) for multi-pool models (Mamba/SWA/DeepSeek-V4).
+- **Packaging**: CPack (deb/rpm/tgz) + Dockerfile; **graceful shutdown**; leveled logging.
+
 ## Status
-TDD, 7 rounds; **45 tests green** (39 C++ via ctest + 6 Python). License: Apache-2.0.
+TDD; **53 C++ ctest entries + 7 Python tests green**, 0 warnings, **ThreadSanitizer-clean**.
+CI: gcc/clang build+test, TSan, RDMA compile-check, static-artifact build. License: Apache-2.0.
+See `docs/DEPLOY.md` (rollout) and the round report in the ai_david KB.
