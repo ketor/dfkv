@@ -50,7 +50,13 @@ void RdmaTransport::Destroy(Conn* c) {
   if (!c) return;
   if (c->smr) ibv_dereg_mr(c->smr);
   if (c->rmr) ibv_dereg_mr(c->rmr);
-  if (c->id) { rdma_disconnect(c->id); rdma_destroy_ep(c->id); }
+  // NOTE: do NOT call rdma_disconnect() here. With synchronous rdma_create_ep
+  // endpoints (no CM event channel on either side) rdma_disconnect blocks
+  // forever waiting for the peer's disconnect reply, which never comes because
+  // the server thread sits in rdma_get_recv_comp. rdma_destroy_ep tears down the
+  // QP locally; the peer observes the RC connection drop as an error completion
+  // and cleans up its own endpoint. (Validated on hd03 InfiniBand, 2026-06-14.)
+  if (c->id) rdma_destroy_ep(c->id);
   delete[] c->sbuf;
   delete[] c->rbuf;
   delete c;

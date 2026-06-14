@@ -92,7 +92,10 @@ void RdmaServer::Serve(void* cm_id) {
     if (rdma_get_send_comp(id, &sc) <= 0) break;
   }
   ibv_dereg_mr(rmr); ibv_dereg_mr(smr);
-  rdma_disconnect(id); rdma_destroy_ep(id);
+  // No rdma_disconnect(): synchronous endpoints have no CM event loop to ack the
+  // disconnect, so it would block. rdma_destroy_ep tears down locally; the client
+  // sees the drop as an error completion. (See rdma_transport.cc Destroy note.)
+  rdma_destroy_ep(id);
 }
 
 }  // namespace dfkv

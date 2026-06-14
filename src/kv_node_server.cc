@@ -25,7 +25,10 @@ Status KvNodeServer::Start(int port) {
   ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
   sockaddr_in sa{};
   sa.sin_family = AF_INET;
-  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  // Listen on all interfaces so peer nodes can reach this cache node (a
+  // distributed cluster needs a routable bind, not loopback). Access control is
+  // by network isolation / firewall, per docs/DEPLOY.md.
+  sa.sin_addr.s_addr = htonl(INADDR_ANY);
   sa.sin_port = htons(static_cast<uint16_t>(port));
   if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
     ::close(listen_fd_); listen_fd_ = -1; return Status::kIOError;
