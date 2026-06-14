@@ -37,15 +37,50 @@ class HiCacheStorageExtraInfo:
     extra_info: Optional[dict] = None
 
 
+class PoolHitPolicy:
+    ALL_PAGES = "all_pages"
+    TRAILING_PAGES = "trailing_pages"
+
+
+@dataclass
+class PoolTransfer:
+    name: str
+    host_indices: Optional[List[int]] = None
+    device_indices: Optional[List[int]] = None
+    keys: Optional[List[str]] = None
+    hit_policy: str = PoolHitPolicy.ALL_PAGES
+
+
+@dataclass
+class PoolTransferResult:
+    kv_hit_pages: int
+    extra_pool_hit_pages: dict
+
+
 class HiCacheStorage(ABC):
     def register_mem_pool_host(self, mem_pool_host):
         self.mem_pool_host = mem_pool_host
+
+    def register_mem_host_pool_v2(self, host_pool, host_pool_name):
+        if not hasattr(self, "registered_pools"):
+            self.registered_pools = {}
+        self.registered_pools[host_pool_name] = host_pool
 
     # v1 zero-copy batch interface (host_indices based) — default NotImplemented.
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
         raise NotImplementedError
 
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
+        raise NotImplementedError
+
+    # v2 pool-aware interface — default NotImplemented.
+    def batch_get_v2(self, transfers, extra_info=None) -> dict:
+        raise NotImplementedError
+
+    def batch_set_v2(self, transfers, extra_info=None) -> dict:
+        raise NotImplementedError
+
+    def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
         raise NotImplementedError
 
     @abstractmethod

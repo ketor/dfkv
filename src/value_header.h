@@ -8,6 +8,9 @@
  * tp_size/tp_rank are NOT part of the match (flags bit0 = is_mla).
  *
  * Portable (no brpc/MDS deps) so it builds & is unit-tested standalone.
+ * Serialization is host-endian (memcpy); all targets are x86_64 LE. A read on
+ * a different-endian host fails the magic/version check => safe MISS (recompute),
+ * never silent corruption. Cross-arch sharing would need explicit LE fields.
  */
 #ifndef DFKV_VALUE_HEADER_H_
 #define DFKV_VALUE_HEADER_H_

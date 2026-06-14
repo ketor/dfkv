@@ -174,6 +174,37 @@ class DingoFSHiCacheTest(unittest.TestCase):
         self.assertEqual(reader.batch_get_v1(["h0"], list(range(self.PAGE_SIZE))),
                          [False])
 
+    def test_batch_v2_multi_pool_roundtrip(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+        members, _, _ = self._node("v2")
+        cfg = self._cfg(members)
+        st = dfkv_hicache.DfkvHiCache(cfg, cfg.extra_config)
+        kv = FakeMlaPool(3, self.PAGE_BYTES, self.PAGE_SIZE)
+        ex = FakeMlaPool(3, self.PAGE_BYTES, self.PAGE_SIZE)
+        st.register_mem_host_pool_v2(kv, "kv")
+        st.register_mem_host_pool_v2(ex, "extra")
+        for i in range(3):
+            kv.fill_page(i, 20 + i)
+            ex.fill_page(i, 50 + i)
+        keys = ["a0", "a1", "a2"]
+        hi = list(range(3 * self.PAGE_SIZE))
+        trs = [PoolTransfer(name="kv", host_indices=hi, keys=keys),
+               PoolTransfer(name="extra", host_indices=hi, keys=keys)]
+        res = st.batch_set_v2(trs)
+        self.assertEqual(res["kv"], [True, True, True])
+        self.assertEqual(res["extra"], [True, True, True])
+        expk = [kv.page_bytes_at(i) for i in range(3)]
+        expe = [ex.page_bytes_at(i) for i in range(3)]
+        kv.zero(); ex.zero()
+        g = st.batch_get_v2(trs)
+        self.assertEqual(g["kv"], [True, True, True])
+        self.assertEqual(g["extra"], [True, True, True])
+        for i in range(3):
+            self.assertEqual(kv.page_bytes_at(i), expk[i])
+            self.assertEqual(ex.page_bytes_at(i), expe[i])
+        r = st.batch_exists_v2(keys, [PoolTransfer(name="extra", host_indices=hi, keys=keys)])
+        self.assertEqual(r.kv_hit_pages, 3)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

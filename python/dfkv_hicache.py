@@ -158,6 +158,72 @@ class DfkvHiCache(HiCacheStorage):
             n += 1
         return n
 
+    # --- v2 pool-aware interface (multi-pool models: Mamba/SWA/DeepSeek-V4) ---
+    def _pool_keys(self, pool_name: str, page_hash: str) -> List[str]:
+        # primary KV pool keeps the MLA/MHA split; auxiliary pools are single-object.
+        if pool_name in ("kv", "__default__"):
+            return self._keys(page_hash)
+        base = f"{self.model}/{page_hash}_{pool_name}"
+        return [base + "_k"] if self.is_mla else [base + "_k", base + "_v"]
+
+    def _pool_sub(self, pool_name: str) -> int:
+        if pool_name in ("kv", "__default__"):
+            return self._sub()
+        return 1 if self.is_mla else 2
+
+    def _v2_io(self, transfers, putting):
+        results = {}
+        for tr in transfers:
+            name = str(tr.name)
+            # MLA backup_skip: only tp_rank 0 writes the replicated latent pools.
+            if putting and self.is_mla and self.tp_rank != 0:
+                results[name] = [True] * len(tr.keys or [])
+                continue
+            pool = self.registered_pools[name]
+            ptrs, sizes = pool.get_page_buffer_meta(tr.host_indices)
+            sub = self._pool_sub(name)
+            keys = tr.keys or []
+            sks, sp, ss = [], [], []
+            for i, k in enumerate(keys):
+                for j, sk in enumerate(self._pool_keys(name, k)):
+                    sks.append(sk); sp.append(int(ptrs[i * sub + j])); ss.append(int(sizes[i * sub + j]))
+            karr, parr, sarr, out, _ = _arrays(sks, sp, ss)
+            (self._lib.dfkv_batch_put if putting else self._lib.dfkv_batch_get)(
+                self._h, karr, parr, sarr, len(sks), out)
+            results[name] = self._fold([out[i] == 1 for i in range(len(sks))], len(keys), sub)
+        return results
+
+    def batch_set_v2(self, transfers, extra_info=None) -> dict:
+        return self._v2_io(transfers, putting=True)
+
+    def batch_get_v2(self, transfers, extra_info=None) -> dict:
+        return self._v2_io(transfers, putting=False)
+
+    def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
+        from sglang.srt.mem_cache.hicache_storage import PoolTransferResult, PoolHitPolicy
+        # primary KV prefix
+        kv_pages = self.batch_exists(keys)
+        hit = {"kv": kv_pages} if kv_pages else {}
+        final = kv_pages
+        for tr in (pool_transfers or []):
+            if final == 0:
+                break
+            name = str(tr.name)
+            present = [all(self._lib.dfkv_exist(self._h, sk.encode()) == 1
+                           for sk in self._pool_keys(name, k)) for k in keys[:kv_pages]]
+            if tr.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                boundary = kv_pages if all(present) else 0
+            else:  # ALL_PAGES
+                boundary = 0
+                for ok in present:
+                    if not ok:
+                        break
+                    boundary += 1
+            if boundary:
+                hit[name] = boundary
+            final = min(final, boundary)
+        return PoolTransferResult(final, hit)
+
     # --- required abstract methods (non zero-copy / introspection) ---
     def exists(self, key) -> bool:
         return all(self._lib.dfkv_exist(self._h, sk.encode()) == 1 for sk in self._keys(key))
