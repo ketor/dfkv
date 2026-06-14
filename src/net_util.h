@@ -5,9 +5,12 @@
 #define DFKV_NET_UTIL_H_
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -52,7 +55,7 @@ inline uint64_t GetU64(const char* p) { uint64_t v; std::memcpy(&v, p, 8); retur
 inline uint32_t GetU32(const char* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 
 // "ip:port" -> connected fd, or -1.
-inline int Dial(const std::string& addr) {
+inline int Dial(const std::string& addr, int connect_ms = 0, int io_ms = 0) {
   auto pos = addr.rfind(':');
   if (pos == std::string::npos) return -1;
   std::string ip = addr.substr(0, pos);
@@ -64,7 +67,31 @@ inline int Dial(const std::string& addr) {
   sa.sin_port = htons(static_cast<uint16_t>(port));
   if (::inet_pton(AF_INET, ip.c_str(), &sa.sin_addr) != 1) { ::close(fd); return -1; }
   int one = 1; ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-  if (::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) { ::close(fd); return -1; }
+
+  if (connect_ms <= 0) {
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) { ::close(fd); return -1; }
+  } else {
+    // non-blocking connect bounded by connect_ms
+    int fl = ::fcntl(fd, F_GETFL, 0);
+    ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+    if (rc != 0) {
+      if (errno != EINPROGRESS) { ::close(fd); return -1; }
+      fd_set wf; FD_ZERO(&wf); FD_SET(fd, &wf);
+      timeval tv{connect_ms / 1000, (connect_ms % 1000) * 1000};
+      if (::select(fd + 1, nullptr, &wf, nullptr, &tv) <= 0) { ::close(fd); return -1; }
+      int err = 0; socklen_t el = sizeof(err);
+      ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+      if (err != 0) { ::close(fd); return -1; }
+    }
+    ::fcntl(fd, F_SETFL, fl);  // back to blocking
+  }
+
+  if (io_ms > 0) {  // bound blocking recv/send so a silent peer can't hang us
+    timeval tv{io_ms / 1000, (io_ms % 1000) * 1000};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  }
   return fd;
 }
 

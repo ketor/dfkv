@@ -58,6 +58,37 @@ int dfkv_exist(dfkv_client_t c, const char* key) {
   return static_cast<KVClient*>(c)->Exist(key) ? 1 : 0;
 }
 
+int dfkv_batch_put(dfkv_client_t c, const char** keys, const void** ptrs,
+                   const uint64_t* sizes, int n, int* out_ok) {
+  if (!c || n < 0) return -1;
+  std::vector<dfkv::KvPutItem> items(n);
+  for (int i = 0; i < n; ++i)
+    items[i] = {keys[i], ptrs[i], static_cast<size_t>(sizes[i])};
+  auto r = static_cast<KVClient*>(c)->BatchPut(items);
+  for (int i = 0; i < n; ++i) out_ok[i] = r[i] ? 1 : 0;
+  return 0;
+}
+
+int dfkv_batch_get(dfkv_client_t c, const char** keys, void** ptrs,
+                   const uint64_t* sizes, int n, int* out_hit) {
+  if (!c || n < 0) return -1;
+  std::vector<dfkv::KvGetItem> items(n);
+  for (int i = 0; i < n; ++i)
+    items[i] = {keys[i], ptrs[i], static_cast<size_t>(sizes[i])};
+  auto r = static_cast<KVClient*>(c)->BatchGet(items);
+  for (int i = 0; i < n; ++i) out_hit[i] = r[i] ? 1 : 0;
+  return 0;
+}
+
+int dfkv_batch_exist(dfkv_client_t c, const char** keys, int n, int* out_exist) {
+  if (!c || n < 0) return -1;
+  std::vector<std::string> ks(n);
+  for (int i = 0; i < n; ++i) ks[i] = keys[i];
+  auto r = static_cast<KVClient*>(c)->BatchExist(ks);
+  for (int i = 0; i < n; ++i) out_exist[i] = r[i] ? 1 : 0;
+  return 0;
+}
+
 void dfkv_close(dfkv_client_t c) { delete static_cast<KVClient*>(c); }
 
 }  // extern "C"

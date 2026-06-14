@@ -1,12 +1,33 @@
 #include "kv_client.h"
 
+#include <atomic>
 #include <cstring>
+#include <functional>
+#include <thread>
 #include <vector>
 
 #include "key_map.h"
 #include "tcp_transport.h"
 
 namespace dfkv {
+
+namespace {
+// Run fn(i) for i in [0,n) across up to `workers` threads (atomic work-steal).
+void RunParallel(size_t n, size_t workers, const std::function<void(size_t)>& fn) {
+  if (n == 0) return;
+  if (workers > n) workers = n;
+  if (workers <= 1) { for (size_t i = 0; i < n; ++i) fn(i); return; }
+  std::atomic<size_t> next{0};
+  std::vector<std::thread> ts;
+  ts.reserve(workers);
+  for (size_t w = 0; w < workers; ++w) {
+    ts.emplace_back([&] {
+      for (size_t i = next.fetch_add(1); i < n; i = next.fetch_add(1)) fn(i);
+    });
+  }
+  for (auto& t : ts) t.join();
+}
+}  // namespace
 
 KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
                    ValueHeader self_hdr, Transport* transport)
@@ -73,6 +94,30 @@ bool KVClient::Exist(const std::string& key) {
   bool e = false;
   if (t_->Exist(node, ToBlockKey(key), &e) != Status::kOk) return false;
   return e;
+}
+
+std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
+  std::vector<char> ok(items.size(), 0);  // char (not vector<bool>) for thread-safe writes
+  RunParallel(items.size(), batch_concurrency_, [&](size_t i) {
+    ok[i] = Put(items[i].key, items[i].value, items[i].n) ? 1 : 0;
+  });
+  return std::vector<bool>(ok.begin(), ok.end());
+}
+
+std::vector<bool> KVClient::BatchGet(const std::vector<KvGetItem>& items) {
+  std::vector<char> hit(items.size(), 0);
+  RunParallel(items.size(), batch_concurrency_, [&](size_t i) {
+    hit[i] = Get(items[i].key, items[i].out, items[i].n) ? 1 : 0;
+  });
+  return std::vector<bool>(hit.begin(), hit.end());
+}
+
+std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
+  std::vector<char> e(keys.size(), 0);
+  RunParallel(keys.size(), batch_concurrency_, [&](size_t i) {
+    e[i] = Exist(keys[i]) ? 1 : 0;
+  });
+  return std::vector<bool>(e.begin(), e.end());
 }
 
 }  // namespace dfkv

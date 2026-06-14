@@ -24,6 +24,15 @@ dfkv_client_t dfkv_open(const char* members, uint64_t model_hash,
 int dfkv_put(dfkv_client_t c, const char* key, const void* ptr, uint64_t n);  // 0=ok
 int dfkv_get(dfkv_client_t c, const char* key, void* ptr, uint64_t n);        // 1=hit,0=miss
 int dfkv_exist(dfkv_client_t c, const char* key);                            // 1/0
+
+// Batched, concurrently fanned out. n items; out_* arrays (len n) receive
+// per-item results (1/0). Return 0 on call success.
+int dfkv_batch_put(dfkv_client_t c, const char** keys, const void** ptrs,
+                   const uint64_t* sizes, int n, int* out_ok);
+int dfkv_batch_get(dfkv_client_t c, const char** keys, void** ptrs,
+                   const uint64_t* sizes, int n, int* out_hit);
+int dfkv_batch_exist(dfkv_client_t c, const char** keys, int n, int* out_exist);
+
 void dfkv_close(dfkv_client_t c);
 
 #ifdef __cplusplus

@@ -25,6 +25,11 @@ class TcpTransport : public Transport {
   Status Exist(const std::string& node, const BlockKey& key,
                bool* exist) override;
 
+  // connect/IO timeouts (ms); 0 = block indefinitely. Defaults bound hangs.
+  void set_timeouts(int connect_ms, int io_ms) {
+    connect_ms_ = connect_ms; io_ms_ = io_ms;
+  }
+
  private:
   Status RoundTrip(const std::string& node, WireOp op, const BlockKey& key,
                    uint64_t offset, uint64_t length, const void* payload,
@@ -34,6 +39,8 @@ class TcpTransport : public Transport {
 
   std::mutex mu_;
   std::unordered_map<std::string, std::vector<int>> pool_;  // node -> idle fds
+  int connect_ms_ = 3000;
+  int io_ms_ = 10000;
 };
 
 }  // namespace dfkv

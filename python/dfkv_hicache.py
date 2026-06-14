@@ -35,9 +35,30 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_get.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint64]
     lib.dfkv_exist.restype = ctypes.c_int
     lib.dfkv_exist.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.dfkv_batch_put.restype = ctypes.c_int
+    lib.dfkv_batch_put.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
+                                   ctypes.POINTER(ctypes.c_void_p),
+                                   ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
+                                   ctypes.POINTER(ctypes.c_int)]
+    lib.dfkv_batch_get.restype = ctypes.c_int
+    lib.dfkv_batch_get.argtypes = lib.dfkv_batch_put.argtypes
+    lib.dfkv_batch_exist.restype = ctypes.c_int
+    lib.dfkv_batch_exist.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
+                                     ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
     lib.dfkv_close.restype = None
     lib.dfkv_close.argtypes = [ctypes.c_void_p]
     return lib
+
+
+def _arrays(subkeys, ptrs, sizes):
+    """Build parallel C arrays (keys, ptrs, sizes) for a batch call."""
+    n = len(subkeys)
+    kbuf = [k.encode() for k in subkeys]
+    karr = (ctypes.c_char_p * n)(*kbuf)
+    parr = (ctypes.c_void_p * n)(*[ctypes.c_void_p(int(p)) for p in ptrs])
+    sarr = (ctypes.c_uint64 * n)(*[int(s) for s in sizes])
+    out = (ctypes.c_int * n)()
+    return karr, parr, sarr, out, kbuf
 
 
 class DfkvHiCache(HiCacheStorage):
@@ -84,47 +105,51 @@ class DfkvHiCache(HiCacheStorage):
     def _sub(self) -> int:
         return 1 if self.is_mla else 2
 
+    def _flatten(self, keys, ptrs, sizes):
+        """Expand per-page keys into per-object (sub) flat arrays."""
+        sub = self._sub()
+        assert len(ptrs) == len(keys) * sub, (len(ptrs), len(keys), sub)
+        sks, sp, ss = [], [], []
+        for i, k in enumerate(keys):
+            for j, sk in enumerate(self._keys(k)):
+                sks.append(sk); sp.append(int(ptrs[i * sub + j])); ss.append(int(sizes[i * sub + j]))
+        return sub, sks, sp, ss
+
+    def _fold(self, flat_results, npages, sub):
+        """A page succeeds iff all its sub-objects succeeded."""
+        return [all(flat_results[i * sub + j] for j in range(sub)) for i in range(npages)]
+
     # --- zero-copy v1 batch path (the one the controller calls) ---
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
         # MLA backup_skip: latent is replicated across TP, only rank 0 writes.
         if self.is_mla and self.tp_rank != 0:
             return [True] * len(keys)
         ptrs, sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
-        sub = self._sub()
-        assert len(ptrs) == len(keys) * sub, (len(ptrs), len(keys), sub)
-        out = []
-        for i, k in enumerate(keys):
-            good = True
-            for j, sk in enumerate(self._keys(k)):
-                rc = self._lib.dfkv_put(self._h, sk.encode(),
-                                        ctypes.c_void_p(int(ptrs[i * sub + j])),
-                                        ctypes.c_uint64(int(sizes[i * sub + j])))
-                good = good and rc == 0
-            out.append(good)
-        return out
+        sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
+        karr, parr, sarr, out, _kb = _arrays(sks, sp, ss)
+        self._lib.dfkv_batch_put(self._h, karr, parr, sarr, len(sks), out)
+        return self._fold([out[i] == 1 for i in range(len(sks))], len(keys), sub)
 
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
         ptrs, sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
-        sub = self._sub()
-        assert len(ptrs) == len(keys) * sub, (len(ptrs), len(keys), sub)
-        out = []
-        for i, k in enumerate(keys):
-            hit = True
-            for j, sk in enumerate(self._keys(k)):
-                rc = self._lib.dfkv_get(self._h, sk.encode(),
-                                        ctypes.c_void_p(int(ptrs[i * sub + j])),
-                                        ctypes.c_uint64(int(sizes[i * sub + j])))
-                hit = hit and rc == 1
-            out.append(hit)
-        return out
+        sub, sks, sp, ss = self._flatten(keys, ptrs, sizes)
+        karr, parr, sarr, out, _kb = _arrays(sks, sp, ss)
+        self._lib.dfkv_batch_get(self._h, karr, parr, sarr, len(sks), out)
+        return self._fold([out[i] == 1 for i in range(len(sks))], len(keys), sub)
 
     def batch_exists(self, keys, extra_info=None) -> int:
+        # longest contiguous prefix of pages whose every sub-object exists
+        sub = self._sub()
+        sks = [sk for k in keys for sk in self._keys(k)]
+        karr = (ctypes.c_char_p * len(sks))(*[s.encode() for s in sks])
+        out = (ctypes.c_int * len(sks))()
+        self._lib.dfkv_batch_exist(self._h, karr, len(sks), out)
+        page_ok = self._fold([out[i] == 1 for i in range(len(sks))], len(keys), sub)
         n = 0
-        for k in keys:
-            if all(self._lib.dfkv_exist(self._h, sk.encode()) == 1 for sk in self._keys(k)):
-                n += 1
-            else:
+        for ok in page_ok:
+            if not ok:
                 break
+            n += 1
         return n
 
     # --- required abstract methods (non zero-copy / introspection) ---

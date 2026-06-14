@@ -66,7 +66,7 @@ int TcpTransport::Acquire(const std::string& node, bool* from_pool) {
     }
   }
   *from_pool = false;
-  return net::Dial(node);  // dial outside the lock
+  return net::Dial(node, connect_ms_, io_ms_);  // dial outside the lock
 }
 
 void TcpTransport::Release(const std::string& node, int fd) {

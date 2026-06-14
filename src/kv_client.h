@@ -19,6 +19,9 @@
 
 namespace dfkv {
 
+struct KvPutItem { std::string key; const void* value; size_t n; };
+struct KvGetItem { std::string key; void* out; size_t n; };
+
 class KVClient {
  public:
   // members: (node_name, "ip:port"). self_hdr: this engine's geometry identity.
@@ -30,6 +33,13 @@ class KVClient {
   bool Get(const std::string& key, void* out, size_t n);  // true = hit
   bool Exist(const std::string& key);
 
+  // Batched, concurrently fanned out across owning nodes. Per-item results.
+  std::vector<bool> BatchPut(const std::vector<KvPutItem>& items);
+  std::vector<bool> BatchGet(const std::vector<KvGetItem>& items);  // hit/miss
+  std::vector<bool> BatchExist(const std::vector<std::string>& keys);
+
+  void set_batch_concurrency(size_t n) { batch_concurrency_ = n ? n : 1; }
+
  private:
   std::string Route(const std::string& key) const;
 
@@ -38,6 +48,7 @@ class KVClient {
   ValueHeader self_hdr_;
   std::unique_ptr<Transport> owned_;
   Transport* t_;
+  size_t batch_concurrency_ = 8;
 };
 
 }  // namespace dfkv
