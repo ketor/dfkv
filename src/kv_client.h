@@ -48,6 +48,11 @@ class KVClient {
   // Thread-safe vs concurrent Put/Get/Exist.
   void SetMembers(std::vector<std::pair<std::string, std::string>> members);
 
+  // Discovery: query a seed node ("ip:port") for the current cluster membership
+  // and SetMembers() it. Lets clients learn add/remove without a static list or
+  // MDS — point at any live node. Returns true if a non-empty list was applied.
+  bool RefreshMembers(const std::string& seed_addr);
+
  private:
   std::string Route(const std::string& key) const;
 

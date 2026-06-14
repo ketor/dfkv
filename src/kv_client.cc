@@ -54,6 +54,25 @@ void KVClient::SetMembers(std::vector<std::pair<std::string, std::string>> membe
   addr_ = std::move(addr);
 }
 
+bool KVClient::RefreshMembers(const std::string& seed_addr) {
+  std::string text;
+  if (t_->Members(seed_addr, &text) != Status::kOk) return false;
+  std::vector<std::pair<std::string, std::string>> members;
+  for (size_t i = 0; i <= text.size();) {  // parse "name=ip:port,name=ip:port,..."
+    size_t c = text.find(',', i);
+    if (c == std::string::npos) c = text.size();
+    std::string tok = text.substr(i, c - i);
+    size_t eq = tok.find('=');
+    if (eq != std::string::npos && eq + 1 < tok.size())
+      members.emplace_back(tok.substr(0, eq), tok.substr(eq + 1));
+    if (c == text.size()) break;
+    i = c + 1;
+  }
+  if (members.empty()) return false;
+  SetMembers(std::move(members));
+  return true;
+}
+
 std::string KVClient::Route(const std::string& key) const {
   std::lock_guard<std::mutex> lk(ring_mu_);
   std::string name;

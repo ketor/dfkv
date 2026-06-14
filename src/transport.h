@@ -31,6 +31,12 @@ class Transport {
   virtual Status Exist(const std::string& node, const BlockKey& key,
                        bool* exist) = 0;
 
+  // Query a node's advertised cluster member list (for discovery). Default: not
+  // supported; TCP/RDMA override it. *out = "name=ip:port,name=ip:port,...".
+  virtual Status Members(const std::string& node, std::string* out) {
+    (void)node; (void)out; return Status::kInvalid;
+  }
+
   // True if CacheMany/RangeMany pipeline requests on one connection (RDMA). When
   // false (TCP), the client parallelizes batches across items with its own
   // threads instead, since the per-node loop here would be sequential.

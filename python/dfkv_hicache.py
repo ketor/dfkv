@@ -47,6 +47,8 @@ def _load_lib(path: Optional[str] = None) -> ctypes.CDLL:
                                      ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
     lib.dfkv_set_members.restype = ctypes.c_int
     lib.dfkv_set_members.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.dfkv_refresh_members.restype = ctypes.c_int
+    lib.dfkv_refresh_members.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     lib.dfkv_close.restype = None
     lib.dfkv_close.argtypes = [ctypes.c_void_p]
     return lib
@@ -100,6 +102,12 @@ class DfkvHiCache(HiCacheStorage):
     def set_members(self, members: str):
         """Hot-swap cluster membership, e.g. 'n1=ip:12000,n2=ip:12000'."""
         self._lib.dfkv_set_members(self._h, members.encode())
+
+    def refresh_members(self, seed: str) -> bool:
+        """Discover cluster membership from a seed node ('ip:port') and apply it.
+        Lets the cluster grow/shrink without restarting clients. Returns True on
+        success (seed reachable and returned a non-empty member list)."""
+        return self._lib.dfkv_refresh_members(self._h, seed.encode()) == 0
 
     # --- key scheme: MLA single object (no rank suffix); MHA two objects ---
     def _keys(self, page_hash: str) -> List[str]:

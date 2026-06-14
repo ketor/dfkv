@@ -66,6 +66,30 @@ TEST_F(KVClientTest, PutGetExistRoundTripWithImmediateVisibility) {
   EXPECT_EQ(out, v);
 }
 
+TEST_F(KVClientTest, RefreshMembersDiscoversClusterFromSeed) {
+  nodes_.push_back(StartNode("disc1"));
+  nodes_.push_back(StartNode("disc2"));
+  // Seed node advertises the full 2-node cluster.
+  std::string list = "d1=" + nodes_[0]->addr + ",d2=" + nodes_[1]->addr;
+  nodes_[0]->srv->set_members(list);
+
+  // Client seeded with only node 0; discovers the rest.
+  KVClient c({{ "d1", nodes_[0]->addr }}, SelfHdr());
+  ASSERT_TRUE(c.RefreshMembers(nodes_[0]->addr));
+  // Empty seed members => no-op false.
+  EXPECT_FALSE(c.RefreshMembers(nodes_[1]->addr));  // node 1 advertises nothing
+
+  // Membership applied: keys now route across both nodes and round-trip.
+  for (int i = 0; i < 20; ++i) {
+    std::string k = "disc_key_" + std::to_string(i);
+    std::string v(256, static_cast<char>(i));
+    ASSERT_TRUE(c.Put(k, v.data(), v.size())) << k;
+    std::string out(v.size(), '\0');
+    ASSERT_TRUE(c.Get(k, &out[0], out.size())) << k;
+    EXPECT_EQ(out, v);
+  }
+}
+
 TEST_F(KVClientTest, MissReturnsFalseNotError) {
   nodes_.push_back(StartNode("a2"));
   KVClient c({{ "a", nodes_[0]->addr }}, SelfHdr());

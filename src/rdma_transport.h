@@ -36,6 +36,7 @@ class RdmaTransport : public Transport {
                uint64_t length, std::string* out) override;
   Status Exist(const std::string& node, const BlockKey& key,
                bool* exist) override;
+  Status Members(const std::string& node, std::string* out) override;
 
   bool pipelined() const override { return true; }
   // Pipelined: up to `depth_` requests in flight on a single connection.

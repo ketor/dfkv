@@ -16,7 +16,8 @@
 namespace dfkv {
 
 // Wire op codes (shared by TcpTransport, RdmaTransport and the server).
-enum class WireOp : uint8_t { kCache = 1, kRange = 2, kExist = 3, kStats = 4 };
+// kMembers returns the node's configured cluster member list (for discovery).
+enum class WireOp : uint8_t { kCache = 1, kRange = 2, kExist = 3, kStats = 4, kMembers = 5 };
 
 constexpr uint8_t kProtoVersion = 1;
 

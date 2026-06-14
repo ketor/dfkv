@@ -198,6 +198,10 @@ Status RdmaTransport::Exist(const std::string& node, const BlockKey& key, bool* 
   return st;
 }
 
+Status RdmaTransport::Members(const std::string& node, std::string* out) {
+  return RoundTrip(node, WireOp::kMembers, BlockKey{}, 0, 0, nullptr, 0, out);
+}
+
 std::vector<Status> RdmaTransport::CacheMany(const std::string& node,
                                              const std::vector<CacheItem>& items) {
   const size_t n = items.size();

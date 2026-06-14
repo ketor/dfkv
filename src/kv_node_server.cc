@@ -133,6 +133,10 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
       *out_data = MetricsText();
       st = Status::kOk;
       break;
+    case WireOp::kMembers:
+      *out_data = members_;  // advertised cluster membership (for client discovery)
+      st = Status::kOk;
+      break;
   }
   return st;
 }

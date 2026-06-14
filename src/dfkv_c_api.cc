@@ -95,6 +95,11 @@ int dfkv_set_members(dfkv_client_t c, const char* members) {
   return 0;
 }
 
+int dfkv_refresh_members(dfkv_client_t c, const char* seed) {
+  if (!c || !seed) return -1;
+  return static_cast<KVClient*>(c)->RefreshMembers(seed) ? 0 : 1;
+}
+
 void dfkv_close(dfkv_client_t c) { delete static_cast<KVClient*>(c); }
 
 }  // extern "C"

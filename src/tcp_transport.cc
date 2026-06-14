@@ -104,6 +104,10 @@ Status TcpTransport::Stats(const std::string& node, std::string* out) {
   return RoundTrip(node, WireOp::kStats, BlockKey{}, 0, 0, nullptr, 0, out);
 }
 
+Status TcpTransport::Members(const std::string& node, std::string* out) {
+  return RoundTrip(node, WireOp::kMembers, BlockKey{}, 0, 0, nullptr, 0, out);
+}
+
 Status TcpTransport::Exist(const std::string& node, const BlockKey& key,
                            bool* exist) {
   Status st = RoundTrip(node, WireOp::kExist, key, 0, 0, nullptr, 0, nullptr);

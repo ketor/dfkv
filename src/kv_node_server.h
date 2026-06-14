@@ -29,6 +29,9 @@ class KvNodeServer {
 
   Status Start(int port);  // port 0 => ephemeral; query with port()
   void Stop();
+  // Cluster member list this node advertises for discovery (kMembers wire op):
+  // "name=ip:port,name=ip:port,...". Clients query any node to learn the cluster.
+  void set_members(const std::string& members) { members_ = members; }
   int port() const { return port_; }
   size_t Count() const { return group_.Count(); }
   uint64_t UsedBytes() const { return group_.UsedBytes(); }
@@ -61,6 +64,7 @@ class KvNodeServer {
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
+  std::string members_;  // advertised cluster membership (kMembers)
 
   DiskCacheGroup group_;
   int listen_fd_ = -1;

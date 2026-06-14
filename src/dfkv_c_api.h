@@ -26,6 +26,9 @@ int dfkv_get(dfkv_client_t c, const char* key, void* ptr, uint64_t n);        //
 int dfkv_exist(dfkv_client_t c, const char* key);                            // 1/0
 // Hot-swap cluster membership ("n1=ip:port,n2=ip:port"). Returns 0 on success.
 int dfkv_set_members(dfkv_client_t c, const char* members);
+// Discovery: query seed ("ip:port") for the cluster member list and apply it.
+// Returns 0 on success, non-zero on failure (seed unreachable / empty list).
+int dfkv_refresh_members(dfkv_client_t c, const char* seed);
 
 // Batched, concurrently fanned out. n items; out_* arrays (len n) receive
 // per-item results (1/0). Return 0 on call success.
