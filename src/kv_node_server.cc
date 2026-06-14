@@ -42,11 +42,14 @@ Status KvNodeServer::Start(int port) {
 }
 
 void KvNodeServer::Stop() {
-  bool was = running_.exchange(false);
-  if (listen_fd_ >= 0) { ::shutdown(listen_fd_, SHUT_RDWR); ::close(listen_fd_); listen_fd_ = -1; }
-  if (was && accept_thread_.joinable()) accept_thread_.join();
-  // accept loop is done; drain in-flight connections: unblock their ReadAll,
-  // then join handler threads so group_ outlives them.
+  if (!running_.exchange(false)) return;  // idempotent
+  // shutdown() (a read of listen_fd_) unblocks accept(); join the accept loop so
+  // there is no concurrent reader before we mutate/close listen_fd_.
+  if (listen_fd_ >= 0) ::shutdown(listen_fd_, SHUT_RDWR);
+  if (accept_thread_.joinable()) accept_thread_.join();
+  if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
+  // accept loop is done; drain in-flight connections: unblock their recv(), then
+  // join handler threads so group_ outlives them.
   std::vector<int> fds;
   std::vector<std::thread> threads;
   {
@@ -54,7 +57,7 @@ void KvNodeServer::Stop() {
     fds.assign(conn_fds_.begin(), conn_fds_.end());
     threads.swap(conn_threads_);
   }
-  for (int fd : fds) ::shutdown(fd, SHUT_RDWR);  // unblock blocked recv()
+  for (int fd : fds) ::shutdown(fd, SHUT_RDWR);
   for (auto& t : threads) if (t.joinable()) t.join();
 }
 

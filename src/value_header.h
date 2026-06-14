@@ -15,6 +15,7 @@
 #ifndef DFKV_VALUE_HEADER_H_
 #define DFKV_VALUE_HEADER_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -22,17 +23,18 @@
 namespace dfkv {
 
 // CRC32 (IEEE 802.3, poly 0xEDB88320) — same polynomial as zlib's crc32.
+// Table built once via a thread-safe function-local static (C++11 magic static)
+// so concurrent callers (batch fan-out) don't race on initialization.
 inline uint32_t Crc32(const void* data, size_t len) {
-  static uint32_t table[256];
-  static bool init = false;
-  if (!init) {
+  static const std::array<uint32_t, 256> table = [] {
+    std::array<uint32_t, 256> t{};
     for (uint32_t i = 0; i < 256; ++i) {
       uint32_t c = i;
       for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-      table[i] = c;
+      t[i] = c;
     }
-    init = true;
-  }
+    return t;
+  }();
   uint32_t c = 0xFFFFFFFFu;
   const auto* p = static_cast<const uint8_t*>(data);
   for (size_t i = 0; i < len; ++i) c = table[(c ^ p[i]) & 0xFFu] ^ (c >> 8);

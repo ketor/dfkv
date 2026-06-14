@@ -45,6 +45,25 @@ jobs:
       - name: Test (C++ gtests + Python plugin)
         run: ctest --test-dir build --output-on-failure -j
 
+  thread-sanitizer:
+    name: ThreadSanitizer (race detection)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ git ca-certificates
+      - name: Build with TSan
+        run: |
+          cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1" \
+            -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread \
+            -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread
+          cmake --build build-tsan -j
+      - name: Run C++ suites under TSan (python excluded — ctypes dlopen)
+        run: TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan -E python_plugin --output-on-failure
+
   rdma-compile:
     name: RDMA build (compile-check)
     runs-on: ubuntu-latest
