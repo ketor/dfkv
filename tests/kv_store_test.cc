@@ -41,6 +41,26 @@ TEST_F(KVStoreTest, CacheThenRangeRoundTripAndImmediateVisibility) {
   EXPECT_EQ(out, v);
 }
 
+TEST_F(KVStoreTest, RangeIntoReadsStraightIntoCallerBuffer) {
+  KVStore s(Opts());
+  BlockKey k{222, 0, 1};
+  std::string v = "zero-copy-server-side-payload-bytes";
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  char buf[64];
+  size_t got = 0;
+  ASSERT_EQ(s.RangeInto(k, 0, v.size(), buf, sizeof(buf), &got), Status::kOk);
+  EXPECT_EQ(got, v.size());
+  EXPECT_EQ(std::string(buf, got), v);
+  // miss => NotFound, out_len 0
+  got = 12345;
+  EXPECT_EQ(s.RangeInto(BlockKey{999, 0, 1}, 0, 64, buf, sizeof(buf), &got), Status::kNotFound);
+  EXPECT_EQ(got, 0u);
+  // dst_cap caps the read
+  ASSERT_EQ(s.RangeInto(k, 0, v.size(), buf, 4, &got), Status::kOk);
+  EXPECT_EQ(got, 4u);
+  EXPECT_EQ(std::string(buf, 4), v.substr(0, 4));
+}
+
 TEST_F(KVStoreTest, RangeMissReturnsNotFoundNoS3) {
   KVStore s(Opts());
   std::string out;

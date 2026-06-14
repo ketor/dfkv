@@ -49,6 +49,12 @@ class KvNodeServer {
                         uint64_t offset, uint64_t length, const char* payload,
                         uint64_t payload_len, std::string* out_data);
 
+  // Zero-copy server-side GET: read the block straight into `dst` (e.g. the RDMA
+  // send buffer), no intermediate std::string. *out_len = bytes read. Updates
+  // hit/miss + bytes_read metrics like a Range.
+  Status RangeInto(uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
+                   uint64_t length, char* dst, size_t dst_cap, size_t* out_len);
+
  private:
   void AcceptLoop();
   void Handle(int fd);

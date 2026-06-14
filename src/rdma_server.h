@@ -27,10 +27,16 @@ class RdmaServer {
       uint8_t op, uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
       uint64_t length, const char* payload, uint64_t payload_len,
       std::string* out_data)>;
+  // Optional zero-copy GET handler: read the block straight into `dst` (the send
+  // buffer), no std::string. When set, kRange requests use it instead of Handler.
+  using RangeHandler = std::function<Status(
+      uint64_t id, uint32_t index, uint32_t ksize, uint64_t offset,
+      uint64_t length, char* dst, size_t dst_cap, size_t* out_len)>;
 
   // dev_name empty => env DFKV_RDMA_DEV, else first device.
   explicit RdmaServer(Handler handler, size_t max_msg = (8u << 20),
                       const std::string& dev_name = "");
+  void set_range_handler(RangeHandler h) { range_handler_ = std::move(h); }
   ~RdmaServer();
 
   Status Start(int port);  // TCP bootstrap port
@@ -42,6 +48,7 @@ class RdmaServer {
   void Serve(int boot_fd);
 
   Handler handler_;
+  RangeHandler range_handler_;
   size_t max_msg_;
   std::string dev_name_;
   int listen_fd_ = -1;

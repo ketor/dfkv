@@ -35,6 +35,11 @@ class KVStore {
   // [offset, offset+length) from the local block; NotFound if absent.
   Status Range(const BlockKey& key, uint64_t offset, uint64_t length,
                std::string* out);
+  // Like Range but reads straight into a caller buffer (no std::string), saving a
+  // copy on the server GET path. Reads up to min(length, file-offset, dst_cap)
+  // bytes into dst; *out_len = bytes read. NotFound if absent.
+  Status RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
+                   char* dst, size_t dst_cap, size_t* out_len);
   bool IsCached(const BlockKey& key) const;
 
   uint64_t UsedBytes() const;

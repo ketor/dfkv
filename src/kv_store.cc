@@ -127,6 +127,33 @@ Status KVStore::Range(const BlockKey& key, uint64_t offset, uint64_t length,
   return Status::kOk;
 }
 
+Status KVStore::RangeInto(const BlockKey& key, uint64_t offset, uint64_t length,
+                          char* dst, size_t dst_cap, size_t* out_len) {
+  *out_len = 0;
+  std::ifstream ifs;
+  uint64_t fsize = 0;
+  {  // index lookup + open under the lock; bulk read outside (see Range)
+    std::lock_guard<std::mutex> lk(mu_);
+    const std::string fname = key.Filename();
+    auto it = index_.find(fname);
+    if (it == index_.end()) return Status::kNotFound;
+    ifs.open(it->second.path, std::ios::binary);
+    if (!ifs) return Status::kIOError;
+    fsize = it->second.size;
+    TouchLocked(fname);
+  }
+  if (offset > fsize) return Status::kInvalid;
+  uint64_t end = offset + length;
+  if (end > fsize) end = fsize;
+  uint64_t n = end - offset;
+  if (n > dst_cap) n = dst_cap;
+  ifs.seekg(static_cast<std::streamoff>(offset));
+  if (n) ifs.read(dst, static_cast<std::streamsize>(n));
+  if (!ifs && n) return Status::kIOError;
+  *out_len = static_cast<size_t>(n);
+  return Status::kOk;
+}
+
 bool KVStore::IsCached(const BlockKey& key) const {
   std::lock_guard<std::mutex> lk(mu_);
   return index_.count(key.Filename()) != 0;

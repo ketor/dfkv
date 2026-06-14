@@ -124,10 +124,37 @@ void RdmaServer::Serve(int boot_fd) {
   free_send.reserve(K);
   for (size_t i = 0; i < K; ++i) free_send.push_back(i);
 
+  // Build the reply for one request into ep.sbuf[slot]; returns the send length
+  // or -1 on overflow. For kRange with a zero-copy range handler set, the payload
+  // is read straight into sbuf+kRespPrefix (no std::string) — server-side zero
+  // copy. Other ops use the generic handler. Thread-safe: distinct slots, and the
+  // handlers are thread-safe (DiskCacheGroup locks); callers serialize post_send.
+  auto build_reply = [&](size_t slot, uint8_t op, uint64_t id, uint32_t index,
+                         uint32_t ksize, uint64_t offset, uint64_t length,
+                         const char* payload, uint64_t payload_len) -> long {
+    char* sb = ep.sbuf(slot);
+    if (op == static_cast<uint8_t>(WireOp::kRange) && range_handler_) {
+      size_t out_len = 0;
+      Status st = range_handler_(id, index, ksize, offset, length,
+                                 sb + kRespPrefix, ep.cap() - kRespPrefix, &out_len);
+      sb[0] = static_cast<char>(st);
+      uint64_t dlen = (st == Status::kOk) ? out_len : 0;
+      net::PutU64(sb + 1, dlen);
+      return static_cast<long>(kRespPrefix + dlen);
+    }
+    std::string data;
+    Status st = handler_(op, id, index, ksize, offset, length, payload, payload_len, &data);
+    if (kRespPrefix + data.size() > ep.cap()) return -1;
+    sb[0] = static_cast<char>(st);
+    net::PutU64(sb + 1, data.size());
+    if (!data.empty()) std::memcpy(sb + kRespPrefix, data.data(), data.size());
+    return static_cast<long>(kRespPrefix + data.size());
+  };
+
   // Worker pool: when pipelining (K>1), the slow part of a GET (reading the
   // 2.74 MiB object) is dispatched to workers so a single connection's in-flight
   // reads run in parallel; the serve thread keeps reaping completions. post_send
-  // on the shared QP is serialized by send_mu. PUT (large inline payload that
+  // on the shared QP is serialized by qp_mu. PUT (large inline payload that
   // lives in rbuf) and the K==1 path stay on the serve thread. Workers are joined
   // before ep is destroyed, so ep always outlives them (no use-after-free).
   struct WorkItem { uint8_t op; uint64_t id; uint32_t index, ksize; uint64_t offset, length; size_t slot; };
@@ -146,16 +173,10 @@ void RdmaServer::Serve(int boot_fd) {
         if (queue.empty()) return;  // done
         it = queue.front(); queue.pop_front();
       }
-      std::string data;
-      Status st = handler_(it.op, it.id, it.index, it.ksize, it.offset, it.length,
-                           nullptr, 0, &data);
-      if (kRespPrefix + data.size() > ep.cap()) { failed = true; continue; }
-      char* sb = ep.sbuf(it.slot);
-      sb[0] = static_cast<char>(st);
-      net::PutU64(sb + 1, data.size());
-      if (!data.empty()) std::memcpy(sb + kRespPrefix, data.data(), data.size());
-      std::lock_guard<std::mutex> sl(qp_mu);
-      if (!ep.PostSend(it.slot, kRespPrefix + data.size())) failed = true;
+      long sl = build_reply(it.slot, it.op, it.id, it.index, it.ksize, it.offset, it.length, nullptr, 0);
+      if (sl < 0) { failed = true; continue; }
+      std::lock_guard<std::mutex> lk(qp_mu);
+      if (!ep.PostSend(it.slot, static_cast<size_t>(sl))) failed = true;
     }
   };
   std::vector<std::thread> workers;
@@ -190,21 +211,17 @@ void RdmaServer::Serve(int boot_fd) {
         qcv.notify_one();
         continue;
       }
-      // Inline: PUT (payload in rbuf) or non-pipelined path.
+      // Inline: PUT (payload in rbuf) or non-pipelined path. GET here (W==0) still
+      // gets server-side zero-copy via build_reply's range-handler branch.
       const char* payload = (payload_len && wc.byte_len >= kReqPrefix + payload_len)
                                 ? req + kReqPrefix : nullptr;
-      std::string data;
-      Status st = handler_(op, net::GetU64(req + 1), net::GetU32(req + 9),
-                           net::GetU32(req + 13), net::GetU64(req + 17),
-                           net::GetU64(req + 25), payload, payload_len, &data);
+      long sl = build_reply(s, op, net::GetU64(req + 1), net::GetU32(req + 9),
+                            net::GetU32(req + 13), net::GetU64(req + 17),
+                            net::GetU64(req + 25), payload, payload_len);
       { std::lock_guard<std::mutex> ql(qp_mu); if (!ep.PostRecv(r)) { fail = true; break; } }
-      if (kRespPrefix + data.size() > ep.cap()) { fail = true; break; }
-      char* sb = ep.sbuf(s);
-      sb[0] = static_cast<char>(st);
-      net::PutU64(sb + 1, data.size());
-      if (!data.empty()) std::memcpy(sb + kRespPrefix, data.data(), data.size());
-      std::lock_guard<std::mutex> sl(qp_mu);
-      if (!ep.PostSend(s, kRespPrefix + data.size())) { fail = true; break; }
+      if (sl < 0) { fail = true; break; }
+      std::lock_guard<std::mutex> sg(qp_mu);
+      if (!ep.PostSend(s, static_cast<size_t>(sl))) { fail = true; break; }
     }
   }
   // Drain workers before ep is destroyed (ep must outlive every worker).
