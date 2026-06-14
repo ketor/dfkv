@@ -2,15 +2,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
-
-#include <unistd.h>
 
 #include "mds_server.h"
 
 namespace {
-dfkv::MdsServer* g_srv = nullptr;
-void OnSig(int) { if (g_srv) g_srv->Stop(); }
+volatile sig_atomic_t g_stop = 0;
+void OnSig(int) { g_stop = 1; }  // async-signal-safe: just set a flag
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -21,7 +20,6 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--listen")) port = std::atoi(argv[i + 1]);
   }
   dfkv::MdsServer srv(etcd);
-  g_srv = &srv;
   std::signal(SIGINT, OnSig);
   std::signal(SIGTERM, OnSig);
   if (srv.Start(port) != dfkv::Status::kOk) {
@@ -30,6 +28,8 @@ int main(int argc, char** argv) {
   }
   std::printf("dfkv_mds listening on %d, etcd=%s\n", srv.port(), etcd.c_str());
   std::fflush(stdout);
-  pause();  // until SIGINT/SIGTERM -> OnSig calls Stop()
+  // poll flag from normal context (matches dfkv_server_main.cc)
+  while (!g_stop) { struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); }
+  srv.Stop();  // called from the main thread, not the signal handler
   return 0;
 }
