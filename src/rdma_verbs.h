@@ -20,7 +20,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <list>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace dfkv {
@@ -97,7 +99,12 @@ class RcEndpoint {
   size_t cap_ = 0, depth_ = 0;
   std::vector<char*> sbuf_, rbuf_;
   std::vector<ibv_mr*> smr_, rmr_;
-  std::unordered_map<uintptr_t, ibv_mr*> user_mr_;  // cached caller-buffer MRs
+  // LRU-capped cache of caller-buffer MRs (addr -> {mr, lru-iterator}); front of
+  // user_lru_ is MRU. Bounded so a workload with many distinct buffers can't leak
+  // registrations (a stable HiCache pool stays fully cached and always hits).
+  static constexpr size_t kMaxUserMr = 64;
+  std::list<uintptr_t> user_lru_;
+  std::unordered_map<uintptr_t, std::pair<ibv_mr*, std::list<uintptr_t>::iterator>> user_mr_;
   QpInfo local_;
 };
 

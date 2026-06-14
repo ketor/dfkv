@@ -11,15 +11,9 @@
 
 #include "kv_store.h"   // Status
 #include "kv_types.h"
+#include "wire.h"       // WireOp, kReqPrefix, kRespPrefix, Encode/DecodeReq/Resp
 
 namespace dfkv {
-
-// Wire op codes (shared by TcpTransport and KvNodeServer).
-enum class WireOp : uint8_t { kCache = 1, kRange = 2, kExist = 3, kStats = 4 };
-// Fixed request prefix: op(1) id(8) index(4) size(4) offset(8) length(8) payload_len(8)
-constexpr size_t kReqPrefix = 1 + 8 + 4 + 4 + 8 + 8 + 8;  // = 41
-// Fixed response prefix: status(1) data_len(8)
-constexpr size_t kRespPrefix = 1 + 8;  // = 9
 
 // One write in a batch (data must outlive the CacheMany call).
 struct CacheItem { BlockKey key; const void* data; size_t len; };

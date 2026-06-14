@@ -7,8 +7,7 @@
 #include "tcp_transport.h"
 
 #ifdef DFKV_WITH_RDMA
-#include "rdma_transport.h"      // native verbs (default): device-by-name, 400G-capable
-#include "rdma_cm_transport.h"   // librdmacm fallback (DFKV_RDMA_CM=1): IP-routed, IB/RoCE
+#include "rdma_transport.h"  // native verbs: device-by-name, 400G-capable
 #endif
 
 namespace dfkv {
@@ -24,12 +23,7 @@ bool EnvTruthy(const char* name) {
 std::unique_ptr<Transport> MakeClientTransport(std::string* reason) {
 #ifdef DFKV_WITH_RDMA
   if (EnvTruthy("DFKV_RDMA")) {
-    if (EnvTruthy("DFKV_RDMA_CM")) {  // explicit librdmacm fallback (IP-routed)
-      if (RdmaCmTransport::Available()) {
-        if (reason) *reason = "rdma-cm";
-        return std::make_unique<RdmaCmTransport>();
-      }
-    } else if (RdmaTransport::Available()) {  // native verbs (default)
+    if (RdmaTransport::Available()) {  // native verbs (device-by-name, 400G)
       if (reason) *reason = "rdma";
       return std::make_unique<RdmaTransport>();
     }

@@ -156,19 +156,17 @@ void KvNodeServer::Handle(int fd) {
   while (running_) {
     char prefix[kReqPrefix];
     if (!net::ReadAll(fd, prefix, kReqPrefix)) return;  // peer closed / error
-    uint64_t payload_len = net::GetU64(prefix + 33);
-    std::vector<char> payload(payload_len);
-    if (payload_len && !net::ReadAll(fd, payload.data(), payload_len)) return;
+    ReqFields rq;
+    if (!DecodeReq(prefix, &rq)) return;  // bad protocol version => drop
+    std::vector<char> payload(rq.payload_len);
+    if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
 
     std::string data;
-    Status st = ProcessRequest(
-        static_cast<uint8_t>(prefix[0]), net::GetU64(prefix + 1),
-        net::GetU32(prefix + 9), net::GetU32(prefix + 13), net::GetU64(prefix + 17),
-        net::GetU64(prefix + 25), payload.data(), payload_len, &data);
+    Status st = ProcessRequest(rq.op, rq.id, rq.index, rq.size, rq.offset,
+                               rq.length, payload.data(), rq.payload_len, &data);
 
     char rp[kRespPrefix];
-    rp[0] = static_cast<char>(st);
-    net::PutU64(rp + 1, data.size());
+    EncodeResp(rp, st, data.size());
     if (!net::WriteAll(fd, rp, kRespPrefix)) return;
     if (!data.empty() && !net::WriteAll(fd, data.data(), data.size())) return;
   }

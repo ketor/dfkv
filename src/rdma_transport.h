@@ -64,6 +64,8 @@ class RdmaTransport : public Transport {
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
   size_t max_msg_;
   size_t depth_;
+  int connect_ms_ = 3000;             // bootstrap TCP connect timeout (DFKV_RDMA_CONNECT_MS)
+  int io_ms_ = 10000;                 // bootstrap TCP IO timeout (DFKV_RDMA_IO_MS)
   std::vector<std::string> devs_;     // RDMA devices (multi-rail); "" = first
   std::atomic<size_t> rr_{0};         // round-robin selector across devs_
 };

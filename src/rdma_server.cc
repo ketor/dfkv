@@ -84,6 +84,16 @@ size_t ServerDepth() {
   if (e && *e) { long v = std::strtol(e, nullptr, 10); if (v >= 1 && v <= 256) return (size_t)v; }
   return 1;
 }
+
+size_t ServerWorkers(size_t K) {
+  // GET worker-pool size per connection (only used when pipelining, K>1).
+  // Default min(K, 8); override with DFKV_RDMA_WORKERS.
+  if (K <= 1) return 0;
+  size_t w = K < 8 ? K : 8;
+  const char* e = std::getenv("DFKV_RDMA_WORKERS");
+  if (e && *e) { long v = std::strtol(e, nullptr, 10); if (v >= 1 && v <= 256) w = (size_t)v; }
+  return w < K ? w : K;
+}
 }  // namespace
 
 void RdmaServer::Serve(int boot_fd) {
@@ -137,16 +147,14 @@ void RdmaServer::Serve(int boot_fd) {
       size_t out_len = 0;
       Status st = range_handler_(id, index, ksize, offset, length,
                                  sb + kRespPrefix, ep.cap() - kRespPrefix, &out_len);
-      sb[0] = static_cast<char>(st);
       uint64_t dlen = (st == Status::kOk) ? out_len : 0;
-      net::PutU64(sb + 1, dlen);
+      EncodeResp(sb, st, dlen);
       return static_cast<long>(kRespPrefix + dlen);
     }
     std::string data;
     Status st = handler_(op, id, index, ksize, offset, length, payload, payload_len, &data);
     if (kRespPrefix + data.size() > ep.cap()) return -1;
-    sb[0] = static_cast<char>(st);
-    net::PutU64(sb + 1, data.size());
+    EncodeResp(sb, st, data.size());
     if (!data.empty()) std::memcpy(sb + kRespPrefix, data.data(), data.size());
     return static_cast<long>(kRespPrefix + data.size());
   };
@@ -163,7 +171,7 @@ void RdmaServer::Serve(int boot_fd) {
   std::deque<WorkItem> queue;
   std::atomic<bool> failed{false};
   bool done = false;
-  const size_t W = (K > 1) ? std::min<size_t>(K, 8) : 0;
+  const size_t W = ServerWorkers(K);
   auto worker = [&] {
     for (;;) {
       WorkItem it;
@@ -196,16 +204,14 @@ void RdmaServer::Serve(int boot_fd) {
       }
       if (wc.opcode != IBV_WC_RECV || wc.byte_len < kReqPrefix) { fail = true; break; }
       size_t r = static_cast<size_t>(wc.wr_id);
-      const char* req = ep.rbuf(r);
-      const uint8_t op = static_cast<uint8_t>(req[0]);
-      const uint64_t payload_len = net::GetU64(req + 33);
+      ReqFields rq;
+      if (!DecodeReq(ep.rbuf(r), &rq)) { fail = true; break; }  // bad protocol version
       if (free_send.empty()) { fail = true; break; }
       size_t s = free_send.back(); free_send.pop_back();
 
       // GET/Exist/Stats (no payload needed past parse) -> pool when pipelining.
-      if (W > 0 && op != static_cast<uint8_t>(WireOp::kCache)) {
-        WorkItem it{op, net::GetU64(req + 1), net::GetU32(req + 9), net::GetU32(req + 13),
-                    net::GetU64(req + 17), net::GetU64(req + 25), s};
+      if (W > 0 && rq.op != static_cast<uint8_t>(WireOp::kCache)) {
+        WorkItem it{rq.op, rq.id, rq.index, rq.size, rq.offset, rq.length, s};
         { std::lock_guard<std::mutex> ql(qp_mu); if (!ep.PostRecv(r)) { fail = true; break; } }  // fields copied; safe to re-arm
         { std::lock_guard<std::mutex> lk(qmu); queue.push_back(it); }
         qcv.notify_one();
@@ -213,11 +219,10 @@ void RdmaServer::Serve(int boot_fd) {
       }
       // Inline: PUT (payload in rbuf) or non-pipelined path. GET here (W==0) still
       // gets server-side zero-copy via build_reply's range-handler branch.
-      const char* payload = (payload_len && wc.byte_len >= kReqPrefix + payload_len)
-                                ? req + kReqPrefix : nullptr;
-      long sl = build_reply(s, op, net::GetU64(req + 1), net::GetU32(req + 9),
-                            net::GetU32(req + 13), net::GetU64(req + 17),
-                            net::GetU64(req + 25), payload, payload_len);
+      const char* payload = (rq.payload_len && wc.byte_len >= kReqPrefix + rq.payload_len)
+                                ? ep.rbuf(r) + kReqPrefix : nullptr;
+      long sl = build_reply(s, rq.op, rq.id, rq.index, rq.size, rq.offset, rq.length,
+                            payload, rq.payload_len);
       { std::lock_guard<std::mutex> ql(qp_mu); if (!ep.PostRecv(r)) { fail = true; break; } }
       if (sl < 0) { fail = true; break; }
       std::lock_guard<std::mutex> sg(qp_mu);

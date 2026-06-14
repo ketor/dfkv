@@ -30,8 +30,9 @@ void RcEndpoint::Close() {
   if (qp_) { ibv_destroy_qp(qp_); qp_ = nullptr; }
   for (auto* m : smr_) if (m) ibv_dereg_mr(m);
   for (auto* m : rmr_) if (m) ibv_dereg_mr(m);
-  for (auto& [addr, m] : user_mr_) if (m) ibv_dereg_mr(m);
+  for (auto& [addr, e] : user_mr_) if (e.first) ibv_dereg_mr(e.first);
   user_mr_.clear();
+  user_lru_.clear();
   smr_.clear(); rmr_.clear();
   for (auto* b : sbuf_) delete[] b;
   for (auto* b : rbuf_) delete[] b;
@@ -178,10 +179,28 @@ bool RcEndpoint::PostSend(size_t slot, size_t len) {
 ibv_mr* RcEndpoint::RegisterUser(void* addr, size_t len) {
   auto key = reinterpret_cast<uintptr_t>(addr);
   auto it = user_mr_.find(key);
-  if (it != user_mr_.end() && it->second->length >= len) return it->second;
-  if (it != user_mr_.end()) { ibv_dereg_mr(it->second); user_mr_.erase(it); }  // grew
+  if (it != user_mr_.end()) {
+    if (it->second.first->length >= len) {           // hit -> move to MRU front
+      user_lru_.erase(it->second.second);
+      user_lru_.push_front(key);
+      it->second.second = user_lru_.begin();
+      return it->second.first;
+    }
+    ibv_dereg_mr(it->second.first);                  // buffer grew -> re-register
+    user_lru_.erase(it->second.second);
+    user_mr_.erase(it);
+  }
+  while (user_mr_.size() >= kMaxUserMr && !user_lru_.empty()) {  // evict LRU
+    uintptr_t victim = user_lru_.back();
+    auto vit = user_mr_.find(victim);
+    if (vit != user_mr_.end()) { ibv_dereg_mr(vit->second.first); user_mr_.erase(vit); }
+    user_lru_.pop_back();
+  }
   ibv_mr* mr = ibv_reg_mr(pd_, addr, len, IBV_ACCESS_LOCAL_WRITE);
-  if (mr) user_mr_[key] = mr;
+  if (mr) {
+    user_lru_.push_front(key);
+    user_mr_[key] = {mr, user_lru_.begin()};
+  }
   return mr;
 }
 

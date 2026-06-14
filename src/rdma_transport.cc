@@ -12,15 +12,13 @@
 namespace dfkv {
 
 namespace {
-void EncodePrefix(char* p, WireOp op, const BlockKey& k, uint64_t offset,
-                  uint64_t length, uint64_t payload_len) {
-  p[0] = static_cast<char>(op);
-  net::PutU64(p + 1, k.id);
-  net::PutU32(p + 9, k.index);
-  net::PutU32(p + 13, k.size);
-  net::PutU64(p + 17, offset);
-  net::PutU64(p + 25, length);
-  net::PutU64(p + 33, payload_len);
+constexpr size_t kMaxIdlePerNode = 16;  // cap pooled idle conns per node (each is depth*max_msg*2)
+
+int EnvInt(const char* name, int dflt) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) return dflt;
+  long x = std::strtol(v, nullptr, 10);
+  return x > 0 ? static_cast<int>(x) : dflt;
 }
 
 // Post w requests (already built in ep.sbuf[j], send length slen[j]) with one
@@ -74,6 +72,8 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   if (devs_.empty()) devs_.push_back("");  // first available device
   const char* d = std::getenv("DFKV_RDMA_DEPTH");  // pipeline depth (must be <= server's)
   if (d && *d) { long v = std::strtol(d, nullptr, 10); if (v >= 1 && v <= 256) depth_ = (size_t)v; }
+  connect_ms_ = EnvInt("DFKV_RDMA_CONNECT_MS", 3000);
+  io_ms_ = EnvInt("DFKV_RDMA_IO_MS", 10000);
 }
 
 RdmaTransport::~RdmaTransport() {
@@ -96,7 +96,7 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
   *from_pool = false;
   // Bootstrap the QP over a short-lived TCP connection to the node's member
   // address (control plane). The data plane then rides the named RDMA device.
-  int fd = net::Dial(node, /*connect_ms=*/3000, /*io_ms=*/10000);
+  int fd = net::Dial(node, connect_ms_, io_ms_);
   if (fd < 0) return nullptr;
 
   // Round-robin a device for this connection (multi-rail spreads load over ports).
@@ -127,8 +127,12 @@ RdmaTransport::Conn* RdmaTransport::Acquire(const std::string& node, bool* from_
 }
 
 void RdmaTransport::Release(const std::string& node, Conn* c) {
-  std::lock_guard<std::mutex> lk(mu_);
-  pool_[node].push_back(c);
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto& v = pool_[node];
+    if (v.size() < kMaxIdlePerNode) { v.push_back(c); return; }
+  }
+  Destroy(c);  // pool full -> drop (and tear down the QP/MRs) instead of growing
 }
 
 Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
@@ -142,7 +146,7 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
     if (!c) return Status::kIOError;
     rdma::RcEndpoint& ep = c->ep;
 
-    EncodePrefix(ep.sbuf(0), op, k, offset, length, payload_len);
+    EncodeReq(ep.sbuf(0), op, k, offset, length, payload_len);
     if (payload_len) std::memcpy(ep.sbuf(0) + kReqPrefix, payload, payload_len);
 
     bool ok = ep.PostRecv(0) && ep.PostSend(0, kReqPrefix + payload_len);
@@ -163,8 +167,8 @@ Status RdmaTransport::RoundTrip(const std::string& node, WireOp op,
       continue;  // stale pooled conn -> retry fresh
     }
     if (recv_bytes < kRespPrefix) { Destroy(c); return Status::kIOError; }
-    Status st = static_cast<Status>(static_cast<uint8_t>(ep.rbuf(0)[0]));
-    uint64_t dlen = net::GetU64(ep.rbuf(0) + 1);
+    Status st; uint64_t dlen = 0;
+    if (!DecodeResp(ep.rbuf(0), &st, &dlen)) { Destroy(c); return Status::kIOError; }
     if (out) {
       if (kRespPrefix + dlen > recv_bytes) { Destroy(c); return Status::kIOError; }
       out->assign(ep.rbuf(0) + kRespPrefix, dlen);
@@ -209,15 +213,16 @@ std::vector<Status> RdmaTransport::CacheMany(const std::string& node,
     std::vector<size_t> slen(w);
     for (size_t j = 0; j < w; ++j) {
       const CacheItem& it = items[base + j];
-      EncodePrefix(ep.sbuf(j), WireOp::kCache, it.key, 0, 0, it.len);
+      EncodeReq(ep.sbuf(j), WireOp::kCache, it.key, 0, 0, it.len);
       if (it.len) std::memcpy(ep.sbuf(j) + kReqPrefix, it.data, it.len);
       slen[j] = kReqPrefix + it.len;
     }
     std::vector<uint32_t> rbytes;
     if (!RunWindow(ep, slen, &rbytes)) { conn_ok = false; break; }
-    for (size_t j = 0; j < w; ++j)
-      if (rbytes[j] >= kRespPrefix)
-        res[base + j] = static_cast<Status>(static_cast<uint8_t>(ep.rbuf(j)[0]));
+    for (size_t j = 0; j < w; ++j) {
+      Status st; uint64_t dl = 0;
+      if (rbytes[j] >= kRespPrefix && DecodeResp(ep.rbuf(j), &st, &dl)) res[base + j] = st;
+    }
   }
   if (conn_ok) Release(node, c); else Destroy(c);
   return res;
@@ -244,7 +249,7 @@ std::vector<Status> RdmaTransport::RangeMany(const std::string& node,
     const size_t w = std::min(W, n - base);
     std::vector<size_t> slen(w);
     for (size_t j = 0; j < w; ++j) {
-      EncodePrefix(ep.sbuf(j), WireOp::kRange, keys[base + j], offset, length, 0);
+      EncodeReq(ep.sbuf(j), WireOp::kRange, keys[base + j], offset, length, 0);
       slen[j] = kReqPrefix;
     }
     std::vector<uint32_t> rbytes;
@@ -252,10 +257,10 @@ std::vector<Status> RdmaTransport::RangeMany(const std::string& node,
     for (size_t j = 0; j < w; ++j) {
       uint32_t rb = rbytes[j];
       if (rb < kRespPrefix) continue;
-      Status st = static_cast<Status>(static_cast<uint8_t>(ep.rbuf(j)[0]));
+      Status st; uint64_t dlen = 0;
+      if (!DecodeResp(ep.rbuf(j), &st, &dlen)) continue;
       res[base + j] = st;
       if (st == Status::kOk) {
-        uint64_t dlen = net::GetU64(ep.rbuf(j) + 1);
         if (kRespPrefix + dlen <= rb) (*outs)[base + j].assign(ep.rbuf(j) + kRespPrefix, dlen);
         else res[base + j] = Status::kIOError;
       }
@@ -297,7 +302,7 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
     // Scatter recv [hdr -> rbuf | payload -> caller buffer], then send the Range req.
     for (size_t j = 0; j < w && conn_ok; ++j) {
       if (!ep.PostRecvScatter(j, dsts[base + j].payload, dsts[base + j].n, mrs[j], hdr_bytes)) { conn_ok = false; break; }
-      EncodePrefix(ep.sbuf(j), WireOp::kRange, keys[base + j], 0, header_size + dsts[base + j].n, 0);
+      EncodeReq(ep.sbuf(j), WireOp::kRange, keys[base + j], 0, header_size + dsts[base + j].n, 0);
       if (!ep.PostSend(j, kReqPrefix)) { conn_ok = false; break; }
     }
     if (!conn_ok) break;
@@ -318,7 +323,8 @@ std::vector<Status> RdmaTransport::RangeInto(const std::string& node,
     for (size_t j = 0; j < w; ++j) {
       uint32_t rb = rbytes[j];
       if (rb < kRespPrefix) continue;
-      Status st = static_cast<Status>(static_cast<uint8_t>(ep.rbuf(j)[0]));
+      Status st; uint64_t dl = 0;
+      if (!DecodeResp(ep.rbuf(j), &st, &dl)) continue;
       res[base + j] = st;            // payload (if any) already in dsts[].payload
       if (st == Status::kOk) {
         if (rb >= hdr_bytes) (*hdrs)[base + j].assign(ep.rbuf(j) + kRespPrefix, header_size);

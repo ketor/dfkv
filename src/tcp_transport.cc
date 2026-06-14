@@ -11,17 +11,6 @@ namespace dfkv {
 namespace {
 constexpr size_t kMaxIdlePerNode = 16;  // cap pooled idle conns per node
 
-void EncodePrefix(char* p, WireOp op, const BlockKey& k, uint64_t offset,
-                  uint64_t length, uint64_t payload_len) {
-  p[0] = static_cast<char>(op);
-  net::PutU64(p + 1, k.id);
-  net::PutU32(p + 9, k.index);
-  net::PutU32(p + 13, k.size);
-  net::PutU64(p + 17, offset);
-  net::PutU64(p + 25, length);
-  net::PutU64(p + 33, payload_len);
-}
-
 // Do one request/response on an existing fd. Returns false on any TRANSPORT
 // failure (caller should drop the connection); on success sets *st to the
 // server's response status (which may itself be NotFound etc.).
@@ -29,14 +18,14 @@ bool OneShot(int fd, WireOp op, const BlockKey& k, uint64_t offset,
              uint64_t length, const void* payload, uint64_t payload_len,
              Status* st, std::string* out) {
   char prefix[kReqPrefix];
-  EncodePrefix(prefix, op, k, offset, length, payload_len);
+  EncodeReq(prefix, op, k, offset, length, payload_len);
   if (!net::WriteAll(fd, prefix, kReqPrefix)) return false;
   if (payload_len && !net::WriteAll(fd, payload, payload_len)) return false;
 
   char rp[kRespPrefix];
   if (!net::ReadAll(fd, rp, kRespPrefix)) return false;
-  *st = static_cast<Status>(static_cast<uint8_t>(rp[0]));
-  uint64_t dlen = net::GetU64(rp + 1);
+  uint64_t dlen = 0;
+  if (!DecodeResp(rp, st, &dlen)) return false;  // bad protocol version
   if (dlen) {
     std::string data(dlen, '\0');
     if (!net::ReadAll(fd, &data[0], dlen)) return false;
