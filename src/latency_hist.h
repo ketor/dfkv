@@ -34,17 +34,22 @@ class LatencyHist {
     return static_cast<double>(sum_us_.load(std::memory_order_relaxed)) / 1e6;
   }
 
-  // Render Prometheus histogram lines. `labels` is the inner label set (e.g.
-  // `op="get"`) or empty. Buckets are cumulative (le).
+  // Full Prometheus block (HELP + TYPE + body). `labels` is the inner label set
+  // (e.g. `op="get"`) or empty. Buckets are cumulative (le).
   std::string Render(const std::string& name, const std::string& labels) const {
+    return "# HELP " + name + " Operation latency seconds\n" +
+           "# TYPE " + name + " histogram\n" + RenderBody(name, labels);
+  }
+
+  // Body only (no HELP/TYPE) — for emitting several label sets of the SAME metric
+  // (e.g. op="get" and op="put") under a single HELP/TYPE header.
+  std::string RenderBody(const std::string& name, const std::string& labels) const {
     auto lbl = [&](const std::string& extra) {
       std::string in = extra;
       if (!labels.empty()) in += (in.empty() ? "" : ",") + labels;
       return in.empty() ? std::string() : "{" + in + "}";
     };
     std::string s;
-    s += "# HELP " + name + " Operation latency seconds\n";
-    s += "# TYPE " + name + " histogram\n";
     uint64_t cum = 0;
     char le[32];
     for (int i = 0; i < kNB; ++i) {
