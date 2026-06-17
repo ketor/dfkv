@@ -32,3 +32,16 @@ TEST(ClientMetrics, CountsServedErrorsTransitionsAndRenders) {
   EXPECT_NE(t.find("dfkv_client_peer_recovered_total 1"), std::string::npos) << t;
   EXPECT_NE(t.find("dfkv_client_peer_errors_total{peer=\"10.0.0.1:12000\"} 1"), std::string::npos) << t;
 }
+
+TEST(ClientMetrics, PerPeerMapIsCardinalityBounded) {
+  // A client that churns through many distinct peer addresses must not grow the
+  // per-peer error map (and its scrape cardinality) without bound.
+  PeerHealth h(1000);
+  for (int i = 0; i < 6000; ++i) h.MarkBad("10.0.0." + std::to_string(i) + ":1", 1000);
+  std::string t = h.Render();
+  size_t n = 0, pos = 0;
+  const std::string needle = "dfkv_client_peer_errors_total{peer=";
+  while ((pos = t.find(needle, pos)) != std::string::npos) { ++n; pos += needle.size(); }
+  EXPECT_LE(n, 4096u) << "per-peer series cardinality not bounded: " << n;
+  EXPECT_EQ(h.errors(), 6000u);  // aggregate still counts every error
+}

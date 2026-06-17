@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "net_util.h"
+#include "prom_escape.h"
 #include "transport.h"
 
 namespace dfkv {
@@ -104,7 +105,8 @@ std::string KvNodeServer::MetricsText() const {
   // single-node scrape and older tooling keep the bare `metric N` form.
   std::string idlabels;
   if (!node_id_.empty() || !node_group_.empty())
-    idlabels = "node=\"" + node_id_ + "\",group=\"" + node_group_ + "\"";
+    idlabels = "node=\"" + PromLabelEscape(node_id_) + "\",group=\"" +
+               PromLabelEscape(node_group_) + "\"";
   // braces(extra): merge `extra` label set with the identity labels.
   auto braces = [&](const std::string& extra) {
     std::string in = extra;
@@ -126,7 +128,8 @@ std::string KvNodeServer::MetricsText() const {
   s += std::string("dfkv_build_info{version=\"") + DFKV_VERSION +
        "\",transport=\"" DFKV_BUILD_TRANSPORT "\"";
   if (!node_id_.empty() || !node_group_.empty())
-    s += ",node=\"" + node_id_ + "\",group=\"" + node_group_ + "\"";
+    s += ",node=\"" + PromLabelEscape(node_id_) + "\",group=\"" +
+         PromLabelEscape(node_group_) + "\"";
   s += "} 1\n";
   uint64_t up = std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::steady_clock::now() - start_time_).count();
@@ -164,12 +167,12 @@ std::string KvNodeServer::MetricsText() const {
   s += "# HELP dfkv_disk_used_bytes Bytes used per backing disk\n";
   s += "# TYPE dfkv_disk_used_bytes gauge\n";
   for (size_t i = 0; i < group_.DiskCount(); ++i)
-    s += "dfkv_disk_used_bytes" + braces("disk=\"" + group_.DiskPath(i) + "\"") + " " +
+    s += "dfkv_disk_used_bytes" + braces("disk=\"" + PromLabelEscape(group_.DiskPath(i)) + "\"") + " " +
          std::to_string(group_.DiskUsedBytes(i)) + "\n";
   s += "# HELP dfkv_disk_objects Objects per backing disk\n";
   s += "# TYPE dfkv_disk_objects gauge\n";
   for (size_t i = 0; i < group_.DiskCount(); ++i)
-    s += "dfkv_disk_objects" + braces("disk=\"" + group_.DiskPath(i) + "\"") + " " +
+    s += "dfkv_disk_objects" + braces("disk=\"" + PromLabelEscape(group_.DiskPath(i)) + "\"") + " " +
          std::to_string(group_.DiskObjects(i)) + "\n";
   // sampled op latency histograms (op label merged with identity); one HELP/TYPE,
   // two label sets (get/put).

@@ -13,7 +13,7 @@ namespace dfkv {
 
 MetricsHttpServer::~MetricsHttpServer() { Stop(); }
 
-Status MetricsHttpServer::Start(int port) {
+Status MetricsHttpServer::Start(int port, const std::string& bind_addr) {
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ < 0) return Status::kIOError;
   int one = 1;
@@ -21,6 +21,10 @@ Status MetricsHttpServer::Start(int port) {
   sockaddr_in sa{};
   sa.sin_family = AF_INET;
   sa.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (!bind_addr.empty() &&
+      ::inet_pton(AF_INET, bind_addr.c_str(), &sa.sin_addr) != 1) {
+    ::close(listen_fd_); listen_fd_ = -1; return Status::kInvalid;  // bad bind addr
+  }
   sa.sin_port = htons(static_cast<uint16_t>(port));
   if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
     ::close(listen_fd_); listen_fd_ = -1; return Status::kIOError;

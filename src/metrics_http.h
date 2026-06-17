@@ -28,7 +28,9 @@ class MetricsHttpServer {
       : render_(std::move(render)) {}
   ~MetricsHttpServer();
 
-  Status Start(int port);  // port 0 => ephemeral; query with port()
+  // port 0 => ephemeral (query with port()). bind_addr empty => all interfaces
+  // (back-compat); pass e.g. "127.0.0.1" to restrict /metrics to loopback.
+  Status Start(int port, const std::string& bind_addr = "");
   void Stop();             // idempotent
   int port() const { return port_; }
   // Handler threads not yet reaped (test/diagnostic). Bounded under scrape churn

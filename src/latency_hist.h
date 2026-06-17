@@ -21,7 +21,9 @@ class LatencyHist {
 
   void Observe(double seconds) {
     if (seconds < 0) seconds = 0;
-    sum_us_.fetch_add(static_cast<uint64_t>(seconds * 1e6), std::memory_order_relaxed);
+    // Accumulate nanoseconds (not µs) so sub-µs/fractional-µs cache-hit latencies
+    // aren't floored to 0 — at µs granularity _sum was biased low for fast ops.
+    sum_ns_.fetch_add(static_cast<uint64_t>(seconds * 1e9), std::memory_order_relaxed);
     count_.fetch_add(1, std::memory_order_relaxed);
     for (int i = 0; i < kNB; ++i) {
       if (seconds <= kBounds[i]) { buckets_[i].fetch_add(1, std::memory_order_relaxed); return; }
@@ -31,7 +33,7 @@ class LatencyHist {
 
   uint64_t Count() const { return count_.load(std::memory_order_relaxed); }
   double Sum() const {
-    return static_cast<double>(sum_us_.load(std::memory_order_relaxed)) / 1e6;
+    return static_cast<double>(sum_ns_.load(std::memory_order_relaxed)) / 1e9;
   }
 
   // Full Prometheus block (HELP + TYPE + body). `labels` is the inner label set
@@ -69,7 +71,7 @@ class LatencyHist {
  private:
   std::atomic<uint64_t> buckets_[kNB]{};
   std::atomic<uint64_t> inf_{0};
-  std::atomic<uint64_t> sum_us_{0};
+  std::atomic<uint64_t> sum_ns_{0};
   std::atomic<uint64_t> count_{0};
 };
 

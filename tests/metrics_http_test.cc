@@ -72,6 +72,18 @@ TEST(MetricsHttp, ReapsHandlerThreadsAcrossScrapes) {
   srv.Stop();
 }
 
+TEST(MetricsHttp, BindAddrRestrictsAndRejectsBad) {
+  // loopback bind still serves a loopback client
+  MetricsHttpServer srv([] { return std::string("dfkv_x 1\n"); });
+  ASSERT_EQ(srv.Start(0, "127.0.0.1"), Status::kOk);
+  std::string m = HttpGet(srv.port(), "/metrics");
+  EXPECT_NE(m.find("dfkv_x 1"), std::string::npos) << m;
+  srv.Stop();
+  // a malformed bind address fails cleanly (no listener)
+  MetricsHttpServer bad([] { return std::string(""); });
+  EXPECT_EQ(bad.Start(0, "not.an.ip"), Status::kInvalid);
+}
+
 TEST(MetricsHttp, StopIsIdempotent) {
   MetricsHttpServer srv([] { return std::string("x 1\n"); });
   ASSERT_EQ(srv.Start(0), Status::kOk);
