@@ -73,6 +73,18 @@ TEST(Metrics, PrometheusFormatAndIdentity) {
   s->Stop();
 }
 
+TEST(Metrics, LabelValuesAreEscaped) {
+  std::string addr;
+  auto dir = fs::temp_directory_path() / "dfkv_metrics_esc";
+  auto s = Start(dir, &addr);
+  s->set_identity("n\"1", "g\\x");  // identity with a quote + backslash
+  std::string text = s->MetricsText();
+  // raw `n"1` would break the scrape; must appear escaped
+  EXPECT_NE(text.find("node=\"n\\\"1\",group=\"g\\\\x\""), std::string::npos) << text;
+  EXPECT_EQ(text.find("node=\"n\"1\""), std::string::npos) << "unescaped quote leaked";
+  s->Stop();
+}
+
 TEST(Metrics, NoIdentityKeepsUnlabeledSeries) {
   std::string addr;
   auto dir = fs::temp_directory_path() / "dfkv_metrics_d";

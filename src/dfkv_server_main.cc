@@ -30,7 +30,7 @@ static void OnSig(int) { g_stop = 1; }
 int main(int argc, char** argv) {
   if (dfkv::WantsVersion(argc, argv)) { std::printf("dfkv_server %s\n", dfkv::Version()); return 0; }
   std::string dir = "/tmp/dfkv_node";
-  std::string rdma_dev, mds, group = "default", node_id, advertise;
+  std::string rdma_dev, mds, group = "default", node_id, advertise, metrics_bind;
   int weight = 1;
   int port = 0, rdma_port = -1, metrics_port = -1;
   unsigned long long cap = 1ull << 30;
@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--advertise")) advertise = argv[i + 1];
     else if (!std::strcmp(argv[i], "--weight")) weight = std::atoi(argv[i + 1]);
     else if (!std::strcmp(argv[i], "--metrics-port")) metrics_port = std::atoi(argv[i + 1]);
+    else if (!std::strcmp(argv[i], "--metrics-bind")) metrics_bind = argv[i + 1];
   }
   (void)rdma_port;
   std::signal(SIGINT, OnSig);
@@ -124,7 +125,7 @@ int main(int argc, char** argv) {
 #endif
       return s;
     });
-    if (mhttp->Start(metrics_port) == Status::kOk)
+    if (mhttp->Start(metrics_port, metrics_bind) == Status::kOk)
       DFKV_LOG_INFO("dfkv_server /metrics on port " + std::to_string(mhttp->port()));
     else
       DFKV_LOG_WARN("dfkv_server /metrics failed to start on port " + std::to_string(metrics_port));

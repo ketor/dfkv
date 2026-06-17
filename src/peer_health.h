@@ -8,6 +8,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "prom_escape.h"
+
 namespace dfkv {
 
 // Layer-1 fast avoidance: a peer (keyed by "ip:port") that fails a transport IO
@@ -37,7 +39,10 @@ class PeerHealth {
     until_[peer] = now_ms + cooldown_ms_;
     errors_.fetch_add(1, std::memory_order_relaxed);
     if (was_ok) marked_bad_.fetch_add(1, std::memory_order_relaxed);  // healthy->bad edge
-    peer_errors_[peer]++;
+    // Bound per-peer cardinality: only track a new peer while under the cap, so a
+    // long-lived client churning through many distinct addresses can't grow the
+    // map (and its scrape series) without bound. Aggregate errors_ still counts.
+    if (peer_errors_.size() < kMaxPeers || peer_errors_.count(peer)) peer_errors_[peer]++;
   }
   void MarkGood(const std::string& peer) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -75,7 +80,8 @@ class PeerHealth {
     s += "# HELP dfkv_client_peer_errors_total IO failures per peer\n";
     s += "# TYPE dfkv_client_peer_errors_total counter\n";
     for (const auto& [peer, n] : snap)
-      s += "dfkv_client_peer_errors_total{peer=\"" + peer + "\"} " + std::to_string(n) + "\n";
+      s += "dfkv_client_peer_errors_total{peer=\"" + PromLabelEscape(peer) + "\"} " +
+           std::to_string(n) + "\n";
     return s;
   }
 
@@ -86,6 +92,7 @@ class PeerHealth {
   uint64_t recovered() const { return recovered_.load(std::memory_order_relaxed); }
 
  private:
+  static constexpr size_t kMaxPeers = 4096;  // per-peer error-map cardinality cap
   mutable std::mutex mu_;
   uint64_t cooldown_ms_;
   std::unordered_map<std::string, uint64_t> until_;        // peer -> unhealthy-until (ms)
