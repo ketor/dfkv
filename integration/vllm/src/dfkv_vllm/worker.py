@@ -460,119 +460,129 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         return invalid_block_ids
 
     def _handle_request(self, req_meta: ReqMeta):
-        token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
-        mask_num = (
-            req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
-            // self.block_size
-            * self.block_size
-        )
+        try:
+            token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
+            mask_num = (
+                req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
+                // self.block_size
+                * self.block_size
+            )
 
-        # Skip chunks the consumer's per-group spec wouldn't populate
-        # locally (e.g. SWA pre-window) even if the producer stored them.
-        load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
+            # Skip chunks the consumer's per-group spec wouldn't populate
+            # locally (e.g. SWA pre-window) even if the producer stored them.
+            load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
 
-        addr_list: list[list[int]] = []
-        size_list: list[list[int]] = []
-        key_list: list[str] = []
-        block_id_list: list[int] = []
-        for g_idx, db in enumerate(self.token_databases):
-            mask = load_mask_per_group[g_idx]
-            for start, end, key in db.process_tokens(
-                token_len, req_meta.block_hashes, mask_num
-            ):
-                chunk_idx = start // db.block_size
-                if chunk_idx >= len(mask) or not mask[chunk_idx]:
-                    continue
-                addr, size, block_id = db.prepare_value(
-                    start, end, req_meta.block_ids[g_idx]
+            addr_list: list[list[int]] = []
+            size_list: list[list[int]] = []
+            key_list: list[str] = []
+            block_id_list: list[int] = []
+            for g_idx, db in enumerate(self.token_databases):
+                mask = load_mask_per_group[g_idx]
+                for start, end, key in db.process_tokens(
+                    token_len, req_meta.block_hashes, mask_num
+                ):
+                    chunk_idx = start // db.block_size
+                    if chunk_idx >= len(mask) or not mask[chunk_idx]:
+                        continue
+                    addr, size, block_id = db.prepare_value(
+                        start, end, req_meta.block_ids[g_idx]
+                    )
+                    key_list.append(key.to_string())
+                    addr_list.append(addr)
+                    size_list.append(size)
+                    block_id_list.append(block_id)
+
+            # Nothing to load (e.g. every chunk masked out for this group) -> finish
+            # the request now, else `tp_rank % 0` below would raise and the req would
+            # never be reported done, hanging vLLM's WAITING_FOR_REMOTE_KVS wait.
+            if not key_list:
+                return
+
+            # Rotate aligned lists by tp_rank for load balancing.
+            rotation = self.tp_rank % len(key_list)
+            key_list_c = _rotate_list(key_list, rotation)
+            addr_list_c = _rotate_list(addr_list, rotation)
+            size_list_c = _rotate_list(size_list, rotation)
+            block_id_list_c = _rotate_list(block_id_list, rotation)
+
+            # dfkv: A GET is one batch -- dfkv has no owner-side DirectIO staging
+            # budget, so the Mooncake disk-offload sub-batch split is dropped.
+            # Flatten per-key scatter-gather to one (ptr, cap) per dfkv key, then
+            # map each flattened result back to its originating block id for error
+            # reporting (see _flatten_segments / seg_owner).
+            sg_keys, sg_ptrs, sg_caps, sg_owner = _group_segments_sg(
+                key_list_c, addr_list_c, size_list_c
+            )
+            sg_totals = [sum(c) for c in sg_caps]
+            batch_bytes = sum(sg_totals)
+
+            load_get_start = time.perf_counter()
+            try:
+                # dfkv: one scatter-gather GET per coalesced key -> (hits, lens). The
+                # server returns one blob; the RDMA recv SGE list scatters it back
+                # into this chunk's per-layer segments. hit == 1 + len == sum(caps)
+                # means the chunk loaded; a miss or short read marks the originating
+                # block as a load error so vLLM recomputes that span (never fatal).
+                hits, lens = self.client.batch_get_auto_sg(sg_keys, sg_ptrs, sg_caps)
+                failed_block_ids: list[int] = []
+                failed_detail: list[tuple[str, int]] = []
+                for i, (hit, got_len) in enumerate(zip(hits, lens, strict=True)):
+                    if hit != 1 or got_len < sg_totals[i]:
+                        failed_block_ids.append(block_id_list_c[sg_owner[i]])
+                        failed_detail.append((sg_keys[i], hit))
+                self._record_operation(
+                    "load_get",
+                    load_get_start,
+                    len(sg_keys),
+                    num_bytes=batch_bytes,
+                    status="partial_failure" if failed_block_ids else "ok",
+                    num_failed_keys=len(failed_block_ids),
                 )
-                key_list.append(key.to_string())
-                addr_list.append(addr)
-                size_list.append(size)
-                block_id_list.append(block_id)
+                logger.debug(
+                    "dfkv load_get: req=%s keys=%d bytes=%d ms=%.1f failed=%d",
+                    req_id, len(sg_keys), batch_bytes,
+                    (time.perf_counter() - load_get_start) * 1000.0,
+                    len(failed_block_ids),
+                )
+                if failed_block_ids:
+                    self._add_load_error_block_ids(failed_block_ids)
+                    logger.warning(
+                        "Failed to get %d dfkv keys from batch "
+                        "(batch_keys=%d, first_failures=%s)",
+                        len(failed_block_ids),
+                        len(sg_keys),
+                        failed_detail[:3],
+                    )
+            except Exception as e:
+                self._add_load_error_block_ids(block_id_list_c)
+                self._record_operation(
+                    "load_get",
+                    load_get_start,
+                    len(sg_keys),
+                    num_bytes=batch_bytes,
+                    status="error",
+                    num_failed_keys=len(sg_keys),
+                )
+                logger.warning(
+                    "Failed to get dfkv batch %s, error: %s",
+                    sg_keys[:3],
+                    e,
+                )
 
-        # Nothing to load (e.g. every chunk masked out for this group) -> finish
-        # the request now, else `tp_rank % 0` below would raise and the req would
-        # never be reported done, hanging vLLM's WAITING_FOR_REMOTE_KVS wait.
-        if not key_list:
+        except Exception as e:
+            # Any unexpected failure in the load path -> recompute this
+            # request's blocks (never hang vLLM's WAITING_FOR_REMOTE_KVS).
+            logger.error("dfkv recv thread failed for req %s: %s", req_id, e)
+            try:
+                self._add_load_error_block_ids(
+                    [b for ids in req_meta.block_ids for b in ids]
+                )
+            except Exception:
+                pass
+        finally:
             self.set_finished_request(req_id)
             self.request_queue.task_done()
-            return
-
-        # Rotate aligned lists by tp_rank for load balancing.
-        rotation = self.tp_rank % len(key_list)
-        key_list_c = _rotate_list(key_list, rotation)
-        addr_list_c = _rotate_list(addr_list, rotation)
-        size_list_c = _rotate_list(size_list, rotation)
-        block_id_list_c = _rotate_list(block_id_list, rotation)
-
-        # dfkv: A GET is one batch -- dfkv has no owner-side DirectIO staging
-        # budget, so the Mooncake disk-offload sub-batch split is dropped.
-        # Flatten per-key scatter-gather to one (ptr, cap) per dfkv key, then
-        # map each flattened result back to its originating block id for error
-        # reporting (see _flatten_segments / seg_owner).
-        sg_keys, sg_ptrs, sg_caps, sg_owner = _group_segments_sg(
-            key_list_c, addr_list_c, size_list_c
-        )
-        sg_totals = [sum(c) for c in sg_caps]
-        batch_bytes = sum(sg_totals)
-
-        load_get_start = time.perf_counter()
-        try:
-            # dfkv: one scatter-gather GET per coalesced key -> (hits, lens). The
-            # server returns one blob; the RDMA recv SGE list scatters it back
-            # into this chunk's per-layer segments. hit == 1 + len == sum(caps)
-            # means the chunk loaded; a miss or short read marks the originating
-            # block as a load error so vLLM recomputes that span (never fatal).
-            hits, lens = self.client.batch_get_auto_sg(sg_keys, sg_ptrs, sg_caps)
-            failed_block_ids: list[int] = []
-            failed_detail: list[tuple[str, int]] = []
-            for i, (hit, got_len) in enumerate(zip(hits, lens, strict=True)):
-                if hit != 1 or got_len < sg_totals[i]:
-                    failed_block_ids.append(block_id_list_c[sg_owner[i]])
-                    failed_detail.append((sg_keys[i], hit))
-            self._record_operation(
-                "load_get",
-                load_get_start,
-                len(sg_keys),
-                num_bytes=batch_bytes,
-                status="partial_failure" if failed_block_ids else "ok",
-                num_failed_keys=len(failed_block_ids),
-            )
-            logger.debug(
-                "dfkv load_get: req=%s keys=%d bytes=%d ms=%.1f failed=%d",
-                req_id, len(sg_keys), batch_bytes,
-                (time.perf_counter() - load_get_start) * 1000.0,
-                len(failed_block_ids),
-            )
-            if failed_block_ids:
-                self._add_load_error_block_ids(failed_block_ids)
-                logger.warning(
-                    "Failed to get %d dfkv keys from batch "
-                    "(batch_keys=%d, first_failures=%s)",
-                    len(failed_block_ids),
-                    len(sg_keys),
-                    failed_detail[:3],
-                )
-        except Exception as e:
-            self._add_load_error_block_ids(block_id_list_c)
-            self._record_operation(
-                "load_get",
-                load_get_start,
-                len(sg_keys),
-                num_bytes=batch_bytes,
-                status="error",
-                num_failed_keys=len(sg_keys),
-            )
-            logger.warning(
-                "Failed to get dfkv batch %s, error: %s",
-                sg_keys[:3],
-                e,
-            )
-
-        self.set_finished_request(req_id)
-        self.request_queue.task_done()
 
 
 # dfkv: per-key scatter-gather flatten helpers. Mooncake's
