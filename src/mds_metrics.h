@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <string>
 
+#include "version.h"  // Version() for the build_info gauge
+
 namespace dfkv {
 
 struct MdsMetrics {
@@ -21,6 +23,11 @@ struct MdsMetrics {
 
   std::string Render() const {
     std::string s;
+    // Version observability for the MDS tier (mirrors dfkv_server's build_info,
+    // so the 3-replica MDS versions are visible via Prometheus, not just --version).
+    s += "# HELP dfkv_build_info Build and version info (constant 1)\n";
+    s += "# TYPE dfkv_build_info gauge\n";
+    s += std::string("dfkv_build_info{version=\"") + Version() + "\",role=\"mds\"} 1\n";
     auto m = [&](const char* name, const char* type, const char* help, uint64_t v) {
       s += "# HELP "; s += name; s += " "; s += help; s += "\n";
       s += "# TYPE "; s += name; s += " "; s += type; s += "\n";
