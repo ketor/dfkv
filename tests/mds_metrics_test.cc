@@ -24,4 +24,8 @@ TEST(MdsMetrics, CountsAndRenders) {
   EXPECT_NE(t.find("dfkv_mds_lease_grants_total 1"), std::string::npos) << t;
   EXPECT_NE(t.find("# TYPE dfkv_mds_members gauge"), std::string::npos) << t;
   EXPECT_NE(t.find("dfkv_mds_members 4"), std::string::npos) << t;
+  // build_info gauge exposes the MDS version (mirrors dfkv_server).
+  EXPECT_NE(t.find("# TYPE dfkv_build_info gauge"), std::string::npos) << t;
+  EXPECT_NE(t.find("dfkv_build_info{version=\""), std::string::npos) << t;
+  EXPECT_NE(t.find("role=\"mds\"} 1"), std::string::npos) << t;
 }
