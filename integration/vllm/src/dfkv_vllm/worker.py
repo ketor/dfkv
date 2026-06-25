@@ -291,10 +291,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if not keys:
                 return
 
-            # Check which blocks already exist (dedup)
+            # Check which blocks already exist (dedup). Blocks are stored under
+            # scatter-gather keys "<key>@sg{n}" (see _group_segments_sg), so we
+            # must probe the first SG group as the block-present proxy -- the
+            # SAME proxy the lookup path uses (find_longest_cache_hit). Probing
+            # the bare "<key>" never matches a stored "<key>@sg0", so without the
+            # suffix this dedup is a silent no-op: every block gets re-PUT on
+            # every request, even when identical KV is already cached.
             save_exists_start = time.perf_counter()
             try:
-                exists_states = self.client.batch_exist(keys)
+                exists_states = self.client.batch_exist(
+                    [f"{k}@sg0" for k in keys]
+                )
             except Exception:
                 self._record_operation(
                     "save_exists",
