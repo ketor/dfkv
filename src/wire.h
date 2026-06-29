@@ -21,7 +21,7 @@ namespace dfkv {
 // reuses the existing request framing; variable content rides the payload/data blob.
 enum class WireOp : uint8_t {
   kCache = 1, kRange = 2, kExist = 3, kStats = 4, kMembers = 5,
-  kRegister = 6, kHeartbeat = 7, kListMembers = 8
+  kRegister = 6, kHeartbeat = 7, kListMembers = 8, kRemove = 9
 };
 
 constexpr uint8_t kProtoVersion = 1;

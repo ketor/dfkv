@@ -68,6 +68,40 @@ TEST_F(KVClientTest, PutGetExistRoundTripWithImmediateVisibility) {
   EXPECT_EQ(out, v);
 }
 
+TEST_F(KVClientTest, RemoveRoundTripThenMiss) {
+  nodes_.push_back(StartNode("r1"));
+  KVClient c({{ "a", nodes_[0]->addr }}, SelfHdr());
+  std::string v(1500, 'r');
+  ASSERT_TRUE(c.Put("glm-5.1/rm_k", v.data(), v.size()));
+  ASSERT_TRUE(c.Exist("glm-5.1/rm_k"));
+  EXPECT_TRUE(c.Remove("glm-5.1/rm_k"));       // dropped
+  EXPECT_FALSE(c.Exist("glm-5.1/rm_k"));       // gone now
+  std::string out(v.size(), '\0');
+  EXPECT_FALSE(c.Get("glm-5.1/rm_k", &out[0], out.size()));  // miss
+  // Removing an absent key still "succeeds" (node confirmed: not present).
+  EXPECT_TRUE(c.Remove("glm-5.1/rm_k"));
+}
+
+TEST_F(KVClientTest, BatchRemoveFansOutAcrossNodes) {
+  nodes_.push_back(StartNode("b1"));
+  nodes_.push_back(StartNode("b2"));
+  std::vector<std::pair<std::string, std::string>> members = {
+      {"b1", nodes_[0]->addr}, {"b2", nodes_[1]->addr}};
+  KVClient c(members, SelfHdr());
+  std::vector<std::string> keys;
+  std::string v(256, 'z');
+  for (int i = 0; i < 12; ++i) {
+    std::string k = "glm-5.1/bk_" + std::to_string(i);
+    keys.push_back(k);
+    ASSERT_TRUE(c.Put(k, v.data(), v.size()));
+  }
+  for (const auto& k : keys) ASSERT_TRUE(c.Exist(k));
+  std::vector<bool> r = c.BatchRemove(keys);
+  ASSERT_EQ(r.size(), keys.size());
+  for (bool ok : r) EXPECT_TRUE(ok);
+  for (const auto& k : keys) EXPECT_FALSE(c.Exist(k));
+}
+
 TEST_F(KVClientTest, RefreshMembersDiscoversClusterFromSeed) {
   nodes_.push_back(StartNode("disc1"));
   nodes_.push_back(StartNode("disc2"));

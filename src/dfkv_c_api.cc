@@ -81,6 +81,11 @@ int dfkv_exist(dfkv_client_t c, const char* key) {
   return static_cast<KVClient*>(c)->Exist(key) ? 1 : 0;
 }
 
+int dfkv_remove(dfkv_client_t c, const char* key) {
+  if (!c || !key) return 0;
+  return static_cast<KVClient*>(c)->Remove(key) ? 1 : 0;
+}
+
 int dfkv_register_memory(dfkv_client_t c, const void* base, uint64_t size) {
   if (!c) return -1;
   static_cast<KVClient*>(c)->RegisterMemory(const_cast<void*>(base),
@@ -152,6 +157,16 @@ int dfkv_batch_exist(dfkv_client_t c, const char** keys, int n, int* out_exist) 
   for (int i = 0; i < n; ++i) ks[i] = keys[i] ? std::string(keys[i]) : std::string();
   auto r = static_cast<KVClient*>(c)->BatchExist(ks);
   for (int i = 0; i < n; ++i) out_exist[i] = (keys[i] && r[i]) ? 1 : 0;
+  return 0;
+}
+
+int dfkv_batch_remove(dfkv_client_t c, const char** keys, int n, int* out_ok) {
+  if (!c || n < 0) return -1;
+  if (n > 0 && (!keys || !out_ok)) return -1;
+  std::vector<std::string> ks(n);
+  for (int i = 0; i < n; ++i) ks[i] = keys[i] ? std::string(keys[i]) : std::string();
+  auto r = static_cast<KVClient*>(c)->BatchRemove(ks);
+  for (int i = 0; i < n; ++i) out_ok[i] = (keys[i] && r[i]) ? 1 : 0;
   return 0;
 }
 

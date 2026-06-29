@@ -71,6 +71,9 @@ class KVClient {
   // it to read back variable-size (unfull) chunks.
   bool GetAuto(const std::string& key, void* out, size_t cap, size_t* out_len);
   bool Exist(const std::string& key);
+  // Drop a key from its owning node. true iff the node confirmed the op (the
+  // block was removed OR was already absent); false on route/health/IO failure.
+  bool Remove(const std::string& key);
 
   // Batched, concurrently fanned out across owning nodes. Per-item results.
   std::vector<bool> BatchPut(const std::vector<KvPutItem>& items);
@@ -84,6 +87,9 @@ class KVClient {
   std::vector<bool> BatchGetAuto(const std::vector<KvGetItem>& items,
                                  std::vector<size_t>* out_lens);
   std::vector<bool> BatchExist(const std::vector<std::string>& keys);
+  // Batched remove, fanned out across owning nodes (grouped per node). Per-item
+  // result like BatchExist: true iff the owning node confirmed the op.
+  std::vector<bool> BatchRemove(const std::vector<std::string>& keys);
 
   // Scatter-gather batch put: each key gathers its N source segments into one
   // stored blob (sum of sizes). Mirrors BatchPut (consistent-hash routing per key,

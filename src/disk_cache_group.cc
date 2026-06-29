@@ -29,6 +29,12 @@ Status DiskCacheGroup::Cache(const BlockKey& key, const void* data, size_t len) 
   return d->Cache(key, data, len);
 }
 
+Status DiskCacheGroup::Remove(const BlockKey& key) {
+  KVStore* d = Route(key);
+  if (d == nullptr) return Status::kInvalid;
+  return d->Remove(key);
+}
+
 Status DiskCacheGroup::CacheDirect(const BlockKey& key, char* data, size_t len,
                                    size_t cap) {
   KVStore* d = Route(key);

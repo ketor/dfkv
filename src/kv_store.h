@@ -87,6 +87,13 @@ class KVStore {
 
   bool IsCached(const BlockKey& key) const;
 
+  // Explicitly drop a cached block: deletes the file, removes it from the
+  // shard index + CLOCK ring, and reclaims its bytes (exclusive shard lock).
+  // kOk if removed, kNotFound if absent. Used by the LMCache L2 eviction path
+  // (dfkv_remove / DfkvL2Adapter.delete); distinct from capacity eviction so
+  // it does NOT touch the eviction counters.
+  Status Remove(const BlockKey& key);
+
   uint64_t UsedBytes() const;
   size_t Count() const;
   uint64_t Evictions() const { return evictions_.load(std::memory_order_relaxed); }

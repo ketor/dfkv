@@ -41,6 +41,10 @@ class DiskCacheGroup {
                          size_t io_cap, KVStore::RangePrep* out);
   bool IsCached(const BlockKey& key) const;
 
+  // Drop a cached block from its owning disk (routes like IsCached). kOk if
+  // removed, kNotFound if absent. Backs the LMCache L2 eviction path.
+  Status Remove(const BlockKey& key);
+
   uint64_t UsedBytes() const;   // summed across disks
   size_t Count() const;         // summed across disks
   size_t DiskCount() const { return disks_.size(); }

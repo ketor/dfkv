@@ -332,6 +332,18 @@ bool KVClient::Exist(const std::string& key) {
   return st == Status::kOk && e;
 }
 
+bool KVClient::Remove(const std::string& key) {
+  std::string node = Route(key);
+  if (node.empty()) return false;
+  uint64_t now = NowMs();
+  if (!health_.Healthy(node, now)) return false;
+  Status st = t_->Remove(node, ToBlockKey(key));
+  if (st == Status::kIOError) { health_.MarkBad(node, now); return false; }
+  health_.MarkGood(node);
+  // kNotFound is a success for the caller: the goal (key not present) holds.
+  return st == Status::kOk || st == Status::kNotFound;
+}
+
 std::vector<bool> KVClient::BatchPut(const std::vector<KvPutItem>& items) {
   const size_t N = items.size();
   std::vector<char> ok(N, 0);  // char (not vector<bool>) for thread-safe writes
@@ -515,6 +527,43 @@ std::vector<bool> KVClient::BatchExist(const std::vector<std::string>& keys) {
     for (size_t m = 0; m < idx.size(); ++m) e[idx[m]] = (m < ex.size() && ex[m]) ? 1 : 0;
   });
   return std::vector<bool>(e.begin(), e.end());
+}
+
+std::vector<bool> KVClient::BatchRemove(const std::vector<std::string>& keys) {
+  const size_t N = keys.size();
+  std::vector<char> ok(N, 0);
+  if (!t_->pipelined()) {  // TCP: parallelize across items with our own threads
+    RunParallel(N, batch_concurrency_.load(std::memory_order_relaxed), [&](size_t i) {
+      ok[i] = Remove(keys[i]) ? 1 : 0;
+    });
+    return std::vector<bool>(ok.begin(), ok.end());
+  }
+  // RDMA: group by node and RemoveMany per node (sequential within a node since
+  // eviction is off the hot path; nodes still fan out in parallel).
+  std::map<std::string, std::vector<size_t>> by_node;
+  for (size_t i = 0; i < N; ++i) {
+    std::string node = Route(keys[i]);
+    if (node.empty()) continue;
+    by_node[node].push_back(i);
+  }
+  std::vector<std::pair<std::string, std::vector<size_t>>> groups(by_node.begin(), by_node.end());
+  RunParallel(groups.size(), batch_concurrency_.load(std::memory_order_relaxed), [&](size_t g) {
+    const std::string& node = groups[g].first;
+    uint64_t now = NowMs();
+    if (!health_.Healthy(node, now)) return;
+    const std::vector<size_t>& idx = groups[g].second;
+    std::vector<BlockKey> bkeys;
+    bkeys.reserve(idx.size());
+    for (size_t k : idx) bkeys.push_back(ToBlockKey(keys[k]));
+    std::vector<Status> sts = t_->RemoveMany(node, bkeys);
+    bool resp = false, ioerr = false;
+    for (Status s : sts) { if (s == Status::kIOError) ioerr = true; else resp = true; }
+    if (resp) health_.MarkGood(node); else if (ioerr) health_.MarkBad(node, now);
+    for (size_t m = 0; m < idx.size(); ++m)
+      ok[idx[m]] = (m < sts.size() &&
+                    (sts[m] == Status::kOk || sts[m] == Status::kNotFound)) ? 1 : 0;
+  });
+  return std::vector<bool>(ok.begin(), ok.end());
 }
 
 std::vector<bool> KVClient::BatchPutSg(const std::vector<KvPutItemSg>& items) {

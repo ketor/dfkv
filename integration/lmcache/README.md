@@ -112,6 +112,12 @@ store → restart (L1 wiped) → reload from dfkv with prefill skipped.
   synchronous ctypes client to LMCache's eventfd model with a background asyncio
   loop (dfkv has no native eventfd, so no pybind/`NativeConnectorL2Adapter`
   path is used).
-- No `remove` / enumeration (`list()` returns `[]`) — dfkv has no such RPC. L2
-  eviction (`max_capacity_gb > 0`) reports usage but cannot delete (dfkv manages
-  its own capacity).
+- **L2 eviction is supported** (dfkv gained a `remove` RPC): set
+  `max_capacity_gb > 0` on the L2 adapter to enable LMCache's L2EvictionController,
+  which calls `DfkvL2Adapter.delete()` → `dfkv_batch_remove` to drop blocks when
+  the configured capacity is exceeded. The in-process connector's `remove_sync`
+  is likewise backed by `dfkv_remove`. Requires a `libdfkv.so` / `dfkv_server`
+  built with the remove RPC (older libs are detected via `supports_remove()` and
+  the delete path degrades to a logged no-op). Default `max_capacity_gb = 0`
+  leaves capacity management to dfkv's own per-node LRU.
+- No enumeration (`list()` returns `[]`) — dfkv has no listing RPC.

@@ -44,6 +44,12 @@ class ExistsLRU:
             for key in keys:
                 self._touch_unlocked(key)
 
+    def discard(self, key: str) -> None:
+        """Forget a key (e.g. after remove) so a later has() doesn't report a
+        stale hit. No-op if absent."""
+        with self._lock:
+            self._entries.pop(key, None)
+
     def has(self, key: str) -> bool:
         with self._lock:
             if key not in self._entries:

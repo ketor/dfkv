@@ -140,6 +140,8 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_cache_miss_total", "counter", "Range (GET) ops that missed", m_cache_miss());
   metric("dfkv_exist_hit_total", "counter", "Exist checks that hit", m_exist_hit());
   metric("dfkv_exist_miss_total", "counter", "Exist checks that missed", m_exist_miss());
+  metric("dfkv_remove_ok_total", "counter", "Remove ops that dropped a block", m_remove_ok());
+  metric("dfkv_remove_miss_total", "counter", "Remove ops for an absent block", m_remove_miss());
   metric("dfkv_bytes_written_total", "counter", "Payload bytes written",
          bytes_written_.load(std::memory_order_relaxed));
   metric("dfkv_bytes_read_total", "counter", "Payload bytes read",
@@ -251,6 +253,11 @@ Status KvNodeServer::ProcessRequest(uint8_t op_raw, uint64_t id, uint32_t index,
     case WireOp::kExist:
       if (group_.IsCached(key)) { st = Status::kOk; exist_hit_.fetch_add(1, std::memory_order_relaxed); }
       else { st = Status::kNotFound; exist_miss_.fetch_add(1, std::memory_order_relaxed); }
+      break;
+    case WireOp::kRemove:
+      st = group_.Remove(key);
+      if (st == Status::kOk) remove_ok_.fetch_add(1, std::memory_order_relaxed);
+      else if (st == Status::kNotFound) remove_miss_.fetch_add(1, std::memory_order_relaxed);
       break;
     case WireOp::kStats:
       *out_data = MetricsText();

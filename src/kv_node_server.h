@@ -52,6 +52,8 @@ class KvNodeServer {
   size_t m_cache_miss() const { return cache_miss_.load(std::memory_order_relaxed); }
   size_t m_exist_hit() const { return exist_hit_.load(std::memory_order_relaxed); }
   size_t m_exist_miss() const { return exist_miss_.load(std::memory_order_relaxed); }
+  size_t m_remove_ok() const { return remove_ok_.load(std::memory_order_relaxed); }
+  size_t m_remove_miss() const { return remove_miss_.load(std::memory_order_relaxed); }
   std::string MetricsText() const;  // Prometheus text format
 
   // Transport-agnostic request processing (shared by the TCP handler and, when
@@ -96,6 +98,7 @@ class KvNodeServer {
   void ReapDoneLocked();  // join+erase finished handler threads; conn_mu_ held
   std::atomic<size_t> cache_put_{0}, cache_hit_{0}, cache_miss_{0};
   std::atomic<size_t> exist_hit_{0}, exist_miss_{0};
+  std::atomic<size_t> remove_ok_{0}, remove_miss_{0};
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
   // depth metrics: errors by op, live connections, sampled op latency
   std::atomic<size_t> put_io_err_{0}, get_io_err_{0}, invalid_ops_{0};

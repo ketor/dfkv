@@ -24,6 +24,7 @@ class TcpTransport : public Transport {
                uint64_t length, std::string* out) override;
   Status Exist(const std::string& node, const BlockKey& key,
                bool* exist) override;
+  Status Remove(const std::string& node, const BlockKey& key) override;
 
   // Fetch a node's Prometheus-format metrics text (not part of Transport iface).
   Status Stats(const std::string& node, std::string* out);

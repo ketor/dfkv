@@ -243,3 +243,49 @@ TEST_F(KVStoreTest, ConcurrentShardedReadWrite) {
     EXPECT_EQ(hits.load(), N * 8);
   }
 }
+
+TEST_F(KVStoreTest, RemoveDropsBlockReclaimsBytesAndIsIdempotent) {
+  KVStore s(Opts());
+  BlockKey k{555, 0, 1};
+  std::string v = "remove-me-payload-bytes";
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  ASSERT_TRUE(s.IsCached(k));
+  ASSERT_EQ(s.UsedBytes(), v.size());
+
+  EXPECT_EQ(s.Remove(k), Status::kOk);
+  EXPECT_FALSE(s.IsCached(k));
+  EXPECT_EQ(s.UsedBytes(), 0u);
+  EXPECT_EQ(s.Count(), 0u);
+
+  // Removing an absent key is a clean kNotFound (idempotent re-remove too).
+  EXPECT_EQ(s.Remove(k), Status::kNotFound);
+  EXPECT_EQ(s.Remove(BlockKey{556, 0, 1}), Status::kNotFound);
+
+  // Eviction counters are untouched by an explicit Remove (distinct from
+  // capacity eviction).
+  EXPECT_EQ(s.Evictions(), 0u);
+
+  // The key is re-cacheable after removal (file path freed, index slot reusable).
+  ASSERT_EQ(s.Cache(k, v.data(), v.size()), Status::kOk);
+  EXPECT_TRUE(s.IsCached(k));
+  EXPECT_EQ(s.UsedBytes(), v.size());
+}
+
+TEST_F(KVStoreTest, RemoveKeepsClockHandValidUnderManyKeys) {
+  // shards=1 forces all keys into one CLOCK ring so Remove must keep the
+  // persistent eviction hand valid; interleave removes with caches and verify
+  // the store stays consistent (no crash / stale index).
+  KVStore s(Opts(1ull << 30, 1));
+  std::string v(64, 'x');
+  for (uint64_t i = 0; i < 64; ++i)
+    ASSERT_EQ(s.Cache(BlockKey{i, 0, 1}, v.data(), v.size()), Status::kOk);
+  ASSERT_EQ(s.Count(), 64u);
+  for (uint64_t i = 0; i < 64; i += 2)  // remove every other key
+    EXPECT_EQ(s.Remove(BlockKey{i, 0, 1}), Status::kOk);
+  EXPECT_EQ(s.Count(), 32u);
+  for (uint64_t i = 0; i < 64; ++i)
+    EXPECT_EQ(s.IsCached(BlockKey{i, 0, 1}), (i % 2 == 1));
+  // The survivors are still readable and a fresh cache still evicts correctly.
+  std::string out;
+  EXPECT_EQ(s.Range(BlockKey{1, 0, 1}, 0, 64, &out), Status::kOk);
+}

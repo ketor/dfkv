@@ -30,6 +30,9 @@ int dfkv_get(dfkv_client_t c, const char* key, void* ptr, uint64_t n);        //
 int dfkv_get_auto(dfkv_client_t c, const char* key, void* ptr, uint64_t cap,
                   uint64_t* out_len);
 int dfkv_exist(dfkv_client_t c, const char* key);                            // 1/0
+// Drop a key from the cache (LMCache L2 eviction). Returns 1 if the owning node
+// confirmed the op (block removed OR already absent), 0 on route/health/IO error.
+int dfkv_remove(dfkv_client_t c, const char* key);                           // 1/0
 // Register a large host memory region (e.g. the whole SGLang host KV pool) so
 // put/get into any buffer inside it never do a per-op RDMA MR registration — the
 // region is registered once per connection. No-op on the TCP transport. Call once
@@ -65,6 +68,10 @@ int dfkv_batch_get_auto(dfkv_client_t c, const char** keys, void** ptrs,
                         const uint64_t* caps, int n, int* out_hit,
                         uint64_t* out_len);
 int dfkv_batch_exist(dfkv_client_t c, const char** keys, int n, int* out_exist);
+// Batch remove. out_ok[i] = 1 iff the owning node confirmed key[i]'s removal
+// (removed or already absent), 0 on failure. Returns 0 on call success, -1 on
+// bad args.
+int dfkv_batch_remove(dfkv_client_t c, const char** keys, int n, int* out_ok);
 
 // Scatter-gather batch put: each of the n keys gathers num_bufs[i] non-contiguous
 // source buffers (ptrs[i][0..num_bufs[i]-1], sizes[i][...]) into one stored blob
