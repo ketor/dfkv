@@ -78,6 +78,15 @@ def load_lib(path: Optional[str] = None) -> ctypes.CDLL:
     lib.dfkv_batch_exist.restype = c_int
     lib.dfkv_batch_exist.argtypes = [c_void_p, POINTER(c_char_p), c_int,
                                      POINTER(c_int)]
+    # dfkv_remove / dfkv_batch_remove are additive (>= dfkv with the remove RPC).
+    # Declared unconditionally; guarded at call sites for older libdfkv.so.
+    if hasattr(lib, "dfkv_remove"):
+        lib.dfkv_remove.restype = c_int
+        lib.dfkv_remove.argtypes = [c_void_p, c_char_p]
+    if hasattr(lib, "dfkv_batch_remove"):
+        lib.dfkv_batch_remove.restype = c_int
+        lib.dfkv_batch_remove.argtypes = [c_void_p, POINTER(c_char_p), c_int,
+                                          POINTER(c_int)]
     lib.dfkv_set_members.restype = c_int
     lib.dfkv_set_members.argtypes = [c_void_p, c_char_p]
     lib.dfkv_start_mds_discovery.restype = c_int
@@ -263,6 +272,15 @@ class DfkvNativeClient:
             raise RuntimeError(f"dfkv_batch_exist rc={rc}")
         return [out[i] == 1 for i in range(n)]
 
+    def _batch_remove_blocking(self, keys: List[str]) -> List[bool]:
+        n = len(keys)
+        karr = (c_char_p * n)(*[k.encode() for k in keys])
+        out = (c_int * n)()
+        rc = self._lib.dfkv_batch_remove(self._h, karr, n, out)
+        if rc != 0:
+            raise RuntimeError(f"dfkv_batch_remove rc={rc}")
+        return [out[i] == 1 for i in range(n)]
+
     # ------------------------------------------------------------------
     # public async API (returns the same tuple shapes the connector expects)
     # ------------------------------------------------------------------
@@ -311,11 +329,45 @@ class DfkvNativeClient:
             r.result = f"hits={hits}/{n}"
             return per_key
 
+    def supports_remove(self) -> bool:
+        """True iff the loaded libdfkv.so exposes the remove RPC (additive)."""
+        return hasattr(self._lib, "dfkv_batch_remove")
+
+    async def batch_remove(
+        self, keys: Sequence[str]
+    ) -> List[bool]:
+        """Drop keys from the ring. per_key[i] = the owning node confirmed the op
+        (removed or already absent). Raises if the lib has no remove RPC."""
+        n = len(keys)
+        if not self.supports_remove():
+            raise RuntimeError(
+                "libdfkv.so has no dfkv_batch_remove (rebuild dfkv with the "
+                "remove RPC to enable L2 eviction)"
+            )
+        with _push_metrics.op("remove", num_keys=n), \
+                access_log("native.batch_remove", lambda: f"{n} keys") as r:
+            per_key = await self._loop.run_in_executor(
+                self._executor, self._batch_remove_blocking, list(keys)
+            )
+            ok = sum(1 for b in per_key if b)
+            r.result = f"ok={ok}/{n}"
+            return per_key
+
     def exists_sync(self, key: str) -> bool:
         with access_log("native.exists_sync", lambda: key) as r:
             found = self._lib.dfkv_exist(self._h, key.encode()) == 1
             r.result = "found" if found else "not_found"
             return found
+
+    def remove_sync(self, key: str) -> bool:
+        """Drop one key synchronously. True iff the owning node confirmed the op
+        (removed or already absent). Raises if the lib has no remove RPC."""
+        if not self.supports_remove():
+            raise RuntimeError("libdfkv.so has no dfkv_remove")
+        with access_log("native.remove_sync", lambda: key) as r:
+            ok = self._lib.dfkv_remove(self._h, key.encode()) == 1
+            r.result = "ok" if ok else "fail"
+            return ok
 
     def ping_sync(self) -> None:
         """Cheap liveness check — connectivity is established at construction

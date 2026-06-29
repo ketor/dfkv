@@ -60,10 +60,28 @@ class Transport {
   virtual Status Exist(const std::string& node, const BlockKey& key,
                        bool* exist) = 0;
 
+  // Explicitly drop a block on its owning node (LMCache L2 eviction). Default:
+  // not supported; TcpTransport/RdmaTransport override it with a kRemove round
+  // trip. kOk = removed, kNotFound = absent, kIOError = transport failure.
+  virtual Status Remove(const std::string& node, const BlockKey& key) {
+    (void)node; (void)key; return Status::kInvalid;
+  }
+
   // Query a node's advertised cluster member list (for discovery). Default: not
   // supported; TCP/RDMA override it. *out = "name=ip:port,name=ip:port,...".
   virtual Status Members(const std::string& node, std::string* out) {
     (void)node; (void)out; return Status::kInvalid;
+  }
+
+  // Batch remove for one node. Default = sequential loop over Remove (eviction
+  // is off the hot path, so neither transport bothers to pipeline it). Returns
+  // the per-key Status for caller-side health accounting.
+  virtual std::vector<Status> RemoveMany(const std::string& node,
+                                         const std::vector<BlockKey>& keys) {
+    std::vector<Status> r;
+    r.reserve(keys.size());
+    for (const auto& k : keys) r.push_back(Remove(node, k));
+    return r;
   }
 
   // Transport-level Prometheus metrics (e.g. RDMA per-rail connections, MR

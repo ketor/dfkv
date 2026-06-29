@@ -133,6 +133,43 @@ def test_real_ring_store_lookup_load_roundtrip():
         a.close()
 
 
+def test_real_ring_remove_and_eviction_roundtrip():
+    a = _mk_adapter()
+    try:
+        if not a._client.supports_remove():
+            pytest.skip("libdfkv.so has no remove RPC (rebuild dfkv with it)")
+        run = os.urandom(6)
+        k = _key(b"rm-" + run)
+        payload = b"dfkv remove + L2 eviction round-trip payload " * 20
+
+        st = a.submit_store_task([k], [_Buf(payload)])
+        res = _wait_for(lambda: a.pop_completed_store_tasks().get(st))
+        assert res is not None and res.is_successful()
+        assert a.get_usage().total_bytes_used == len(payload)
+
+        # present before delete
+        lk = a.submit_lookup_and_lock_task([k])
+        bm = _wait_for(lambda: a.query_lookup_and_lock_result(lk))
+        assert bm is not None and bm.test(0)
+
+        # delete via the L2 eviction path (real dfkv_remove over the wire)
+        a.delete([k])
+        assert a.get_usage().total_bytes_used == 0  # accounting reclaimed
+
+        # gone after delete
+        lk2 = a.submit_lookup_and_lock_task([k])
+        bm2 = _wait_for(lambda: a.query_lookup_and_lock_result(lk2))
+        assert bm2 is not None and bm2.popcount() == 0
+
+        # a load now misses (nothing to bring back)
+        dst = _Buf(bytes(len(payload)))
+        ld = a.submit_load_task([k], [dst])
+        bm3 = _wait_for(lambda: a.query_load_result(ld))
+        assert bm3 is not None and bm3.popcount() == 0
+    finally:
+        a.close()
+
+
 def test_real_ring_batch_roundtrip():
     a = _mk_adapter()
     try:

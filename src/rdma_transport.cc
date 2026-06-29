@@ -298,6 +298,11 @@ Status RdmaTransport::Exist(const std::string& node, const BlockKey& key, bool* 
   return st;
 }
 
+Status RdmaTransport::Remove(const std::string& node, const BlockKey& key) {
+  // Key-only request, Status-only response (same framing as kExist).
+  return RoundTrip(node, WireOp::kRemove, key, 0, 0, nullptr, 0, nullptr);
+}
+
 Status RdmaTransport::Members(const std::string& node, std::string* out) {
   return RoundTrip(node, WireOp::kMembers, BlockKey{}, 0, 0, nullptr, 0, out);
 }

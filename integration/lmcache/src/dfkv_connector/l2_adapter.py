@@ -249,6 +249,7 @@ class DfkvL2Adapter(L2AdapterInterface):
         self._locked_keys: dict[ObjectKey, int] = {}
         # First-store-wins byte accounting (re-store of a known key adds 0).
         self._key_sizes: dict[ObjectKey, int] = {}
+        self._warned_no_remove = False
         self._lock = threading.Lock()
 
         # Background asyncio loop that runs the client's batch_* coroutines.
@@ -480,6 +481,50 @@ class DfkvL2Adapter(L2AdapterInterface):
     def query_load_result(self, task_id: L2TaskId) -> Optional[Bitmap]:
         with self._lock:
             return self._completed_loads.pop(task_id, None)
+
+    # ------------------------------------------------------------------
+    # Eviction (delete)
+    # ------------------------------------------------------------------
+
+    def delete(self, keys: List[ObjectKey]) -> None:
+        """Drop keys from dfkv (L2 eviction). Synchronous per the L2 controller
+        contract; fires ``_notify_keys_deleted`` so the eviction policy's byte
+        accounting stays in sync. No-op (with a one-time warning) if the loaded
+        libdfkv.so predates the remove RPC. Only meaningful when the adapter was
+        constructed with ``max_capacity_gb > 0`` (otherwise the controller never
+        calls delete — dfkv manages its own capacity)."""
+        if not keys:
+            return
+        if not self._client.supports_remove():
+            if not self._warned_no_remove:
+                self._warned_no_remove = True
+                logger.warning(
+                    "dfkv L2 delete requested but libdfkv.so has no remove RPC; "
+                    "eviction is a no-op. Rebuild dfkv with the remove RPC."
+                )
+            return
+        key_strs = [_object_key_to_string(k) for k in keys]
+        fut = asyncio.run_coroutine_threadsafe(
+            self._client.batch_remove(key_strs), self._loop
+        )
+        try:
+            per_key = fut.result(timeout=30.0)
+        except Exception as e:  # pragma: no cover - network/lib failure path
+            logger.warning("dfkv L2 delete failed for %d keys: %s", len(keys), e)
+            return
+        deleted: List[ObjectKey] = []
+        sizes: List[int] = []
+        with self._lock:
+            for key, ok in zip(keys, per_key):
+                if not ok:
+                    continue
+                # Only account keys we tracked a size for (stored via this adapter).
+                sz = self._key_sizes.pop(key, None)
+                if sz is not None:
+                    deleted.append(key)
+                    sizes.append(sz)
+        if deleted:
+            self._notify_keys_deleted(deleted, sizes)
 
     # ------------------------------------------------------------------
     # Status / Cleanup

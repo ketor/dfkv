@@ -116,4 +116,11 @@ Status TcpTransport::Exist(const std::string& node, const BlockKey& key,
   return st;
 }
 
+Status TcpTransport::Remove(const std::string& node, const BlockKey& key) {
+  // kRemove is a key-only request (no payload), Status-only response: kOk when a
+  // block was dropped, kNotFound when it was already absent (both fine for the
+  // caller), kIOError on a transport failure.
+  return RoundTrip(node, WireOp::kRemove, key, 0, 0, nullptr, 0, nullptr);
+}
+
 }  // namespace dfkv

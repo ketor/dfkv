@@ -85,6 +85,19 @@ class _FakeDfkvClient:
     async def batch_exists(self, keys):
         return [k in self._store for k in keys]
 
+    def supports_remove(self) -> bool:
+        return True
+
+    async def batch_remove(self, keys):
+        out = []
+        for k in keys:
+            out.append(self._store.pop(k, None) is not None or True)
+        return out
+
+    def remove_sync(self, key) -> bool:
+        self._store.pop(key, None)
+        return True
+
     def close(self):
         self.closed = True
 
@@ -241,6 +254,38 @@ def test_store_event_fd_is_signalled():
         # the store event fd must become readable on completion
         r, _, _ = select.select([efd], [], [], 5.0)
         assert efd in r, "store event fd was not signalled"
+    finally:
+        a.close()
+
+
+def test_delete_removes_and_updates_byte_accounting():
+    a = _mk_adapter()
+    try:
+        k = _key(70)
+        payload = b"y" * 2048
+        st = a.submit_store_task([k], [_FakeObj(payload)])
+        _wait_for(lambda: a.pop_completed_store_tasks().get(st))
+        assert a.get_usage().total_bytes_used == 2048
+
+        # delete is synchronous; it removes from the backend and decrements the
+        # base-class byte accounting via _notify_keys_deleted.
+        a.delete([k])
+        assert a.get_usage().total_bytes_used == 0
+
+        # gone from the backend -> lookup miss
+        lk = a.submit_lookup_and_lock_task([k])
+        bm = _wait_for(lambda: a.query_lookup_and_lock_result(lk))
+        assert bm is not None and bm.popcount() == 0
+    finally:
+        a.close()
+
+
+def test_delete_empty_and_unknown_key_safe():
+    a = _mk_adapter()
+    try:
+        a.delete([])            # no-op
+        a.delete([_key(71)])    # never stored -> no accounting change, no raise
+        assert a.get_usage().total_bytes_used == 0
     finally:
         a.close()
 

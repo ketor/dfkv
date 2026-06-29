@@ -328,6 +328,29 @@ Status KVStore::Cache(const BlockKey& key, const void* data, size_t len) {
   return Status::kOk;
 }
 
+Status KVStore::Remove(const BlockKey& key) {
+  const std::string fname = key.Filename();
+  Shard& sh = ShardFor(fname);
+  std::lock_guard<std::shared_mutex> wl(sh.mu);  // exclusive
+  auto it = sh.index.find(fname);
+  if (it == sh.index.end()) return Status::kNotFound;
+  std::error_code ec;
+  fs::remove(it->second.path, ec);  // best-effort unlink (index is the source of truth)
+  sh.used_bytes -= it->second.size;
+  // Drop it from the CLOCK ring; if the hand points at the victim, advance the
+  // hand off it first so the persistent eviction cursor stays valid (same
+  // discipline as EvictLocked).
+  for (auto rit = sh.ring.begin(); rit != sh.ring.end(); ++rit) {
+    if (*rit == fname) {
+      if (sh.hand == rit) sh.hand = HandNext(sh.ring, rit);
+      sh.ring.erase(rit);
+      break;
+    }
+  }
+  sh.index.erase(it);
+  return Status::kOk;
+}
+
 Status KVStore::CacheDirect(const BlockKey& key, char* data, size_t len,
                             size_t cap) {
   if (data == nullptr && len != 0) return Status::kInvalid;

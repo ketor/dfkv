@@ -561,8 +561,21 @@ class DfkvConnector(RemoteConnector):
     def remove_sync(self, key: CacheEngineKey) -> bool:
         key_str = cache_engine_key_to_dfkv_str(key)
         with access_log("remove_sync", lambda: key_str) as r:
-            r.result = "FAIL NotImplementedError"
-            raise NotImplementedError("dfkv connector has no remove path yet")
+            if not self._client.supports_remove():
+                r.result = "FAIL no remove RPC"
+                raise NotImplementedError(
+                    "libdfkv.so has no remove RPC (rebuild dfkv with it)"
+                )
+            try:
+                ok = self._client.remove_sync(key_str)
+            except Exception as e:
+                logger.warning("remove_sync failed for %s: %s", key_str, e)
+                r.result = f"error: {e}"
+                return False
+            if ok:
+                self._exists_lru.discard(key_str)
+            r.result = "ok" if ok else "fail"
+            return ok
 
     def support_batched_contains(self) -> bool:
         return False

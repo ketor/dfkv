@@ -38,6 +38,7 @@ class RdmaTransport : public Transport {
                uint64_t length, std::string* out) override;
   Status Exist(const std::string& node, const BlockKey& key,
                bool* exist) override;
+  Status Remove(const std::string& node, const BlockKey& key) override;
   Status Members(const std::string& node, std::string* out) override;
 
   void RegisterMemory(void* base, size_t size) override;
