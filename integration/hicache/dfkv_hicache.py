@@ -580,6 +580,19 @@ class DfkvHiCache(HiCacheStorage):
                   file=sys.stderr, flush=True)
         return True
 
+    def supports_fused_draft_device(self) -> bool:
+        """True iff the device-direct entry points accept `with_draft=True`, i.e.
+        they can carry the EAGLE draft's sub-keys INSIDE the same scatter-gather
+        batch as the target page instead of needing a second
+        batch_set/get_v1_device_draft round trip.
+
+        The draft always rides the same page hashes and the same device slots as
+        the target (see _draft_device_flat), so fusing is a pure op-count
+        collapse: identical keys, identical bytes, one RDMA batch instead of two.
+        Capability probe for the SGLang controller; the standalone
+        batch_set/get_v1_device_draft ABI stays available as the fallback."""
+        return True
+
     def register_mem_pool_device(self, mem_pool_device):
         """Register the GPU KV pool's per-layer buffers for RDMA (GPUDirect MR;
         dfkv_register_memory accepts device pointers — same call the vLLM connector
@@ -969,7 +982,8 @@ class DfkvHiCache(HiCacheStorage):
             todo = failed
         return present
 
-    def batch_set_v1_device(self, keys, device_indices, extra_info=None) -> List[bool]:
+    def batch_set_v1_device(self, keys, device_indices, extra_info=None,
+                            with_draft=False) -> List[bool]:
         """L2-bypass write-through: RDMA a page straight from its GPU KV slots to L3
         (no D2H staging). Mirrors batch_set_v1 but the page payload is gathered from
         the layer-first device pool as per-layer scatter-gather segments.
@@ -989,17 +1003,11 @@ class DfkvHiCache(HiCacheStorage):
                 if _sp:
                     _sp.attrs = {"dfkv.backup_skip": True}
                 return [True] * n
-            from sglang.srt.mem_cache.device_page_meta import (
-                get_device_page_buffer_meta,
-            )
-            seg_ptrs, seg_sizes = get_device_page_buffer_meta(
-                self.mem_pool_device, device_indices)
-            sub, sks, sp, ss = self._flatten_device(keys, seg_ptrs, seg_sizes)
-            nbytes = sum(sum(s) for s in ss)
-            t0 = time.perf_counter()
-            flat = self._put_sg_flat(sks, sp, ss)
-            dur = time.perf_counter() - t0
-            res = self._fold(flat, n, sub)
+            # Increment 7: fuse the dense EAGLE draft's sub-keys into this batch.
+            draft_extra = (self._fused_draft_or_fallback(
+                keys, device_indices, putting=True) if with_draft else None)
+            res, nbytes, dur = self._kv_device_set(
+                keys, device_indices, extra=draft_extra)
             r.result = f"ok {sum(res)}/{n} (device-direct)"
             if self._put_retry_recovered:
                 r.result += f" retry_ok={self._put_retry_recovered}"
@@ -1038,7 +1046,8 @@ class DfkvHiCache(HiCacheStorage):
             return [0] * n, [0] * n
         return [out_hit[i] for i in range(n)], [int(out_len[i]) for i in range(n)]
 
-    def batch_get_v1_device(self, keys, device_indices, extra_info=None) -> List[bool]:
+    def batch_get_v1_device(self, keys, device_indices, extra_info=None,
+                            with_draft=False) -> List[bool]:
         """L2-bypass on-demand read: RDMA a page's stored blob straight INTO its
         GPU KV slots (no host staging). The read twin of batch_set_v1_device.
 
@@ -1067,15 +1076,24 @@ class DfkvHiCache(HiCacheStorage):
             sub, sks, sp, sc = self._flatten_device(keys, seg_ptrs, seg_caps)
             # Per sub-key expected byte length = sum of its per-layer segment caps.
             want = [sum(c) for c in sc]
+            nmain = len(sks)
+            # Increment 7: fuse the dense EAGLE draft's sub-keys into this SG GET
+            # (same keys/slots, `.draft` namespace) — one RDMA batch, not two. The
+            # draft's results/bytes stay out of the target fold below.
+            draft_extra = (self._fused_draft_or_fallback(
+                keys, device_indices, putting=False) if with_draft else None)
+            if draft_extra:
+                e_sks, e_sp, e_sc = draft_extra
+                sks = sks + e_sks; sp = sp + e_sp; sc = sc + e_sc
             t0 = time.perf_counter()
             hits, lens = self._batch_get_sg(sks, sp, sc)
             dur = time.perf_counter() - t0
             # A sub-object is good only on a full-length hit; fold to per-page.
-            flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
+            flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(nmain)]
             res = self._fold(flat_ok, n, sub)
-            nbytes = sum(lens)
+            nbytes = sum(lens[:nmain])
             r.result = f"hits={sum(res)}/{n} (device-direct)"
-            short = sum(1 for i in range(len(sks))
+            short = sum(1 for i in range(nmain)
                         if hits[i] == 1 and lens[i] < want[i])
             if short:
                 r.result += f" short_read={short}"
@@ -1275,11 +1293,17 @@ class DfkvHiCache(HiCacheStorage):
             return res
 
     # --- DSA L2-bypass: main KV device-direct + sidecar host, one logical op ----
-    def _kv_device_set(self, keys, device_indices):
+    def _kv_device_set(self, keys, device_indices, extra=None):
         """Core of batch_set_v1_device (device-direct SG put) without the tracing /
         access-log wrapper, so batch_set_v2_device can reuse it for the anchor KV.
         Returns (per_page_bools, nbytes, seconds). MLA backup_skip on non-zero TP
-        rank (replicated latent) short-circuits to all-True, no I/O."""
+        rank (replicated latent) short-circuits to all-True, no I/O.
+
+        `extra` is an optional (sks, seg_ptrs, seg_sizes) flat group appended to
+        the SAME batch (the fused EAGLE draft — see _draft_device_flat). Its
+        sub-keys ride one exist probe + one put with the anchor's; its results and
+        bytes are NOT folded into the return value (the draft is best-effort and
+        must not gate the target page, and its bytes belong to no target metric)."""
         n = len(keys)
         if self.is_mla and self.tp_rank != 0:
             return [True] * n, 0, 0.0
@@ -1290,16 +1314,23 @@ class DfkvHiCache(HiCacheStorage):
             self.mem_pool_device, device_indices)
         sub, sks, sp, ss = self._flatten_device(keys, seg_ptrs, seg_sizes)
         nbytes = sum(sum(s) for s in ss)
+        nmain = len(sks)
+        if extra:
+            e_sks, e_sp, e_ss = extra
+            sks = sks + e_sks; sp = sp + e_sp; ss = ss + e_ss
         t0 = time.perf_counter()
         flat = self._put_sg_flat(sks, sp, ss)
         dur = time.perf_counter() - t0
-        return self._fold(flat, n, sub), nbytes, dur
+        return self._fold(flat[:nmain], n, sub), nbytes, dur
 
-    def _kv_device_get(self, keys, device_indices):
+    def _kv_device_get(self, keys, device_indices, extra=None):
         """Core of batch_get_v1_device (device-direct SG get) without the tracing /
         access-log wrapper, so batch_get_v2_device can reuse it for the anchor KV.
         Returns (per_page_bools, nbytes, seconds). A page is a hit only on a
-        full-length read of every sub-object (a short read is a corrupt page)."""
+        full-length read of every sub-object (a short read is a corrupt page).
+
+        `extra` is the fused-draft flat group (see _kv_device_set); it shares this
+        one SG GET but is excluded from the returned hit fold and byte count."""
         n = len(keys)
         from sglang.srt.mem_cache.device_page_meta import (
             get_device_page_buffer_meta,
@@ -1308,11 +1339,15 @@ class DfkvHiCache(HiCacheStorage):
             self.mem_pool_device, device_indices)
         sub, sks, sp, sc = self._flatten_device(keys, seg_ptrs, seg_caps)
         want = [sum(c) for c in sc]
+        nmain = len(sks)
+        if extra:
+            e_sks, e_sp, e_sc = extra
+            sks = sks + e_sks; sp = sp + e_sp; sc = sc + e_sc
         t0 = time.perf_counter()
         hits, lens = self._batch_get_sg(sks, sp, sc)
         dur = time.perf_counter() - t0
-        flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(len(sks))]
-        return self._fold(flat_ok, n, sub), sum(lens), dur
+        flat_ok = [hits[i] == 1 and lens[i] >= want[i] for i in range(nmain)]
+        return self._fold(flat_ok, n, sub), sum(lens[:nmain]), dur
 
     # --- task 4: DSA indexer sidecar device-direct (no host staging) -----------
     def _sidecar_device_set(self, name, keys, device_indices):
@@ -1435,8 +1470,81 @@ class DfkvHiCache(HiCacheStorage):
                 r.result += f" +indexer {sum(side)}/{n}"
             return res
 
+    # --- increment 7: fuse the draft into the target's SG batch ----------------
+    def _draft_device_flat(self, keys, device_indices, putting):
+        """Flat SG group (sks, seg_ptrs, seg_sizes) for the EAGLE draft's pages —
+        the draft latent and, for a DSA draft, its indexer sidecar — so they can be
+        appended to the TARGET page's batch instead of costing their own RDMA ops.
+
+        Sound because the draft is addressed by exactly the same page hashes and
+        the same device slot indices as the target (the draft rides the slots the
+        target rode; see the SGLang controller's _draft_device_set /
+        _maybe_device_draft_get, both of which pass the target's keys+indices
+        verbatim). Only the key namespace differs (`.draft_k` / `draft_indexer`).
+
+        Returns None when there is nothing to fuse, and the caller must then fall
+        back to the standalone batch_set/get_v1_device_draft call so semantics are
+        unchanged:
+          * no draft pool registered, or an empty batch;
+          * on a PUT, when the draft latent's TP rank-skip would not agree with the
+            anchor's. The anchor skips on `is_mla and tp_rank != 0`; the draft
+            latent skips on `draft_sub == 1 and tp_rank != 0`. They agree for
+            GLM-5.2 (MLA target + MLA draft) and for a dense target + dense draft,
+            but a mixed pair (MLA target + MHA draft, or vice versa) must keep its
+            own call. Reads have no rank skip anywhere, so a read always fuses.
+        The draft indexer's skip is `is_mla and tp_rank != 0` (it goes through the
+        shared _sidecar_device_set), i.e. identical to the anchor's — so once the
+        latent check passes the whole group is skip-compatible."""
+        draft_pool = getattr(self, "mem_pool_device_draft", None)
+        n = len(keys)
+        if not n or draft_pool is None:
+            return None
+        from sglang.srt.mem_cache.device_page_meta import (
+            get_device_page_buffer_meta,
+            get_device_sidecar_page_buffer_meta,
+        )
+        seg_ptrs, seg_sizes = get_device_page_buffer_meta(draft_pool, device_indices)
+        sub = len(seg_ptrs) // n
+        if putting and (sub == 1) != bool(self.is_mla):
+            return None
+        _stride, sks, sp, ss = self._flatten_device(
+            keys, seg_ptrs, seg_sizes,
+            keys_fn=lambda h: self._draft_keys(h, sub), sub=sub)
+        name = getattr(self, "_draft_sidecar_name", None)
+        if name:
+            pool = self._sidecar_device_pools[name]
+            d_ptrs, d_sizes = get_device_sidecar_page_buffer_meta(pool, device_indices)
+            _s2, sks2, sp2, ss2 = self._flatten_device(
+                keys, d_ptrs, d_sizes,
+                keys_fn=lambda h: self._pool_keys(name, h), sub=self._pool_sub(name))
+            sks = sks + sks2; sp = sp + sp2; ss = ss + ss2
+        return sks, sp, ss
+
+    def _fused_draft_or_fallback(self, keys, device_indices, putting):
+        """Build the fused draft group, or run the standalone draft op and return
+        None when the group cannot be fused. Best-effort throughout: any failure
+        only costs EAGLE acceptance on those pages (the target verifies the draft),
+        never correctness, so it is swallowed exactly like _draft_device_set /
+        _maybe_device_draft_get on the SGLang side."""
+        try:
+            extra = self._draft_device_flat(keys, device_indices, putting)
+        except Exception:
+            extra = None
+        else:
+            if extra is not None:
+                return extra
+        try:
+            if putting:
+                self.batch_set_v1_device_draft(keys, device_indices)
+            else:
+                self.batch_get_v1_device_draft(keys, device_indices)
+        except Exception:
+            pass
+        return None
+
     def batch_set_v2_device(
-        self, kv_keys, kv_device_indices, sidecar_transfers, extra_info=None
+        self, kv_keys, kv_device_indices, sidecar_transfers, extra_info=None,
+        with_draft=False,
     ) -> dict:
         """DSA L2-bypass backup (GLM-5.2): the anchor "kv" pool (the big MLA latent)
         RDMAs straight from its GPU slots to L3 via the device-direct SG put. Task 4:
@@ -1462,7 +1570,13 @@ class DfkvHiCache(HiCacheStorage):
                 access_log("batch_set_v2_device",
                            lambda: f"{self._alog_tag} kv={n} "
                                    f"{_fmt_pools(sidecar_transfers)}") as r:
-            kv_res, kv_bytes, kv_secs = self._kv_device_set(kv_keys, kv_device_indices)
+            # Increment 7: the EAGLE draft's sub-keys ride the anchor's SG batch
+            # (one exist probe + one put covers target latent + draft latent +
+            # draft indexer), so draft L3 adds no RDMA op to the backup.
+            draft_extra = (self._fused_draft_or_fallback(
+                kv_keys, kv_device_indices, putting=True) if with_draft else None)
+            kv_res, kv_bytes, kv_secs = self._kv_device_set(
+                kv_keys, kv_device_indices, extra=draft_extra)
             results = {"kv": kv_res}
             # Main-KV device write reports on_set (v1-device), matching stock DSA's
             # anchor attribution; skip the metric on the MLA rank!=0 no-op.
@@ -1503,7 +1617,8 @@ class DfkvHiCache(HiCacheStorage):
             return results
 
     def batch_get_v2_device(
-        self, kv_keys, kv_device_indices, sidecar_transfers, extra_info=None
+        self, kv_keys, kv_device_indices, sidecar_transfers, extra_info=None,
+        with_draft=False,
     ) -> dict:
         """DSA L2-bypass on-demand read (GLM-5.2): the read twin of
         batch_set_v2_device. The anchor "kv" pool RDMAs straight INTO its GPU slots
@@ -1520,7 +1635,12 @@ class DfkvHiCache(HiCacheStorage):
                 access_log("batch_get_v2_device",
                            lambda: f"{self._alog_tag} kv={n} "
                                    f"{_fmt_pools(sidecar_transfers)}") as r:
-            kv_res, kv_bytes, kv_secs = self._kv_device_get(kv_keys, kv_device_indices)
+            # Increment 7: fuse the draft GET into the anchor's SG GET (same keys,
+            # same device slots, distinct namespace) — one RDMA batch, not two.
+            draft_extra = (self._fused_draft_or_fallback(
+                kv_keys, kv_device_indices, putting=False) if with_draft else None)
+            kv_res, kv_bytes, kv_secs = self._kv_device_get(
+                kv_keys, kv_device_indices, extra=draft_extra)
             results = {"kv": kv_res}
             if n:
                 self._metrics.on_get(pages=n, hit_pages=sum(kv_res),

@@ -789,6 +789,174 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         st.register_mem_pool_device_draft(dst)
         self.assertEqual(st.batch_get_v1_device_draft([page_hash], dev), [True])
 
+    # Increment 7: the draft rides the TARGET's SG batch (with_draft=True).
+    def test_fused_draft_write_is_readable_by_the_unfused_draft_path(self):
+        """The load-bearing R3 claim: fusing changes only WHICH RDMA batch carries
+        the draft sub-keys, never the keys or the bytes. A page whose draft was
+        written fused (batch_set_v1_device(..., with_draft=True)) must read back
+        byte-exact through the STANDALONE batch_get_v1_device_draft — i.e. what a
+        restarted engine finds in L3 is identical either way."""
+        st = self._plugin(self._node("fusedw"))
+        kv = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        src = FakeDsaDraftDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM, num_pages=4, side_bytes=self.SIDE_DEV_BYTES)
+        st.register_mem_pool_device(kv)
+        st.register_mem_pool_device_draft(src)
+        st.register_mem_pool_device_draft_sidecar(src)
+        self.assertTrue(st.supports_fused_draft_device())
+
+        page_hash = "fused701"
+        dev = list(range(0, self.PAGE_SIZE))
+        # ONE call: target latent + draft latent + draft indexer in one SG put.
+        self.assertEqual(
+            st.batch_set_v1_device([page_hash], dev, with_draft=True), [True])
+
+        dst = FakeDsaDraftDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM, num_pages=4, side_bytes=self.SIDE_DEV_BYTES)
+        for L in range(self.LAYER_NUM):
+            dst._np[L][:] = 0
+            dst._side_np[L][:] = 0
+        st.register_mem_pool_device_draft(dst)
+        st.register_mem_pool_device_draft_sidecar(dst)
+        # Read via the UNFUSED draft ABI — proves the fused write used the same keys.
+        self.assertEqual(st.batch_get_v1_device_draft([page_hash], dev), [True])
+        for L in range(self.LAYER_NUM):
+            self.assertEqual(dst.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                             src.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                             f"fused-written draft latent layer {L} mismatch")
+            self.assertEqual(dst.side_layer_page_bytes(L, 0),
+                             src.side_layer_page_bytes(L, 0),
+                             f"fused-written draft indexer layer {L} mismatch")
+
+    def test_unfused_draft_write_is_readable_by_the_fused_read(self):
+        """The mirror of the above (and the real R3 shape: a PREVIOUS process wrote
+        unfused, this one reads fused). batch_get_v1_device(..., with_draft=True)
+        must fill the draft GPU slots from a standalone-written draft page."""
+        st = self._plugin(self._node("fusedr"))
+        kv = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        src = FakeDsaDraftDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM, num_pages=4, side_bytes=self.SIDE_DEV_BYTES)
+        st.register_mem_pool_device(kv)
+        st.register_mem_pool_device_draft(src)
+        st.register_mem_pool_device_draft_sidecar(src)
+        page_hash = "fused702"
+        dev = list(range(0, self.PAGE_SIZE))
+        self.assertEqual(st.batch_set_v1_device([page_hash], dev), [True])
+        self.assertEqual(st.batch_set_v1_device_draft([page_hash], dev), [True])
+
+        kv_dst = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        dst = FakeDsaDraftDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM, num_pages=4, side_bytes=self.SIDE_DEV_BYTES)
+        for L in range(self.LAYER_NUM):
+            kv_dst._np[L][:] = 0
+            dst._np[L][:] = 0
+            dst._side_np[L][:] = 0
+        st.register_mem_pool_device(kv_dst)
+        st.register_mem_pool_device_draft(dst)
+        st.register_mem_pool_device_draft_sidecar(dst)
+        # ONE call fills target latent AND draft latent AND draft indexer.
+        self.assertEqual(
+            st.batch_get_v1_device([page_hash], dev, with_draft=True), [True])
+        for L in range(self.LAYER_NUM):
+            self.assertEqual(kv_dst.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                             kv.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                             f"fused read: target layer {L} mismatch")
+            self.assertEqual(dst.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                             src.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                             f"fused read: draft latent layer {L} mismatch")
+            self.assertEqual(dst.side_layer_page_bytes(L, 0),
+                             src.side_layer_page_bytes(L, 0),
+                             f"fused read: draft indexer layer {L} mismatch")
+
+    def test_fused_v2_device_roundtrip_all_four_components(self):
+        """DSA (GLM-5.2) shape: batch_set_v2_device(..., with_draft=True) followed by
+        batch_get_v2_device(..., with_draft=True) carries target latent + target
+        indexer + draft latent + draft indexer, all byte-exact, and the returned
+        target/sidecar hit lists are unaffected by the fused draft sub-keys."""
+        st = self._plugin(self._node("fusedv2"))
+        kv = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        side = FakeLayerFirstIndexerDevicePool(
+            self.LAYER_NUM, num_pages=4, page_bytes=self.SIDE_DEV_BYTES,
+            page_size=self.PAGE_SIZE)
+        draft = FakeDsaDraftDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM, num_pages=4, side_bytes=self.SIDE_DEV_BYTES)
+        st.register_mem_pool_device(kv)
+        st.register_mem_pool_device_sidecar("indexer", side)
+        st.register_mem_pool_device_draft(draft)
+        st.register_mem_pool_device_draft_sidecar(draft)
+
+        h = "fusedv21"
+        dev = list(range(0, self.PAGE_SIZE))
+        res = st.batch_set_v2_device(
+            [h], dev, [_DeviceTransfer("indexer", [h], dev)], with_draft=True)
+        self.assertEqual(res["kv"], [True])
+        self.assertEqual(res["indexer"], [True])
+
+        kv2 = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        side2 = FakeLayerFirstIndexerDevicePool(
+            self.LAYER_NUM, num_pages=4, page_bytes=self.SIDE_DEV_BYTES,
+            page_size=self.PAGE_SIZE)
+        draft2 = FakeDsaDraftDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM, num_pages=4, side_bytes=self.SIDE_DEV_BYTES)
+        for L in range(self.LAYER_NUM):
+            kv2._np[L][:] = 0
+            side2._np[L][:] = 0
+            draft2._np[L][:] = 0
+            draft2._side_np[L][:] = 0
+        st.register_mem_pool_device(kv2)
+        st.register_mem_pool_device_sidecar("indexer", side2)
+        st.register_mem_pool_device_draft(draft2)
+        st.register_mem_pool_device_draft_sidecar(draft2)
+        got = st.batch_get_v2_device(
+            [h], dev, [_DeviceTransfer("indexer", [h], dev)], with_draft=True)
+        self.assertEqual(got["kv"], [True])
+        self.assertEqual(got["indexer"], [True])
+        for L in range(self.LAYER_NUM):
+            self.assertEqual(kv2.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                             kv.layer_page_bytes(L, 0, self.PAGE_SIZE))
+            self.assertEqual(side2.layer_page_bytes(L, 0), side.layer_page_bytes(L, 0))
+            self.assertEqual(draft2.layer_page_bytes(L, 0, self.PAGE_SIZE),
+                             draft.layer_page_bytes(L, 0, self.PAGE_SIZE))
+            self.assertEqual(draft2.side_layer_page_bytes(L, 0),
+                             draft.side_layer_page_bytes(L, 0))
+
+    def test_fused_read_of_absent_draft_still_serves_the_target(self):
+        """Best-effort invariant preserved under fusion: a target page that IS in L3
+        but whose draft never was must still report a target HIT (the draft only
+        gates EAGLE acceptance, never the target's usability)."""
+        st = self._plugin(self._node("fusedmiss"))
+        kv = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        st.register_mem_pool_device(kv)
+        h = "fusedm01"
+        dev = list(range(0, self.PAGE_SIZE))
+        self.assertEqual(st.batch_set_v1_device([h], dev), [True])  # target only
+        draft = FakeDsaDraftDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM, num_pages=4, side_bytes=self.SIDE_DEV_BYTES)
+        st.register_mem_pool_device_draft(draft)
+        st.register_mem_pool_device_draft_sidecar(draft)
+        self.assertEqual(
+            st.batch_get_v1_device([h], dev, with_draft=True), [True],
+            "a missing draft must not turn a target hit into a miss")
+
     def test_draft_indexer_keys_distinct_namespace(self):
         """The DSA draft indexer rides its own `draft_indexer` key namespace, distinct
         from the draft latent (`.draft_k`) and the target indexer (`_indexer_k`)."""
@@ -798,6 +966,180 @@ class TestDeviceDirectEndToEnd(unittest.TestCase):
         self.assertEqual(st._pool_keys("draft_indexer", h), ["m/abc123_draft_indexer_k"])
         self.assertNotEqual(st._pool_keys("draft_indexer", h), st._draft_keys(h, 1))
         self.assertNotEqual(st._pool_keys("draft_indexer", h), st._pool_keys("indexer", h))
+
+
+class FakeMhaDraftDevicePool:
+    """Layer-first MHA GPU pool (k + v buffers => sub=2), used to exercise the
+    increment-7 rank-skip-disagreement guard: an MLA target skips its write on
+    tp_rank != 0 while an MHA draft (sub=2) does not, so that pair must NOT fuse."""
+
+    def __init__(self, layer_num, slots, page_size, head_dim):
+        self.page_size = page_size
+        self.head_num = 1
+        self.head_dim = head_dim
+        self.v_head_dim = head_dim
+        self.use_dsa = False
+        self._np = []
+        self.k_buffer, self.v_buffer = [], []
+        for _ in range(layer_num):
+            k = np.zeros(slots * head_dim, dtype=np.uint8)
+            v = np.zeros(slots * head_dim, dtype=np.uint8)
+            self._np += [k, v]
+            self.k_buffer.append(_NpTensor(k))
+            self.v_buffer.append(_NpTensor(v))
+
+
+class _FakeMetrics:
+    """Inert metrics sink for the op-counting tests."""
+
+    def on_set(self, **kw):
+        pass
+
+    def on_get(self, **kw):
+        pass
+
+
+class TestFusedDraftGrouping(unittest.TestCase):
+    """Increment 7 (fused draft), pure logic — no cache node, no libdfkv IO.
+
+    Covers WHICH sub-keys are folded into the target's batch, WHEN fusion is
+    declined (and falls back to the standalone draft op), and the op-count
+    collapse that is the whole point of the change.
+    """
+
+    LAYER_NUM = 3
+    PAGE_SIZE = 4
+    KV_DIM = 5
+    SIDE_BYTES = 6
+
+    def _st(self, **attrs):
+        st = _bare(**attrs)
+        st._lib = FakeLib()
+        st._h = None
+        return st
+
+    def _mla_draft(self):
+        return FakeDsaDraftDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM, num_pages=4, side_bytes=self.SIDE_BYTES)
+
+    def test_group_is_draft_latent_plus_draft_indexer(self):
+        """A DSA draft fuses BOTH of its namespaces (`.draft_k` and
+        `draft_indexer`) — never the target's own keys."""
+        st = self._st()
+        draft = self._mla_draft()
+        st.mem_pool_device_draft = draft
+        st._draft_sidecar_name = "draft_indexer"
+        st._sidecar_device_pools = {"draft_indexer": draft}
+        h = "abc123"
+        sks, sp, ss = st._draft_device_flat([h], list(range(self.PAGE_SIZE)),
+                                            putting=True)
+        self.assertEqual(sks, ["m/abc123.draft_k@sg0",
+                               "m/abc123_draft_indexer_k@sg0"])
+        self.assertEqual(len(sp), len(sks))
+        self.assertEqual(len(ss), len(sks))
+        # Every fused sub-key is in a draft namespace, never the target's.
+        for sk in sks:
+            self.assertNotIn(sk, st._keys(h))
+
+    def test_dense_draft_group_is_latent_only(self):
+        st = self._st()
+        st.mem_pool_device_draft = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        sks, _sp, _ss = st._draft_device_flat(["abc123"],
+                                              list(range(self.PAGE_SIZE)),
+                                              putting=True)
+        self.assertEqual(sks, ["m/abc123.draft_k@sg0"])
+
+    def test_no_draft_pool_declines(self):
+        st = self._st()
+        self.assertIsNone(
+            st._draft_device_flat(["h"], list(range(self.PAGE_SIZE)), putting=True))
+
+    def test_put_declines_when_rank_skip_disagrees(self):
+        """MLA target (write skipped on tp_rank != 0) + MHA draft (sub=2, every rank
+        writes): fusing would silently drop the draft write on ranks 1..N-1, so the
+        group is declined and the standalone draft op keeps its own semantics.
+        The READ has no rank skip anywhere, so the same pair fuses on a get."""
+        st = self._st(is_mla=True, tp_size=2, tp_rank=1)
+        st.mem_pool_device_draft = FakeMhaDraftDevicePool(
+            self.LAYER_NUM, slots=self.PAGE_SIZE * 3, page_size=self.PAGE_SIZE,
+            head_dim=self.KV_DIM)
+        idx = list(range(self.PAGE_SIZE))
+        self.assertIsNone(st._draft_device_flat(["h"], idx, putting=True))
+        self.assertIsNotNone(st._draft_device_flat(["h"], idx, putting=False))
+
+    def test_fallback_runs_the_standalone_draft_op(self):
+        """When the group is declined, _fused_draft_or_fallback must still issue the
+        draft IO itself — the SGLang side has already skipped its own call."""
+        st = self._st(is_mla=True, tp_size=2, tp_rank=1)
+        st.mem_pool_device_draft = FakeMhaDraftDevicePool(
+            self.LAYER_NUM, slots=self.PAGE_SIZE * 3, page_size=self.PAGE_SIZE,
+            head_dim=self.KV_DIM)
+        calls = []
+        st.batch_set_v1_device_draft = lambda k, d: calls.append(("set", tuple(k)))
+        idx = list(range(self.PAGE_SIZE))
+        self.assertIsNone(st._fused_draft_or_fallback(["h"], idx, putting=True))
+        self.assertEqual(calls, [("set", ("h",))])
+
+    def test_fusion_halves_the_put_op_count(self):
+        """The point of increment 7: draft L3 costs ZERO extra RDMA ops. Fused, the
+        target + draft latent + draft indexer share one exist probe and one put;
+        unfused they take three of each."""
+        draft = self._mla_draft()
+
+        def st_with_counters():
+            st = self._st()
+            st.mem_pool_device = FakeLayerFirstMlaDevicePool(
+                self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+                kv_cache_dim=self.KV_DIM)
+            st.mem_pool_device_draft = draft
+            st._draft_sidecar_name = "draft_indexer"
+            st._sidecar_device_pools = {"draft_indexer": draft}
+            st._metrics = _FakeMetrics()
+            st.ops = {"exist": 0, "put": 0}
+            st._batch_exist_flat = lambda sks: (
+                st.ops.__setitem__("exist", st.ops["exist"] + 1)
+                or [False] * len(sks))
+            st._batch_put_sg = lambda sks, p, s: (
+                st.ops.__setitem__("put", st.ops["put"] + 1) or [True] * len(sks))
+            return st
+
+        h = "abc123"
+        idx = list(range(self.PAGE_SIZE))
+
+        unfused = st_with_counters()
+        unfused.batch_set_v1_device([h], idx)
+        unfused.batch_set_v1_device_draft([h], idx)
+        self.assertEqual(unfused.ops, {"exist": 3, "put": 3},
+                         "unfused: target, draft latent and draft indexer each pay "
+                         "their own exist probe + put")
+
+        fused = st_with_counters()
+        fused.batch_set_v1_device([h], idx, with_draft=True)
+        self.assertEqual(fused.ops, {"exist": 1, "put": 1},
+                         "fused: one probe + one put carries all three")
+
+    def test_fusion_halves_the_get_op_count(self):
+        draft = self._mla_draft()
+        st = self._st()
+        st.mem_pool_device = FakeLayerFirstMlaDevicePool(
+            self.LAYER_NUM, size=self.PAGE_SIZE * 2, page_size=self.PAGE_SIZE,
+            kv_cache_dim=self.KV_DIM)
+        st.mem_pool_device_draft = draft
+        st._draft_sidecar_name = "draft_indexer"
+        st._sidecar_device_pools = {"draft_indexer": draft}
+        st._metrics = _FakeMetrics()
+        gets = []
+        st._batch_get_sg = lambda sks, p, c: (
+            gets.append(list(sks)) or ([1] * len(sks), [sum(x) for x in c]))
+        h = "abc123"
+        idx = list(range(self.PAGE_SIZE))
+        self.assertEqual(st.batch_get_v1_device([h], idx, with_draft=True), [True])
+        self.assertEqual(len(gets), 1, "fused read must be ONE SG GET")
+        self.assertEqual(gets[0], ["m/abc123_k@sg0", "m/abc123.draft_k@sg0",
+                                   "m/abc123_draft_indexer_k@sg0"])
 
 
 if __name__ == "__main__":
