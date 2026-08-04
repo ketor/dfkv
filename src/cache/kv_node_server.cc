@@ -33,8 +33,10 @@ inline double NowSec() {
 }  // namespace
 
 void KvNodeServer::InitTcpListenerConfig() {
-  auto bounded = [](const char* name, uint64_t fallback,
-                    uint64_t hard_max) -> uint64_t {
+  // allow_zero: knobs where 0 is a documented "feature off" setting (the
+  // first-frame deadline) keep 0 instead of falling back with a warning.
+  auto bounded = [](const char* name, uint64_t fallback, uint64_t hard_max,
+                    bool allow_zero = false) -> uint64_t {
     const char* value = std::getenv(name);
     if (value == nullptr || *value == '\0') return fallback;
     if (*value < '0' || *value > '9') {
@@ -45,7 +47,8 @@ void KvNodeServer::InitTcpListenerConfig() {
     errno = 0;
     char* end = nullptr;
     const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0' || parsed == 0) {
+    if (errno != 0 || end == value || *end != '\0' ||
+        (parsed == 0 && !allow_zero)) {
       DFKV_LOG_WARN(std::string("invalid ") + name + "='" + value +
                     "'; using " + std::to_string(fallback));
       return fallback;
@@ -63,10 +66,15 @@ void KvNodeServer::InitTcpListenerConfig() {
   tcp_io_timeout_seconds_ = static_cast<int>(
       bounded("DFKV_TCP_IO_TIMEOUT_S", kDefaultTcpIoTimeoutSeconds,
               kHardTcpIoTimeoutSeconds));
+  tcp_first_req_ms_ =
+      bounded("DFKV_TCP_FIRST_REQ_MS", kDefaultTcpFirstReqMs,
+              kHardTcpFirstReqMs, /*allow_zero=*/true);
   config_dump::RecordResolved("DFKV_TCP_MAX_CONNS",
                               std::to_string(tcp_max_connections_));
   config_dump::RecordResolved("DFKV_TCP_IO_TIMEOUT_S",
                               std::to_string(tcp_io_timeout_seconds_));
+  config_dump::RecordResolved("DFKV_TCP_FIRST_REQ_MS",
+                              std::to_string(tcp_first_req_ms_));
 }
 
 KvNodeServer::KvNodeServer(const std::string& cache_dir,
@@ -349,6 +357,10 @@ std::string KvNodeServer::MetricsText() const {
   metric("dfkv_tcp_io_timeout_seconds", "gauge",
          "Configured cache TCP per-socket receive/send timeout",
          tcp_io_timeout_seconds_);
+  metric("dfkv_tcp_first_req_ms", "gauge",
+         "Absolute deadline for the first complete request frame after accept "
+         "(0 = disabled; anti slow-drip bound, not per-syscall)",
+         tcp_first_req_ms_);
   metric("dfkv_tcp_rejected_connections_total", "counter",
          "Cache TCP connections rejected at the handler admission limit",
          rd(tcp_rejected_connections_));
@@ -575,6 +587,9 @@ void KvNodeServer::AcceptLoop() {
   while (running_) {
     int fd = ::accept(listen_fd_, nullptr, nullptr);
     if (fd < 0) { if (!running_) break; continue; }
+    // The first-frame deadline is anchored at ACCEPT time: queuing delay
+    // (handler-thread spawn) counts against the peer's budget, not ours.
+    const auto accepted_at = std::chrono::steady_clock::now();
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     timeval timeout{tcp_io_timeout_seconds_, 0};
@@ -592,9 +607,9 @@ void KvNodeServer::AcceptLoop() {
     open_connections_.fetch_add(1, std::memory_order_relaxed);
     conn_fds_.insert(fd);
     auto done = std::make_shared<std::atomic<bool>>(false);
-    conns_.push_back({std::thread([this, fd, done] {
+    conns_.push_back({std::thread([this, fd, done, accepted_at] {
                         NameThisThread("kv-serve");
-                        Handle(fd);
+                        Handle(fd, accepted_at);
                         open_connections_.fetch_sub(1, std::memory_order_relaxed);
                         { std::lock_guard<std::mutex> lk(conn_mu_); conn_fds_.erase(fd); }
                         ::close(fd);
@@ -693,25 +708,48 @@ Status KvNodeServer::ProcessRequestForKey(
         if (coalesce_enabled_ && length > 0) {
           // TCP convoy collapse: leader reads via group_.Range into a scratch
           // string sized by the store; followers copy the shared bytes.
-          const size_t cap = length;
-          out_data->resize(cap);
-          size_t n = 0;
-          st = read_coalescer_.Read(
-              key, offset, length,
-              out_data->empty() ? nullptr : &(*out_data)[0], cap, &n,
-              out_value_len,
-              [&](char* buf, size_t bcap, size_t* on, size_t* value_len) {
-                std::string tmp;
-                Status s =
-                    group_.Range(key, offset, length, &tmp, value_len);
-                if (s == Status::kOk) {
-                  size_t m = tmp.size() < bcap ? tmp.size() : bcap;
-                  std::memcpy(buf, tmp.data(), m);
-                  *on = m;
-                }
-                return s;
-              });
-          out_data->resize(st == Status::kOk ? n : 0);
+          //
+          // The client-declared length is UNTRUSTED: sizing the scratch
+          // straight from it lets one forged kRange frame drive an unbounded
+          // allocation (length_error/bad_alloc -> std::terminate, or OOM).
+          // Look up the authoritative stored length first -- an unknown key
+          // must fail here exactly like the plain path, before ANY sized
+          // allocation happens.
+          ValueMetadata metadata;
+          st = LookupForKey(key, &metadata);
+          if (st == Status::kOk) {
+            const uint64_t max_payload = max_request_payload_
+                                             ? max_request_payload_
+                                             : wire_limits::MaxRequestPayload();
+            const uint64_t avail = offset < metadata.value_len
+                                       ? metadata.value_len - offset
+                                       : 0;
+            // cap is an ALLOCATION bound only: the fill still issues
+            // group_.Range with the original (offset, length), so store-side
+            // Range semantics (offset >= value_len, data clamped to the
+            // remainder) are unchanged; a concurrent same-key rewrite stays
+            // the store-level race it already was.
+            const size_t cap =
+                static_cast<size_t>(std::min({length, avail, max_payload}));
+            out_data->resize(cap);
+            size_t n = 0;
+            st = read_coalescer_.Read(
+                key, offset, length,
+                out_data->empty() ? nullptr : &(*out_data)[0], cap, &n,
+                out_value_len,
+                [&](char* buf, size_t bcap, size_t* on, size_t* value_len) {
+                  std::string tmp;
+                  Status s =
+                      group_.Range(key, offset, length, &tmp, value_len);
+                  if (s == Status::kOk) {
+                    size_t m = tmp.size() < bcap ? tmp.size() : bcap;
+                    std::memcpy(buf, tmp.data(), m);
+                    *on = m;
+                  }
+                  return s;
+                });
+            out_data->resize(st == Status::kOk ? n : 0);
+          }
         } else {
           st = group_.Range(key, offset, length, out_data, out_value_len);
         }
@@ -916,8 +954,12 @@ Status KvNodeServer::RangeDirectForKey(
           const char* p = nullptr;
           Status s = group_.RangeDirect(key, offset, length, buf, cap, &p, n,
                                         stored_len);
+          // A DIO superset read returns p = buf + head with head in (0, 4095]:
+          // src points INSIDE dst, so this in-place compaction overlaps
+          // (forward) and must be a memmove -- memcpy on an overlap is UB and
+          // can hand shifted bytes to the leader AND every follower.
           if (s == Status::kOk && p && p != buf && *n > 0)
-            std::memcpy(buf, p, *n < cap ? *n : cap);
+            std::memmove(buf, p, *n < cap ? *n : cap);
           return s;
         });
     if (st == Status::kOk && out_data) *out_data = io_buf;
@@ -1045,20 +1087,60 @@ void KvNodeServer::FinishRamRead(
 }
 
 // Keep-alive: serve requests on this connection until the peer closes it.
-void KvNodeServer::Handle(int fd) {
+void KvNodeServer::Handle(int fd,
+                          std::chrono::steady_clock::time_point accepted_at) {
   // Bound the declared payload_len BEFORE the allocation below: without this
   // a forged 42-byte prefix is a 16 GiB allocation. Same bound as the RDMA
   // path (utils/wire_limits.h).
   const uint64_t max_payload = max_request_payload_
                                    ? max_request_payload_
                                    : wire_limits::MaxRequestPayload();
+  // Absolute deadline for the FIRST complete frame on the connection
+  // (DFKV_TCP_FIRST_REQ_MS). SO_RCVTIMEO is a per-syscall budget, so a drip
+  // feeder (1 byte/interval) otherwise pins a connection slot forever; until
+  // the first prefix+payload are fully in, each read's per-syscall budget is
+  // recomputed as min(base timeout, deadline remaining) and an already-spent
+  // budget closes the connection. 0 disables (legacy per-syscall behavior).
+  bool first_frame_pending = tcp_first_req_ms_ > 0;
+  const auto first_deadline =
+      accepted_at + std::chrono::milliseconds(tcp_first_req_ms_);
+  const timeval base_timeout{tcp_io_timeout_seconds_, 0};
   while (running_) {
     char prefix[kReqPrefix];
-    if (!net::ReadAll(fd, prefix, kReqPrefix)) return;  // peer closed / error
+    if (first_frame_pending) {
+      if (!net::ReadAllWithin(fd, prefix, kReqPrefix, base_timeout,
+                              first_deadline))
+        return;
+    } else if (!net::ReadAll(fd, prefix, kReqPrefix)) {
+      return;  // peer closed / error
+    }
     ReqFields rq;
     if (!DecodeReq(prefix, &rq, max_payload)) return;  // bad version / oversize => drop
+    // Same-source bound for a kRange's declared range length: a value can
+    // never exceed max_payload, so a longer range is always garbage or a
+    // hostile pre-allocation attempt. The RDMA frontend rejects this shape at
+    // its own decode/serve gates (rdma_server.cc); the TCP frontend drops the
+    // connection here so no request handler ever sees it.
+    if (rq.op == static_cast<uint8_t>(WireOp::kRange) &&
+        rq.length > max_payload)
+      return;
     std::vector<char> payload(rq.payload_len);
-    if (rq.payload_len && !net::ReadAll(fd, payload.data(), rq.payload_len)) return;
+    if (rq.payload_len) {
+      if (first_frame_pending) {
+        if (!net::ReadAllWithin(fd, payload.data(), rq.payload_len,
+                                base_timeout, first_deadline))
+          return;
+      } else if (!net::ReadAll(fd, payload.data(), rq.payload_len)) {
+        return;
+      }
+    }
+    if (first_frame_pending) {
+      // First frame complete: restore the plain base per-syscall budget the
+      // deadline reads shrank, so keep-alive reads behave exactly as before.
+      first_frame_pending = false;
+      ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &base_timeout,
+                   sizeof(base_timeout));
+    }
 
     std::string data;
     size_t value_len = 0;

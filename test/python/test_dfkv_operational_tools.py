@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import struct
+import subprocess
 import sys
 import unittest
 from tempfile import TemporaryDirectory
@@ -17,7 +18,7 @@ sys.path.insert(0, str(DEPLOY))
 
 from dfkv_load_regression import bench_once, histogram_delta, histogram_quantile, percentile  # noqa: E402
 from dfkv_membership_audit import decode_registration, info_fields, range_end  # noqa: E402
-from dfkv_node_replace import Replacer  # noqa: E402
+from dfkv_node_replace import Replacer, WorkflowError  # noqa: E402
 from dfkv_tenant_quota import load_quotas, main as quota_main  # noqa: E402
 from dfkv_ops_common import (  # noqa: E402
     members_epoch,
@@ -32,6 +33,11 @@ RING = """group=glm members=2 ring_points=300
 ID               ADDR                   WEIGHT   VNODES   SHARE  INFO
 n1               10.0.0.1:28001             1      100   33.3%  ver=2.0,engine=slab,disks=3,cap=9,ram=0,rdma=on
 n2               10.0.0.2:28001             2      200   66.7%  ver=2.0,engine=slab,disks=3,cap=9,ram=0,rdma=on
+"""
+
+RING_OLD = """group=glm members=1 ring_points=300
+ID               ADDR                   WEIGHT   VNODES   SHARE  INFO
+n1               10.0.0.1:28001             1      300  100.0%  ver=2.0,engine=slab,disks=3,cap=9,ram=0,rdma=on
 """
 
 CLIENTS = """group=glm clients=2 (only upgraded clients register)
@@ -175,6 +181,107 @@ class ReplacementWorkflowTest(unittest.TestCase):
         workflow.rollback(RuntimeError("cutover failed"))
         self.assertEqual(workflow.actions, [("old", "start")])
         self.assertEqual(workflow.required, [{"n1"}])
+
+    def test_start_timeout_marks_started_new_and_rollback_stops_replacement(self) -> None:
+        class Fixture(Replacer):
+            def __init__(self, args):
+                super().__init__(args)
+                self.actions = []
+
+            def ring(self):
+                return parse_ring(RING_OLD)
+
+            def clients(self):
+                return {"client-1"}
+
+            def remote(self, host, action):
+                self.actions.append((host, action))
+                if (host, action) == ("new", "start"):
+                    raise subprocess.TimeoutExpired(["ssh", "new"], 1.0)
+
+        workflow = Fixture(self.args(dry_run=False))
+        with self.assertRaises(subprocess.TimeoutExpired):
+            workflow.run()
+        # The local SSH timeout must not hide a remotely running replacement.
+        self.assertTrue(workflow.started_new)
+        self.assertFalse(workflow.old_stopped)
+        workflow.rollback(RuntimeError("start ssh timed out"))
+        self.assertEqual(workflow.actions, [("new", "start"), ("new", "stop")])
+        events = workflow.events
+        self.assertTrue(any(event["phase"] == "rollback" for event in events))
+        self.assertFalse(any("safe abort" in str(event["message"]) for event in events))
+
+    def test_successful_cutover_keeps_started_new_without_rollback(self) -> None:
+        class Fixture(Replacer):
+            def __init__(self, args):
+                super().__init__(args)
+                self.actions = []
+
+            def ring(self):
+                return parse_ring(RING_OLD)
+
+            def clients(self):
+                return {"client-1"}
+
+            def remote(self, host, action):
+                self.actions.append((host, action))
+
+            def wait_stable_ring(self, required, forbidden):
+                return parse_ring(RING)
+
+            def wait_for(self, description, predicate):
+                return True
+
+        workflow = Fixture(self.args(dry_run=False))
+        workflow.run()
+        self.assertEqual(workflow.actions, [("new", "start"), ("old", "stop")])
+        self.assertTrue(workflow.started_new)
+        self.assertTrue(workflow.old_stopped)
+        phases = [event["phase"] for event in workflow.events]
+        self.assertNotIn("rollback", phases)
+        self.assertNotIn("abort", phases)
+
+    def test_rollback_fails_loudly_when_replacement_stop_fails(self) -> None:
+        class Fixture(Replacer):
+            def remote(self, host, action):
+                raise subprocess.TimeoutExpired(["ssh", host], 1.0)
+
+        workflow = Fixture(self.args(dry_run=False))
+        workflow.started_new = True
+        with self.assertRaises(WorkflowError) as raised:
+            workflow.rollback(RuntimeError("start ssh timed out"))
+        message = str(raised.exception)
+        self.assertIn("CRITICAL", message)
+        self.assertIn("still be registered in the ring", message)
+        self.assertIn("stop dfkv on new manually", message)
+        self.assertFalse(any("safe abort" in str(event["message"]) for event in workflow.events))
+
+    def test_wait_for_retries_command_timeouts_until_predicate_succeeds(self) -> None:
+        transient = subprocess.TimeoutExpired(["dfkvctl", "ring"], 1.0)
+        with patch("dfkv_node_replace.run_command", side_effect=[transient, transient, RING]) as command:
+            workflow = Replacer(self.args())
+            view = workflow.wait_for("replacement ring", workflow.ring)
+        self.assertEqual([member.node_id for member in view.members], ["n1", "n2"])
+        self.assertEqual(command.call_count, 3)
+
+    def test_wait_for_deadline_still_fails_under_persistent_timeouts(self) -> None:
+        args = self.args()
+        args.timeout = 0.05
+        transient = subprocess.TimeoutExpired(["dfkvctl", "ring"], 1.0)
+        with patch("dfkv_node_replace.run_command", side_effect=transient) as command:
+            workflow = Replacer(args)
+            with self.assertRaises(WorkflowError) as raised:
+                workflow.wait_for("replacement ring", workflow.ring)
+        self.assertIn("timed out", str(raised.exception))
+        self.assertGreaterEqual(command.call_count, 2)
+
+    def test_wait_for_retries_os_errors_as_transient(self) -> None:
+        reset = OSError(104, "connection reset by peer")
+        with patch("dfkv_node_replace.run_command", side_effect=[reset, reset, RING]) as command:
+            workflow = Replacer(self.args())
+            view = workflow.wait_for("replacement ring", workflow.ring)
+        self.assertEqual([member.node_id for member in view.members], ["n1", "n2"])
+        self.assertEqual(command.call_count, 3)
 
 
 class MembershipDecodeTest(unittest.TestCase):
