@@ -442,6 +442,7 @@ void RdmaServer::Serve(int boot_fd) {
     ::close(boot_fd);
     return;
   }
+  ep.set_busy_poll(true);
   ibv_mr* recv_segment_mr =
       ep.RegisterRemoteRegion(recv_segment_.data(), recv_segment_.size());
   if (!recv_segment_mr) {
