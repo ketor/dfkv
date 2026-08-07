@@ -289,10 +289,14 @@ void RdmaServer::AcceptLoop() {
 
 namespace {
 size_t ServerDepth() {
-  // Pipeline depth (requests in flight per connection). Default 1 keeps per-conn
-  // pinned memory low; set DFKV_RDMA_DEPTH>1 to enable pipelining (helps the
-  // latency-bound PUT path; GET scales via more conns).
-  size_t out = 1;
+  // Pipeline depth (requests in flight per connection). Default 4 matches the
+  // typical client depth (DFKV_RDMA_DEPTH=4 in production deployments). A server
+  // depth lower than the client causes the batching window to clamp, which
+  // silently degrades throughput 3-4x on pipelined GETs and causes PUT batch
+  // failures during burst writes (observed 532 "Write page to storage: 128
+  // pages failed" on GLM-5.2-NVFP4 with depth=1 server vs depth=4 client,
+  // resulting in hot-round L3 prefetch failures and -29.8% throughput vs cold).
+  size_t out = 4;
   const char* e = std::getenv("DFKV_RDMA_DEPTH");
   if (e && *e) { long v = std::strtol(e, nullptr, 10); if (v >= 1 && v <= 256) out = (size_t)v; }
   config_dump::RecordResolved("DFKV_RDMA_DEPTH", std::to_string(out));

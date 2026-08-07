@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
       "  --put-inflight-limit <n>  cap concurrent disk PUTs; excess fast-fail kCacheFull (0 = off)\n"
       "  --tcp-max-conns <n> cap cache TCP handlers (default 512, hard max 4096)\n"
       "  --tcp-io-timeout-s <n>  per-socket TCP read/write timeout seconds (default 60, hard max 3600)\n"
-      "  --rdma-depth <n>     RDMA write pipeline depth (must be <= client's; env DFKV_RDMA_DEPTH)\n"
+      "  --rdma-depth <n>     RDMA write pipeline depth (default 4; must be >= client's; env DFKV_RDMA_DEPTH)\n"
       "  --rdma-numa <0|1>    NUMA-local rail selection per connection (env DFKV_RDMA_NUMA)\n"
       "  --rdma-idle-ms <n>   idle connection reaper interval ms (env DFKV_RDMA_IDLE_MS)\n"
       "  --rdma-op-timeout-ms <n>  per-op RDMA timeout ms (env DFKV_RDMA_OP_TIMEOUT_MS)\n"
