@@ -87,7 +87,7 @@ class RdmaTransport : public Transport {
 
   bool pipelined() const override { return true; }
   size_t MaxSgPayloadSegs() const override { return sg_payload_segs_; }
-  // Pipelined: up to `depth_` requests in flight on a single connection.
+  // Pipelined: up to `depth_` requests in flight on a single connection (default 4; env DFKV_RDMA_DEPTH).
   std::vector<Status> CacheMany(const std::string& node,
                                 const std::vector<CacheItem>& items) override;
   std::vector<Status> CacheFrom(const std::string& node,
