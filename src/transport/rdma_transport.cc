@@ -226,7 +226,7 @@ bool RdmaTransport::Available() {
 RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
     : max_payload_(ResolveMaxPayload(max_msg)),
       declared_(std::min<uint64_t>(
-          EnvBytes("DFKV_RDMA_MAX_BLOCK_BYTES", ResolveMaxPayload(max_msg)),
+          EnvBytes("DFKV_RDMA_MAX_BLOCK_BYTES", 8ull << 20),
           ResolveMaxPayload(max_msg))),
       depth_(4) {
   std::string list = dev_name;
