@@ -152,7 +152,7 @@ class RdmaTransport : public Transport {
   // queue_depth * aligned_slot_size from one fixed pinned segment. Inflating
   // this value reduces connection capacity; understating it deterministically
   // rejects larger operations. It must therefore be exact and nonzero.
-  // Default 8 MiB (env DFKV_RDMA_MAX_BLOCK_BYTES); capped by max_payload_.
+  // Default 4 MiB (env DFKV_RDMA_MAX_BLOCK_BYTES); capped by max_payload_.
   uint64_t declared_ = 0;
   size_t OpBound() const {  // per-op payload bound honoring the declaration
     return declared_ ? static_cast<size_t>(declared_) : max_payload_;
