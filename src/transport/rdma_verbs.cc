@@ -69,6 +69,7 @@ std::atomic<uint64_t> g_pool_mr_reg_failures{0};
 std::atomic<uint64_t> g_pool_mr_active{0};
 std::atomic<uint64_t> g_transient_user_mr_active{0};
 std::atomic<uint64_t> g_lease_write_mr_active{0};
+std::atomic<uint64_t> g_lease_read_mr_active{0};
 std::atomic<uint64_t> g_cq_completions{0};
 std::atomic<uint64_t> g_cq_errors{0};
 
@@ -370,6 +371,10 @@ void RcEndpoint::Close() {
   g_lease_write_mr_active.fetch_sub(lease_write_mr_.size(),
                                    std::memory_order_relaxed);
   lease_write_mr_.clear();
+  for (auto* mr : lease_read_mr_) DeregisterMr(mr);
+  g_lease_read_mr_active.fetch_sub(lease_read_mr_.size(),
+                                  std::memory_order_relaxed);
+  lease_read_mr_.clear();
   for (auto* m : smr_) DeregisterMr(m);
   for (auto* m : rmr_) DeregisterMr(m);
   for (auto* m : dmr_) DeregisterMr(m);
@@ -786,6 +791,29 @@ void RcEndpoint::ReleaseLeaseWriteRegion(ibv_mr* mr) {
 
 uint64_t RcEndpoint::LeaseWriteMrActive() {
   return g_lease_write_mr_active.load(std::memory_order_relaxed);
+}
+
+ibv_mr* RcEndpoint::RegisterLeaseReadRegion(void* base, size_t size) {
+  if (!pd_ || !base || size == 0) return nullptr;
+  ibv_mr* mr = ibv_reg_mr(
+      pd_, base, size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+  if (!mr) return nullptr;
+  lease_read_mr_.push_back(mr);
+  g_lease_read_mr_active.fetch_add(1, std::memory_order_relaxed);
+  return mr;
+}
+
+void RcEndpoint::ReleaseLeaseReadRegion(ibv_mr* mr) {
+  if (!mr) return;
+  const auto it = std::find(lease_read_mr_.begin(), lease_read_mr_.end(), mr);
+  if (it == lease_read_mr_.end()) std::abort();
+  DeregisterMr(mr);
+  lease_read_mr_.erase(it);
+  g_lease_read_mr_active.fetch_sub(1, std::memory_order_relaxed);
+}
+
+uint64_t RcEndpoint::LeaseReadMrActive() {
+  return g_lease_read_mr_active.load(std::memory_order_relaxed);
 }
 
 ibv_mr* RcEndpoint::RegisterRemoteReadRegion(void* base, size_t size) {

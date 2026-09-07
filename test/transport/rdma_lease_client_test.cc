@@ -45,7 +45,7 @@ long Counter(const std::string& text, const std::string& name) {
 }
 
 // Only the bootstrap TCP channel is proxied. Payloads still use the actual
-// negotiated RC QPs. Suppressing the optional probe bit reproduces a v2.25
+// negotiated RC QPs. Suppressing both optional probe bits reproduces a v2.25
 // peer, including its ordinary receive geometry, not a disabled client path.
 class CapabilityProxy {
  public:
@@ -83,6 +83,7 @@ class CapabilityProxy {
   std::atomic<bool> advertise_lease{false};
   std::atomic<unsigned> ordinary_bootstraps{0};
   std::atomic<unsigned> leased_bootstraps{0};
+  std::atomic<unsigned> dynamic_bootstraps{0};
   std::atomic<unsigned> legacy_probes{0};
 
  private:
@@ -97,7 +98,8 @@ class CapabilityProxy {
         if (net::ReadAll(server, reply, sizeof(reply))) {
           if (!advertise_lease.load()) {
             reply[5] = static_cast<char>(
-                static_cast<uint8_t>(reply[5]) & ~rdma::kV2ProbeCapLeasedPut);
+                static_cast<uint8_t>(reply[5]) &
+                ~(rdma::kV2ProbeCapLeasedPut | rdma::kV2ProbeCapDynamicPull));
             ++legacy_probes;
           }
           net::WriteAll(client, reply, sizeof(reply));
@@ -105,14 +107,19 @@ class CapabilityProxy {
       } else {
         if (rdma::DevFrameRequestsLeasedPut(frame)) ++leased_bootstraps;
         else ++ordinary_bootstraps;
+        const bool dynamic = rdma::DevFrameRequestsDynamicPull(frame);
+        if (dynamic) ++dynamic_bootstraps;
+        const size_t readiness_bytes = dynamic
+                                           ? rdma::kV2RetirementReadinessBytes
+                                           : rdma::kV2PullReadinessBytes;
         char qp[rdma::kQpInfoBytes];
         char readiness[rdma::kV2PullReadinessBytes];
         if (net::ReadAll(client, qp, sizeof(qp)) &&
             net::WriteAll(server, qp, sizeof(qp)) &&
             net::ReadAll(server, qp, sizeof(qp)) &&
             net::WriteAll(client, qp, sizeof(qp)) &&
-            net::ReadAll(server, readiness, sizeof(readiness))) {
-          net::WriteAll(client, readiness, sizeof(readiness));
+            net::ReadAll(server, readiness, readiness_bytes)) {
+          net::WriteAll(client, readiness, readiness_bytes);
         }
       }
     }
@@ -184,6 +191,7 @@ class RdmaLeaseClient : public testing::Test {
   ScopedEnv local_fault_{"DFKV_RDMA_TEST_COMPLETION_FAULT", nullptr};
   ScopedEnv remote_fault_{"DFKV_RDMA_TEST_ENDPOINT_COMPLETION_FAULT", nullptr};
   ScopedEnv read_fault_{"DFKV_RDMA_TEST_PULL_READ_FAILURE", nullptr};
+  ScopedEnv dynamic_{"DFKV_RDMA_DYNAMIC_PULL", nullptr};
   ScopedEnv ceiling_{"DFKV_RDMA_MAX_BLOCK_BYTES", "1048576"};
   ScopedEnv threshold_{"DFKV_RDMA_INLINE_PUT_MAX_BYTES", "131072"};
   ScopedEnv minimum_{"DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES", "65536"};
@@ -424,8 +432,7 @@ TEST_F(RdmaLeaseClient, PullCapacityRejectionPreservesConnectionAndGeneration) {
       return transport.RangeInto(
           addr_, {key}, {{out->data(), out->size()}}, nullptr)[0];
     };
-    // Seed a previous generation, then reject two successive PREPARE results.
-    // Each rejection must carry forward its own retirement generation.
+    // Success and each capacity rejection must retire their own generation.
     std::string out(value.size(), '?');
     ASSERT_EQ(get(&out), Status::kOk);
     EXPECT_EQ(out, value);
@@ -443,6 +450,8 @@ TEST_F(RdmaLeaseClient, PullCapacityRejectionPreservesConnectionAndGeneration) {
                       "dfkv_rdma_client_remote_rail_failures_total"), 0);
     EXPECT_EQ(Counter(transport.MetricsText(),
                       "dfkv_rdma_client_pull_failures_total"), 0);
+    EXPECT_EQ(Counter(transport.MetricsText(),
+                      "dfkv_rdma_client_pull_releases_total"), 4);
 
     // In contrast, an actual READ failure still retires the endpoint and
     // attributes remote failure; capacity rejection must not hide that case.
@@ -453,6 +462,202 @@ TEST_F(RdmaLeaseClient, PullCapacityRejectionPreservesConnectionAndGeneration) {
     EXPECT_EQ(Counter(transport.MetricsText(),
                       "dfkv_rdma_client_pull_failures_total"), 1);
   }
+}
+
+TEST_F(RdmaLeaseClient, DynamicPullReleasesLargeScalarAndScatterReadsBeforeIdle) {
+  std::string value(kLarge, '\0');
+  for (size_t i = 0; i < value.size(); ++i)
+    value[i] = static_cast<char>(i % 251);
+  const BlockKey key{12, 1};
+  std::string ignored;
+  size_t stored_len = 0;
+  ASSERT_EQ(store_->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored, &stored_len), Status::kOk);
+  RdmaTransport transport(kMaxMsg);
+  const long baseline_bytes = Counter(
+      transport.MetricsText(),
+      "dfkv_rdma_client_registered_slot_bytes_budget{kind=\"used\"}");
+  const auto expect_idle = [&] {
+    EXPECT_EQ(Counter(server_->MetricsText(),
+                      "dfkv_rdma_recv_segment_used_bytes"),
+              static_cast<long>(rdma::V2SlotSize(65536)));
+    EXPECT_EQ(Counter(transport.MetricsText(),
+                      "dfkv_rdma_client_conns_opened_total"), 1);
+    EXPECT_EQ(Counter(
+                  transport.MetricsText(),
+                  "dfkv_rdma_client_registered_slot_bytes_budget{kind=\"used\"}"),
+              baseline_bytes + static_cast<long>(rdma::V2SlotSize(65536)));
+  };
+  for (int round = 0; round < 3; ++round) {
+    std::string out(value.size() + 17, '?');
+    std::vector<uint64_t> value_lens;
+    ASSERT_EQ(transport.RangeInto(
+                  addr_, {key}, {{out.data(), out.size()}}, &value_lens),
+              std::vector<Status>{Status::kOk});
+    EXPECT_EQ(out.substr(0, value.size()), value);
+    EXPECT_EQ(out.substr(value.size()), std::string(17, '?'));
+    EXPECT_EQ(value_lens, std::vector<uint64_t>{value.size()});
+    expect_idle();
+    out.assign(out.size(), '?');
+    const size_t split = value.size() / 3 + 7;
+    std::vector<size_t> lengths;
+    ASSERT_EQ(transport.RangeIntoMulti(
+                  addr_, {key},
+                  {{{{out.data(), split}, {nullptr, 0},
+                     {out.data() + split, out.size() - split}}}},
+                  &lengths), std::vector<Status>{Status::kOk});
+    EXPECT_EQ(out.substr(0, value.size()), value);
+    EXPECT_EQ(out.substr(value.size()), std::string(17, '?'));
+    EXPECT_EQ(lengths, std::vector<size_t>{value.size()});
+    expect_idle();
+  }
+  EXPECT_EQ(Counter(transport.MetricsText(),
+                    "dfkv_rdma_client_pull_releases_total"), 6);
+  EXPECT_EQ(Counter(transport.MetricsText(),
+                    "dfkv_rdma_client_pull_read_bytes_total"), 6 * kLarge);
+  std::string small(value.size() - 1, '?');
+  std::vector<uint64_t> rejected_lengths;
+  EXPECT_EQ(transport.RangeInto(
+                addr_, {key}, {{small.data(), small.size()}}, &rejected_lengths),
+            std::vector<Status>{Status::kInvalid});
+  EXPECT_EQ(rejected_lengths, std::vector<uint64_t>{value.size()});
+  EXPECT_EQ(small, std::string(small.size(), '?'));
+  expect_idle();
+  std::vector<size_t> rejected_sg_lengths;
+  EXPECT_EQ(transport.RangeIntoMulti(
+                addr_, {key}, {{{{small.data(), small.size()}}}},
+                &rejected_sg_lengths), std::vector<Status>{Status::kInvalid});
+  EXPECT_EQ(rejected_sg_lengths, std::vector<size_t>{0});
+  EXPECT_EQ(small, std::string(small.size(), '?'));
+  expect_idle();
+  std::string out(value.size(), '?');
+  EXPECT_EQ(transport.RangeInto(
+                addr_, {{12, 2}}, {{out.data(), out.size()}}, nullptr),
+            std::vector<Status>{Status::kNotFound});
+  EXPECT_EQ(out, std::string(value.size(), '?'));
+  EXPECT_EQ(transport.RangeIntoMulti(
+                addr_, {{12, 2}}, {{{{out.data(), out.size()}}}}, nullptr),
+            std::vector<Status>{Status::kNotFound});
+  EXPECT_EQ(transport.RangeInto(addr_, {key}, {{nullptr, 0}}, nullptr),
+            std::vector<Status>{Status::kInvalid});
+  EXPECT_EQ(transport.RangeIntoMulti(addr_, {key}, {{}}, nullptr),
+            std::vector<Status>{Status::kInvalid});
+  expect_idle();
+  EXPECT_EQ(Counter(transport.MetricsText(),
+                    "dfkv_rdma_client_pull_releases_total"), 8);
+  EXPECT_EQ(Counter(transport.MetricsText(),
+                    "dfkv_rdma_client_pull_failures_total"), 0);
+}
+
+TEST_F(RdmaLeaseClient, LegacyGetReusesAndRefreshesBothOptionalCapabilities) {
+  const BlockKey key{13, 1};
+  const std::string value(kLarge, 'g');
+  std::string ignored;
+  size_t stored_len = 0;
+  ASSERT_EQ(store_->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored, &stored_len), Status::kOk);
+  CapabilityProxy proxy(addr_);
+  ASSERT_FALSE(proxy.addr.empty());
+  RdmaTransport transport(kMaxMsg);
+  PeerTopology topology;
+  topology.peer_addr = proxy.addr;
+  topology.peer_id = "get-peer";
+  topology.generation = 1;
+  transport.OnPeerTopology(topology);
+  const auto get = [&] {
+    std::string out(value.size(), '?');
+    EXPECT_EQ(transport.RangeInto(
+                  proxy.addr, {key}, {{out.data(), out.size()}}, nullptr),
+              std::vector<Status>{Status::kOk});
+    EXPECT_EQ(out, value);
+    out.assign(out.size(), '?');
+    EXPECT_EQ(transport.RangeIntoMulti(
+                  proxy.addr, {key}, {{{{out.data(), out.size()}}}}, nullptr),
+              std::vector<Status>{Status::kOk});
+    EXPECT_EQ(out, value);
+  };
+  get();
+  const long probes = Counter(transport.MetricsText(),
+                             "dfkv_rdma_client_v2_probe_attempts_total");
+  get();
+  EXPECT_EQ(proxy.ordinary_bootstraps.load(), 1u);
+  EXPECT_EQ(proxy.dynamic_bootstraps.load(), 0u);
+  EXPECT_EQ(Counter(transport.MetricsText(),
+                    "dfkv_rdma_client_v2_probe_attempts_total"), probes);
+  EXPECT_EQ(Counter(server_->MetricsText(),
+                    "dfkv_rdma_recv_segment_used_bytes"),
+            static_cast<long>(2 * rdma::V2SlotSize(kLarge)));
+  proxy.advertise_lease.store(true);
+  ++topology.generation;
+  transport.OnPeerTopology(topology);
+  get();
+  EXPECT_EQ(proxy.dynamic_bootstraps.load(), 1u);
+  proxy.advertise_lease.store(false);
+  ++topology.generation;
+  transport.OnPeerTopology(topology);
+  get();
+  get();
+  EXPECT_EQ(proxy.ordinary_bootstraps.load(), 3u);
+  EXPECT_EQ(proxy.dynamic_bootstraps.load(), 1u);
+  // Peer identity changes invalidate optional bits even at the same generation.
+  proxy.advertise_lease.store(true);
+  topology.peer_id = "replacement-get-peer";
+  transport.OnPeerTopology(topology);
+  get();
+  EXPECT_EQ(proxy.ordinary_bootstraps.load(), 4u);
+  EXPECT_EQ(proxy.dynamic_bootstraps.load(), 2u);
+  EXPECT_EQ(Counter(transport.MetricsText(),
+                    "dfkv_rdma_client_pull_releases_total"), 4);
+}
+
+TEST_F(RdmaLeaseClient, DynamicPullEscapeHatchRetainsLegacyGeometry) {
+  ScopedEnv disabled("DFKV_RDMA_DYNAMIC_PULL", "0");
+  CapabilityProxy proxy(addr_);
+  ASSERT_FALSE(proxy.addr.empty());
+  proxy.advertise_lease.store(true);
+  const BlockKey key{14, 1};
+  const std::string value(kLarge, 'e');
+  std::string ignored;
+  size_t stored_len = 0;
+  ASSERT_EQ(store_->ProcessRequestForKey(
+                static_cast<uint8_t>(WireOp::kCache), key, 0, 0,
+                value.data(), value.size(), &ignored, &stored_len), Status::kOk);
+  RdmaTransport transport(kMaxMsg);
+  for (int round = 0; round < 2; ++round) {
+    std::string out(value.size(), '?');
+    ASSERT_EQ(transport.RangeInto(
+                  proxy.addr, {key}, {{out.data(), out.size()}}, nullptr),
+              std::vector<Status>{Status::kOk});
+    EXPECT_EQ(out, value);
+  }
+  EXPECT_EQ(proxy.dynamic_bootstraps.load(), 0u);
+  EXPECT_EQ(proxy.ordinary_bootstraps.load(), 1u);
+  EXPECT_EQ(Counter(server_->MetricsText(),
+                    "dfkv_rdma_recv_segment_used_bytes"),
+            static_cast<long>(2 * rdma::V2SlotSize(kLarge)));
+}
+
+TEST_F(RdmaLeaseClient, StringRangesPreservePartialOffsetsAndStoredLength) {
+  const BlockKey key{15, 1};
+  const std::string value = "0123456789abcdefghij";
+  RdmaTransport transport(kMaxMsg);
+  ASSERT_EQ(transport.Cache(addr_, key, value.data(), value.size()), Status::kOk);
+  std::string out;
+  uint64_t length = 0;
+  ASSERT_EQ(transport.Range(addr_, key, 7, 6, &out, &length), Status::kOk);
+  EXPECT_EQ(out, value.substr(7, 6));
+  EXPECT_EQ(length, value.size());
+  std::vector<std::string> outputs;
+  std::vector<uint64_t> lengths;
+  EXPECT_EQ(transport.RangeMany(addr_, {key, {15, 2}}, 17, 8, &outputs, &lengths),
+            (std::vector<Status>{Status::kOk, Status::kNotFound}));
+  ASSERT_EQ(outputs.size(), 2u);
+  EXPECT_EQ(outputs[0], value.substr(17));
+  EXPECT_TRUE(outputs[1].empty());
+  ASSERT_EQ(lengths.size(), 2u);
+  EXPECT_EQ(lengths[0], value.size());
 }
 
 }  // namespace

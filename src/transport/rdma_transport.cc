@@ -398,6 +398,7 @@ struct RdmaTransport::Conn {
   // Negotiated staged-lease PUT datapath (probe bit + bootstrap request bit).
   // Off for pooled conns predating the opt-in and for peers without support.
   bool leased_put = false;
+  bool dynamic_pull = false;
   bool active_counted = false;
   bool live_counted = false;
   bool visited = true;  // guarded by RdmaTransport::mu_ while idle
@@ -469,6 +470,10 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
       inline_resolved_state == 0
           ? std::string("0")
           : std::to_string(inline_put_max_bytes_));
+  if (const char* value = std::getenv("DFKV_RDMA_DYNAMIC_PULL"))
+    dynamic_pull_enabled_ = std::strcmp(value, "0") != 0;
+  config_dump::RecordResolved("DFKV_RDMA_DYNAMIC_PULL",
+                              dynamic_pull_enabled_ ? "1" : "0");
   std::string list = dev_name;
   if (list.empty()) {
     const char* configured = std::getenv("DFKV_RDMA_DEV");
@@ -973,8 +978,8 @@ void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
              ? RemoteRailOutcome::kEndpointFailure
              : RemoteRailOutcome::kAbandon);
 
-  // Direct GET failure paths have already obtained responder-retirement proof.
-  // Deletion releases terminal verbs resources; it is not a DMA fence.
+  // RcEndpoint destroys its QP before deregistering MRs. In particular this
+  // fences an outstanding initiator READ before caller memory can be reused.
   delete c;
   if (credit_held) {
     const uint64_t now = rdma::RailPolicy::NowMicros();
@@ -1082,7 +1087,7 @@ void RdmaTransport::OnPeerTopology(const PeerTopology& topology) {
     // linearization point and become active with the retired incarnation.
     std::lock_guard<std::mutex> lock(mu_);
     if (!peer_topologies_->Update(topology)) return;
-    peer_put_capabilities_.erase(topology.peer_addr);
+    peer_capabilities_.erase(topology.peer_addr);
     const auto current_snapshot =
         peer_topologies_->Snapshot(topology.peer_addr);
     const auto reap = [&](auto& pools) {
@@ -1137,9 +1142,11 @@ void RdmaTransport::NoteNegotiatedDepth(const std::string& node, Lane lane,
 }
 
 bool RdmaTransport::ProbeV2(const std::string& node,
-                             bool* leased_put_supported) const {
+                             bool* leased_put_supported,
+                             bool* dynamic_pull_supported) const {
   v2_probe_attempts_.fetch_add(1, std::memory_order_relaxed);
   if (leased_put_supported) *leased_put_supported = false;
+  if (dynamic_pull_supported) *dynamic_pull_supported = false;
   int fd = net::Dial(node, connect_ms_, io_ms_);
   if (fd < 0) {
     v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -1160,6 +1167,8 @@ bool RdmaTransport::ProbeV2(const std::string& node,
     v2_probe_failures_.fetch_add(1, std::memory_order_relaxed);
   else if (leased_put_supported)
     *leased_put_supported = leased;
+  if (dynamic_pull_supported)
+    *dynamic_pull_supported = ok && rdma::V2ProbeSupportsDynamicPull(reply);
   return ok;
 }
 
@@ -1254,20 +1263,22 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       ConnectionDepth(node, lane, options.requested_credits);
   bool probed = false;
   bool leased_put_supported = false;
-  if (options.request_leased_put) {
+  bool dynamic_pull_supported = false;
+  if (options.request_leased_put || dynamic_pull_enabled_) {
     bool known = false;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      const auto found = peer_put_capabilities_.find(node);
-      if (found != peer_put_capabilities_.end() &&
+      const auto found = peer_capabilities_.find(node);
+      if (found != peer_capabilities_.end() &&
           found->second.peer_id == peer_snapshot->peer_id &&
           found->second.publication == peer_snapshot->publication) {
         known = true;
         leased_put_supported = found->second.leased_put;
+        dynamic_pull_supported = found->second.dynamic_pull;
       }
     }
     if (!known) {
-      if (!ProbeV2(node, &leased_put_supported)) {
+      if (!ProbeV2(node, &leased_put_supported, &dynamic_pull_supported)) {
         complete_unowned_lease(rdma::RailCompletion::kEndpointFailure);
         result.failure = AcquireFailure::kEndpoint;
         return result;
@@ -1276,21 +1287,25 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
       std::lock_guard<std::mutex> lock(mu_);
       if (peer_topologies_->IsCurrent(
               node, peer_snapshot->peer_id, peer_snapshot->publication)) {
-        peer_put_capabilities_[node] = {
+        peer_capabilities_[node] = {
             peer_snapshot->peer_id, peer_snapshot->publication,
-            leased_put_supported};
+            leased_put_supported, dynamic_pull_supported};
       }
     }
   }
   const bool want_leased_put =
       options.request_leased_put && leased_put_supported;
+  const bool want_dynamic_pull =
+      dynamic_pull_enabled_ && dynamic_pull_supported;
   if (options.request_leased_put && !want_leased_put)
     leaseput_path_fallbacks_.fetch_add(1, std::memory_order_relaxed);
   const size_t required_bound =
       lane == Lane::kControl
           ? static_cast<size_t>(rdma::kV2ControlCap)
-          : ConnectionBound(want_leased_put ? options.leased_inline_bytes
-                                           : options.required_data_bytes);
+          : ConnectionBound(options.request_dynamic_pull && want_dynamic_pull
+                                ? 0
+                                : want_leased_put ? options.leased_inline_bytes
+                                                  : options.required_data_bytes);
 
   std::vector<std::pair<void*, size_t>> pools;
   std::vector<Conn*> stale;
@@ -1332,6 +1347,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
               candidate->declared_bytes >= required_bound &&
               candidate->depth >= required_depth &&
               (!want_leased_put || candidate->leased_put) &&
+              candidate->dynamic_pull == want_dynamic_pull &&
               (candidate->declared_bytes < best_bound ||
                (candidate->declared_bytes == best_bound &&
                 candidate->depth < best_depth))) {
@@ -1390,8 +1406,10 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   const uint64_t conn_slot_bytes = static_cast<uint64_t>(rdma::V2SlotSize(
       static_cast<size_t>(
           std::max<uint64_t>(conn_declared, rdma::kV2DataOffset))));
+  const uint64_t resident_bytes =
+      (want_dynamic_pull ? 1 : 2) * conn_slot_bytes;
   const rdma::ResourceRequest budget_request{
-      1, 1, conn_depth, 2 * conn_slot_bytes * conn_depth};
+      1, 1, conn_depth, resident_bytes * conn_depth};
   bool budget_acquired = resource_budget_->TryAcquire(budget_request);
   if (!budget_acquired && EvictOneIdle())
     budget_acquired = resource_budget_->TryAcquire(budget_request);
@@ -1425,7 +1443,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
 
   const std::string& dev = devs_[ridx];
-  if (!probed && !ProbeV2(node, &leased_put_supported)) {
+  if (!probed &&
+      !ProbeV2(node, &leased_put_supported, &dynamic_pull_supported)) {
     DFKV_LOG_ERROR(
         "rdma: peer " + node +
         " does not advertise required v2 writer-retirement and pull-read capabilities");
@@ -1438,9 +1457,9 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     std::lock_guard<std::mutex> lock(mu_);
     if (peer_topologies_->IsCurrent(
             node, peer_snapshot->peer_id, peer_snapshot->publication)) {
-      peer_put_capabilities_[node] = {
+      peer_capabilities_[node] = {
           peer_snapshot->peer_id, peer_snapshot->publication,
-          leased_put_supported};
+          leased_put_supported, dynamic_pull_supported};
     }
   }
 
@@ -1489,7 +1508,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   // sends the token only to a client that will consume it.
   // Geometry was chosen from this publication's capability observation.
   // If the peer changed without a publication, fail before posting payload.
-  if (want_leased_put && !leased_put_supported) {
+  if ((want_leased_put && !leased_put_supported) ||
+      (want_dynamic_pull && !dynamic_pull_supported)) {
     ::close(fd);
     Destroy(conn, rdma::RailCompletion::kEndpointFailure);
     result.failure = AcquireFailure::kEndpoint;
@@ -1498,7 +1518,8 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   const uint64_t bootstrap_declared =
       conn_declared | rdma::kDevFrameRequestWriterRetirement |
       rdma::kDevFrameRequestPullRead |
-      (want_leased_put ? rdma::kDevFrameRequestLeasedPut : 0);
+      (want_leased_put ? rdma::kDevFrameRequestLeasedPut : 0) |
+      (want_dynamic_pull ? rdma::kDevFrameRequestDynamicPull : 0);
   rdma::EncodeDevFrame(auto_device_ ? std::string() : dev,
                        bootstrap_declared, devbuf, rdma::kDevProtoV2);
   char mine[rdma::kQpInfoBytes], remote_qp_bytes[rdma::kQpInfoBytes];
@@ -1549,21 +1570,27 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     const size_t surplus = conn_depth - remote.depth;
     conn->budget_request = rdma::ResourceRequest{
         1, 1, static_cast<size_t>(remote.depth),
-        2 * conn_slot_bytes * remote.depth};
+        resident_bytes * remote.depth};
     resource_budget_->Release(
         rdma::ResourceRequest{0, 0, surplus,
-                              2 * conn_slot_bytes * surplus});
+                              resident_bytes * surplus});
     depth_refunds_.fetch_add(1, std::memory_order_relaxed);
   }
 
   char readiness[rdma::kV2PullReadinessBytes];
-  if (!net::ReadAll(fd, readiness, sizeof(readiness)) ||
-      !rdma::DecodeV2PullReadiness(
-          readiness, sizeof(readiness), &conn->recv_segment,
-          &conn->writer_token, &conn->pull_arena)) {
+  const size_t readiness_bytes = want_dynamic_pull
+                                     ? rdma::kV2RetirementReadinessBytes
+                                     : rdma::kV2PullReadinessBytes;
+  if (!net::ReadAll(fd, readiness, readiness_bytes) ||
+      !(want_dynamic_pull
+            ? rdma::DecodeV2Readiness(readiness, readiness_bytes, true,
+                                      &conn->recv_segment, &conn->writer_token)
+            : rdma::DecodeV2PullReadiness(
+                  readiness, readiness_bytes, &conn->recv_segment,
+                  &conn->writer_token, &conn->pull_arena))) {
     DFKV_LOG_ERROR(
         "rdma: peer " + node +
-        " did not provide valid retirement and pull-read arenas");
+        " did not provide valid negotiated v2 readiness");
     ::close(fd);
     Destroy(conn, rdma::RailCompletion::kEndpointFailure);
     result.failure = AcquireFailure::kEndpoint;
@@ -1599,6 +1626,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
     return result;
   }
   conn->leased_put = want_leased_put;
+  conn->dynamic_pull = want_dynamic_pull;
   conns_opened_.fetch_add(1, std::memory_order_relaxed);
   MarkClassOpened(conn);
   rail_conns_[ridx].fetch_add(1, std::memory_order_relaxed);
@@ -2211,6 +2239,14 @@ std::string RdmaTransport::MetricsText() const {
   s += "# TYPE dfkv_rdma_client_pull_failures_total counter\n";
   s += "dfkv_rdma_client_pull_failures_total " +
        std::to_string(pull_failures_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_pull_releases_total Acknowledged dynamic pull releases\n";
+  s += "# TYPE dfkv_rdma_client_pull_releases_total counter\n";
+  s += "dfkv_rdma_client_pull_releases_total " +
+       std::to_string(pull_releases_.load(std::memory_order_relaxed)) + "\n";
+  s += "# HELP dfkv_rdma_client_pull_release_failures_total Failed dynamic pull release exchanges\n";
+  s += "# TYPE dfkv_rdma_client_pull_release_failures_total counter\n";
+  s += "dfkv_rdma_client_pull_release_failures_total " +
+       std::to_string(pull_release_failures_.load(std::memory_order_relaxed)) + "\n";
   s += "# HELP dfkv_rdma_client_ambiguous_get_quarantines_total Failed staged GETs retained because responder retirement proof was unavailable\n";
   s += "# TYPE dfkv_rdma_client_ambiguous_get_quarantines_total counter\n";
   s += "dfkv_rdma_client_ambiguous_get_quarantines_total " +
@@ -2558,6 +2594,8 @@ Status RdmaTransport::Range(const std::string& node, const BlockKey& key,
   if (length > std::numeric_limits<size_t>::max() ||
       NoteBlock(static_cast<size_t>(length)))
     return Status::kInvalid;
+  // String ranges retain the staged responder-WRITE path: offset/length are
+  // slice semantics, unlike the whole-object direct destination APIs.
   return RoundTrip(node, WireOp::kRange, key, offset, length, nullptr, 0, out,
                    value_len);
 }
@@ -3204,6 +3242,147 @@ std::vector<Status> RdmaTransport::ExistMany(
   return result;
 }
 
+Status RdmaTransport::PullInto(
+    const std::string& node, const BlockKey& key,
+    const RangeDstSegment* segments, size_t segment_count, size_t capacity,
+    Lane lane, uint64_t* value_len, std::string* out_dev) {
+  AcquireOptions options;
+  options.required_data_bytes = capacity;
+  options.request_dynamic_pull = true;
+  options.requested_credits = 1;
+  options.peer = peer_topologies_->Snapshot(node);
+  AcquireResult acquired = Acquire(node, lane, options);
+  if (!acquired.conn) return acquired.status;
+  Conn* conn = acquired.conn;
+  rdma::RcEndpoint& ep = conn->ep;
+  if (out_dev) {
+    if (!out_dev->empty()) *out_dev += "->";
+    *out_dev += devs_[conn->rail_index];
+  }
+  const auto fail = [&]() {
+    pull_failures_.fetch_add(1, std::memory_order_relaxed);
+    // Leave any outstanding transient MR owned by ep: Destroy fences its QP
+    // before deregistration, so a timed-out READ cannot DMA after return.
+    Destroy(conn, rdma::RailCompletion::kEndpointFailure);
+    return Status::kIOError;
+  };
+  std::vector<uint32_t> replies;
+  const auto exchange = [&](size_t request_bytes, size_t response_bytes,
+                            Status* status, uint64_t* stored_len) {
+    bool timed_out = false;
+    ibv_wc_status wc_status = IBV_WC_SUCCESS;
+    bool had_wcs = false;
+    const bool ok =
+        ep.PostRecv(0) && ep.PostSend(0, request_bytes) &&
+        ReapWindow(ep, 1, &replies, BatchTimeout(), &timed_out,
+                   &wc_status, &had_wcs);
+    if (timed_out)
+      completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
+    uint64_t bytes = 0;
+    return ok && !replies.empty() && replies[0] >= kRespPrefix &&
+           conn->Decode(ep.rbuf(0), status, &bytes, response_bytes, stored_len) &&
+           bytes == (*status == Status::kOk ? response_bytes : 0) &&
+           replies[0] == kRespPrefix + bytes;
+  };
+
+  conn->Encode(ep.sbuf(0), WireOp::kPullRange, key, 0, capacity,
+               rdma::kPullPrepareBytes);
+  const rdma::PullPrepareControl control{
+      0, conn->pending_pull_generation};
+  rdma::EncodePullPrepareControl(control, ep.sbuf(0) + kReqPrefix);
+  pull_prepares_.fetch_add(1, std::memory_order_relaxed);
+  Status status = Status::kIOError;
+  uint64_t stored_len = 0;
+  const size_t ready_bytes = conn->dynamic_pull
+                                 ? rdma::kDynamicPullReadyBytes
+                                 : rdma::kPullReadyBytes;
+  if (!exchange(kReqPrefix + rdma::kPullPrepareBytes, ready_bytes,
+                &status, &stored_len))
+    return fail();
+  conn->pending_pull_generation = 0;
+  if (status != Status::kOk) {
+    if (value_len) *value_len = stored_len;
+    Release(node, lane, conn);
+    return status;
+  }
+
+  rdma::DynamicPullReady ready;
+  if (conn->dynamic_pull) {
+    if (!rdma::DecodeDynamicPullReady(ep.rbuf(0) + kRespPrefix, &ready))
+      return fail();
+  } else {
+    rdma::PullReady legacy;
+    if (!rdma::DecodePullReady(ep.rbuf(0) + kRespPrefix, &legacy) ||
+        conn->pull_arena.slot_count == 0 ||
+        legacy.slot_index >= conn->pull_arena.slot_count)
+      return fail();
+    const uint64_t slot_bytes =
+        conn->pull_arena.arena_bytes / conn->pull_arena.slot_count;
+    if (legacy.data_len > slot_bytes) return fail();
+    ready = {legacy.slot_index, legacy.slot_generation, legacy.data_len,
+             legacy.value_len,
+             conn->pull_arena.base_addr + legacy.slot_index * slot_bytes,
+             conn->pull_arena.rkey};
+  }
+  if (ready.slot_index != 0 || ready.data_len > capacity ||
+      ready.data_len > OpBound() ||
+      ready.data_len != std::min<uint64_t>(ready.value_len, capacity))
+    return fail();
+
+  const bool too_small = ready.value_len > capacity;
+  if (!too_small) {
+    size_t copied = 0;
+    CompletionDeadline deadline(BatchTimeout());
+    for (size_t i = 0; i < segment_count && copied < ready.data_len; ++i) {
+      const auto& segment = segments[i];
+      const size_t bytes = std::min<size_t>(
+          segment.second, static_cast<size_t>(ready.data_len) - copied);
+      if (bytes == 0) continue;
+      ibv_mr* mr = ep.RegisterTransient(segment.first, bytes);
+      if (!mr || InjectPullReadFailure() ||
+          !ep.PostRead(0, segment.first, bytes, mr,
+                       ready.address + copied, ready.rkey))
+        return fail();
+      ibv_wc completion{};
+      const int got = ep.WaitComp(&completion, 1, deadline.Remaining());
+      if (got != 1 || completion.status != IBV_WC_SUCCESS ||
+          completion.opcode != IBV_WC_RDMA_READ) {
+        if (got == 0)
+          completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        return fail();
+      }
+      ep.ReleaseTransient(mr);
+      copied += bytes;
+      pull_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    if (copied != ready.data_len) return fail();
+    pull_reads_.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (conn->dynamic_pull) {
+    // The READ CQEs above are the local completion proof. Only the RELEASE
+    // ACK proves the remote capability and storage are gone before idling.
+    conn->Encode(ep.sbuf(0), WireOp::kPullRelease, key, 0,
+                 ready.slot_generation,
+                 static_cast<uint64_t>(ready.slot_index) + 1);
+    Status released = Status::kIOError;
+    uint64_t ignored = 0;
+    if (!exchange(kReqPrefix, 0, &released, &ignored) ||
+        released != Status::kOk) {
+      pull_release_failures_.fetch_add(1, std::memory_order_relaxed);
+      return fail();
+    }
+    pull_releases_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    // Preserve the v2.25 piggyback retirement wire contract.
+    conn->pending_pull_slot = ready.slot_index;
+    conn->pending_pull_generation = ready.slot_generation;
+  }
+  if (value_len) *value_len = ready.value_len;
+  if (!too_small) RecordRailTransfer(conn, false, 1, ready.data_len);
+  Release(node, lane, conn);
+  return too_small ? Status::kInvalid : Status::kOk;
+}
+
 std::vector<Status> RdmaTransport::RangeInto(
     const std::string& node, const std::vector<BlockKey>& keys,
     const std::vector<RangeDst>& destinations,
@@ -3217,114 +3396,11 @@ std::vector<Status> RdmaTransport::RangeInto(
     if (!ValidBuffer(destination.payload, destination.n) ||
         NoteBlock(destination.n))
       continue;
-    AcquireOptions options;
-    options.required_data_bytes = destination.n;
-    options.requested_credits = 1;
-    options.peer = peer_topologies_->Snapshot(node);
-    AcquireResult acquired = Acquire(node, Lane::kData, options);
-    if (!acquired.conn) {
-      result[item] = acquired.status;
-      continue;
-    }
-    Conn* conn = acquired.conn;
-    rdma::RcEndpoint& ep = conn->ep;
-    bool reusable = true;
-
-    conn->Encode(ep.sbuf(0), WireOp::kPullRange, keys[item], 0,
-                 destination.n, rdma::kPullPrepareBytes);
-    const rdma::PullPrepareControl control{
-        0, conn->pending_pull_generation};
-    rdma::EncodePullPrepareControl(control, ep.sbuf(0) + kReqPrefix);
-    pull_prepares_.fetch_add(1, std::memory_order_relaxed);
-    std::vector<uint32_t> reply_bytes;
-    bool timed_out = false;
-    ibv_wc_status wc_status = IBV_WC_SUCCESS;
-    bool had_wcs = false;
-    bool ok =
-        ep.PostRecv(0) &&
-        ep.PostSend(0, kReqPrefix + rdma::kPullPrepareBytes) &&
-        ReapWindow(ep, 1, &reply_bytes, BatchTimeout(), &timed_out,
-                   &wc_status, &had_wcs);
-    if (timed_out)
-      completion_timeouts_.fetch_add(1, std::memory_order_relaxed);
-    Status status = Status::kIOError;
-    uint64_t response_len = 0;
-    uint64_t stored_len = 0;
-    rdma::PullReady ready;
-    if (!ok || reply_bytes.empty() || reply_bytes[0] < kRespPrefix ||
-        !conn->Decode(ep.rbuf(0), &status, &response_len,
-                      rdma::kPullReadyBytes, &stored_len) ||
-        (status == Status::kOk &&
-         (response_len != rdma::kPullReadyBytes ||
-          reply_bytes[0] < kRespPrefix + rdma::kPullReadyBytes ||
-          !rdma::DecodePullReady(ep.rbuf(0) + kRespPrefix, &ready)))) {
-      reusable = false;
-    } else if (status != Status::kOk) {
-      result[item] = status;
-      if (value_lens) (*value_lens)[item] = stored_len;
-      conn->pending_pull_generation = 0;
-    } else {
-      const size_t slot_bytes =
-          conn->pull_arena.arena_bytes / conn->pull_arena.slot_count;
-      if (ready.slot_index >= conn->pull_arena.slot_count ||
-          ready.data_len > destination.n || ready.data_len > slot_bytes) {
-        reusable = false;
-      } else if (ready.value_len > destination.n) {
-        // PREPARE succeeded, but this whole-object destination is too small.
-        // Retire its arena generation on the next request without reading or
-        // blaming a healthy endpoint for the caller's capacity.
-        conn->pending_pull_slot = ready.slot_index;
-        conn->pending_pull_generation = ready.slot_generation;
-        result[item] = Status::kInvalid;
-        if (value_lens) (*value_lens)[item] = ready.value_len;
-      } else {
-        ibv_mr* destination_mr =
-            ready.data_len
-                ? ep.RegisterTransient(destination.payload,
-                                       static_cast<size_t>(ready.data_len))
-                : nullptr;
-        if (ready.data_len != 0 && !destination_mr) {
-          reusable = false;
-        } else {
-          const uint64_t remote_addr =
-              conn->pull_arena.base_addr +
-              static_cast<uint64_t>(ready.slot_index) * slot_bytes;
-          bool read_ok =
-              !InjectPullReadFailure() &&
-              (ready.data_len == 0 ||
-               ep.PostRead(0, destination.payload,
-                           static_cast<size_t>(ready.data_len), destination_mr,
-                           remote_addr, conn->pull_arena.rkey));
-          if (read_ok && ready.data_len != 0) {
-            ibv_wc completion{};
-            read_ok = ep.WaitComp(&completion, 1, BatchTimeout()) == 1 &&
-                      completion.status == IBV_WC_SUCCESS &&
-                      completion.opcode == IBV_WC_RDMA_READ;
-          }
-          if (destination_mr) ep.ReleaseTransient(destination_mr);
-          if (!read_ok) {
-            reusable = false;
-          } else {
-            conn->pending_pull_slot = ready.slot_index;
-            conn->pending_pull_generation = ready.slot_generation;
-            pull_reads_.fetch_add(1, std::memory_order_relaxed);
-            pull_read_bytes_.fetch_add(ready.data_len,
-                                       std::memory_order_relaxed);
-            result[item] = Status::kOk;
-            RecordRailTransfer(conn, false, 1, ready.data_len);
-            if (value_lens) (*value_lens)[item] = ready.value_len;
-          }
-        }
-      }
-    }
-    if (!reusable) {
-      result[item] = Status::kIOError;
-      pull_failures_.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (reusable)
-      Release(node, Lane::kData, conn);
-    else
-      Destroy(conn, rdma::RailCompletion::kEndpointFailure);
+    const RangeDstSegment segment{
+        destination.payload, destination.n, destination.memory_kind};
+    result[item] = PullInto(node, keys[item], &segment, 1, destination.n,
+                            Lane::kData,
+                            value_lens ? &(*value_lens)[item] : nullptr);
   }
   return result;
 }
@@ -3699,9 +3775,10 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
   if (destinations.size() != count) return InvalidStatuses(count);
   std::vector<Status> result(count, Status::kInvalid);
   for (size_t item = 0; item < count; ++item) {
+    const auto& segments = destinations[item].payloads;
     size_t capacity = 0;
     bool valid = true;
-    for (const auto& segment : destinations[item].payloads) {
+    for (const auto& segment : segments) {
       size_t next = 0;
       if (!ValidBuffer(segment.first, segment.second) ||
           !CheckedAddSize(capacity, segment.second, &next)) {
@@ -3711,117 +3788,11 @@ std::vector<Status> RdmaTransport::RangeIntoMulti(
       capacity = next;
     }
     if (!valid || NoteBlock(capacity)) continue;
-    AcquireOptions options;
-    options.required_data_bytes = capacity;
-    options.requested_credits = 1;
-    options.peer = peer_topologies_->Snapshot(node);
-    AcquireResult acquired = Acquire(node, Lane::kSgData, options);
-    if (!acquired.conn) {
-      result[item] = acquired.status;
-      continue;
-    }
-    Conn* conn = acquired.conn;
-    rdma::RcEndpoint& ep = conn->ep;
-    if (out_dev) {
-      if (!out_dev->empty()) *out_dev += "->";
-      *out_dev += devs_[conn->rail_index];
-    }
-    bool reusable = true;
-    conn->Encode(ep.sbuf(0), WireOp::kPullRange, keys[item], 0, capacity,
-                 rdma::kPullPrepareBytes);
-    const rdma::PullPrepareControl control{
-        0, conn->pending_pull_generation};
-    rdma::EncodePullPrepareControl(control, ep.sbuf(0) + kReqPrefix);
-    pull_prepares_.fetch_add(1, std::memory_order_relaxed);
-    std::vector<uint32_t> reply_bytes;
-    bool timed_out = false;
-    ibv_wc_status wc_status = IBV_WC_SUCCESS;
-    bool had_wcs = false;
-    bool ok =
-        ep.PostRecv(0) &&
-        ep.PostSend(0, kReqPrefix + rdma::kPullPrepareBytes) &&
-        ReapWindow(ep, 1, &reply_bytes, BatchTimeout(), &timed_out,
-                   &wc_status, &had_wcs);
-    Status status = Status::kIOError;
-    uint64_t response_len = 0;
-    uint64_t stored_len = 0;
-    rdma::PullReady ready;
-    if (!ok || reply_bytes.empty() || reply_bytes[0] < kRespPrefix ||
-        !conn->Decode(ep.rbuf(0), &status, &response_len,
-                      rdma::kPullReadyBytes, &stored_len) ||
-        (status == Status::kOk &&
-         (response_len != rdma::kPullReadyBytes ||
-          reply_bytes[0] < kRespPrefix + rdma::kPullReadyBytes ||
-          !rdma::DecodePullReady(ep.rbuf(0) + kRespPrefix, &ready)))) {
-      reusable = false;
-    } else if (status != Status::kOk) {
-      conn->pending_pull_generation = 0;
-      result[item] = status;
-    } else {
-      const size_t slot_bytes =
-          conn->pull_arena.arena_bytes / conn->pull_arena.slot_count;
-      if (ready.slot_index >= conn->pull_arena.slot_count ||
-          ready.data_len > capacity || ready.data_len > slot_bytes) {
-        reusable = false;
-      } else if (ready.value_len > capacity) {
-        // Even a rejected destination must acknowledge the successful PREPARE
-        // before a pooled connection can prepare another object.
-        conn->pending_pull_slot = ready.slot_index;
-        conn->pending_pull_generation = ready.slot_generation;
-        result[item] = Status::kInvalid;
-      } else {
-        const uint64_t remote_base =
-            conn->pull_arena.base_addr +
-            static_cast<uint64_t>(ready.slot_index) * slot_bytes;
-        size_t copied = 0;
-        for (const auto& segment : destinations[item].payloads) {
-          const size_t bytes = std::min<size_t>(
-              segment.second, static_cast<size_t>(ready.data_len) - copied);
-          if (bytes == 0) {
-            if (copied == ready.data_len) break;
-            continue;
-          }
-          ibv_mr* mr = ep.RegisterTransient(segment.first, bytes);
-          bool read_ok =
-              !InjectPullReadFailure() && mr &&
-              ep.PostRead(0, segment.first, bytes, mr,
-                          remote_base + copied, conn->pull_arena.rkey);
-          if (read_ok) {
-            ibv_wc completion{};
-            read_ok = ep.WaitComp(&completion, 1, BatchTimeout()) == 1 &&
-                      completion.status == IBV_WC_SUCCESS &&
-                      completion.opcode == IBV_WC_RDMA_READ;
-          }
-          if (mr) ep.ReleaseTransient(mr);
-          if (!read_ok) {
-            reusable = false;
-            break;
-          }
-          copied += bytes;
-        }
-        if (reusable && copied == ready.data_len) {
-          conn->pending_pull_slot = ready.slot_index;
-          conn->pending_pull_generation = ready.slot_generation;
-          pull_reads_.fetch_add(1, std::memory_order_relaxed);
-          pull_read_bytes_.fetch_add(ready.data_len,
-                                     std::memory_order_relaxed);
-          result[item] = Status::kOk;
-          RecordRailTransfer(conn, false, 1, ready.data_len);
-          if (out_lengths)
-            (*out_lengths)[item] = static_cast<size_t>(ready.value_len);
-        } else {
-          reusable = false;
-        }
-      }
-    }
-    if (!reusable) {
-      result[item] = Status::kIOError;
-      pull_failures_.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (reusable)
-      Release(node, Lane::kSgData, conn);
-    else
-      Destroy(conn, rdma::RailCompletion::kEndpointFailure);
+    uint64_t value_len = 0;
+    result[item] = PullInto(node, keys[item], segments.data(), segments.size(),
+                            capacity, Lane::kSgData, &value_len, out_dev);
+    if (out_lengths && result[item] == Status::kOk)
+      (*out_lengths)[item] = static_cast<size_t>(value_len);
   }
   return result;
 }

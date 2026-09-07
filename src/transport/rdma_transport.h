@@ -1,6 +1,6 @@
 /* RDMA client transport — native v2 libibverbs RC. Requests and bounded
  * responses use 32,786-byte SEND/RECV control buffers (18-byte prefix plus a
- * 32-KiB Members payload); PUT/GET payloads use one-sided WRITEs.
+ * 32-KiB Members payload); PUT uses WRITEs and direct GET uses initiator READs.
  * A peer that cannot negotiate v2 is rejected.
  * An empty DFKV_RDMA_DEV discovers every ACTIVE HCA; an explicit comma list is
  * a whitelist. Device names, not IPs, select the data fabric. QPs bootstrap over
@@ -158,6 +158,9 @@ class RdmaTransport : public Transport {
     // peer advertises the capability; the request bit is then echoed on the
     // bootstrap frame.
     bool request_leased_put = false;
+    // Direct pull GET demand has no connection-resident payload in dynamic
+    // mode. Logical length still travels in the operation request.
+    bool request_dynamic_pull = false;
     size_t leased_inline_bytes = 0;
     RailMask excluded;
     std::shared_ptr<const rdma::PeerRailSnapshot> peer;
@@ -214,28 +217,31 @@ class RdmaTransport : public Transport {
   // first cache read after an idle gap to discover and rebuild stale QPs.
   void KeepaliveLoop();
   bool KeepaliveConn(Conn* c, rdma::RailCompletion* failure);
+  Status PullInto(const std::string& node, const BlockKey& key,
+                  const RangeDstSegment* segments, size_t segment_count,
+                  size_t capacity, Lane lane, uint64_t* value_len,
+                  std::string* out_dev = nullptr);
   Status RoundTrip(const std::string& node, WireOp op, const BlockKey& key,
                    uint64_t offset, uint64_t length, const void* payload,
                    uint64_t payload_len, std::string* out,
                    uint64_t* value_len = nullptr);
-  // Probe the node's v2 base capabilities. When leased_put_supported is
-  // non-null it additionally reports the optional staged-lease capability
-  // (still true for the base result when the optional bit is absent, since
-  // old servers advertise only writer-retirement and pull-read).
+  // Probe required base capabilities and report actual optional peer bits.
   bool ProbeV2(const std::string& node,
-               bool* leased_put_supported = nullptr) const;
+               bool* leased_put_supported = nullptr,
+               bool* dynamic_pull_supported = nullptr) const;
   mutable std::mutex mu_;
   // Scalar and SG operations share data endpoints. An acquired connection is
   // never concurrently reused, while operation framing remains self-describing.
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
   // Optional capability observations belong to one peer publication, just like
   // pooled endpoints. A topology update invalidates both at the same boundary.
-  struct PeerPutCapability {
+  struct PeerCapability {
     std::string peer_id;
     uint64_t publication = 0;
     bool leased_put = false;
+    bool dynamic_pull = false;
   };
-  std::unordered_map<std::string, PeerPutCapability> peer_put_capabilities_;
+  std::unordered_map<std::string, PeerCapability> peer_capabilities_;
   // Exist/Remove/Members remain isolated from payload transfers.
   std::vector<size_t> IdleDataBounds(const std::string& node) const;
   std::vector<size_t> IdleDataDepths(const std::string& node) const;
@@ -270,6 +276,7 @@ class RdmaTransport : public Transport {
   // Leased-PUT in-flight datapath. Zero disables the optional capability
   // request and keeps every object on connection-resident receive slots.
   size_t inline_put_max_bytes_ = 4194304;  // DFKV_RDMA_INLINE_PUT_MAX_BYTES
+  bool dynamic_pull_enabled_ = true;  // DFKV_RDMA_DYNAMIC_PULL=0 disables
   mutable std::atomic<uint64_t> leaseput_ops_{0};
   mutable std::atomic<uint64_t> leaseput_path_fallbacks_{0};
   // Records n as a candidate high-water mark and reports whether it exceeds the
@@ -371,6 +378,8 @@ class RdmaTransport : public Transport {
   std::atomic<uint64_t> pull_reads_{0};
   std::atomic<uint64_t> pull_read_bytes_{0};
   std::atomic<uint64_t> pull_failures_{0};
+  std::atomic<uint64_t> pull_releases_{0};
+  std::atomic<uint64_t> pull_release_failures_{0};
   std::atomic<uint64_t> ambiguous_get_quarantines_{0};
   std::atomic<uint64_t> ambiguous_get_quarantined_bytes_{0};
   // Raw ownership is intentional: without retirement proof no in-process

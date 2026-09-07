@@ -243,6 +243,8 @@ class RdmaServer {
   std::atomic<uint64_t> lease_put_busy_rejects_{0};
   std::atomic<uint64_t> lease_put_active_{0};
   std::atomic<uint64_t> lease_put_bytes_active_{0};
+  std::atomic<uint64_t> dynamic_get_active_{0};
+  std::atomic<uint64_t> dynamic_get_bytes_active_{0};
   // One anchor per resolved rail holds a lifetime shared device reference and
   // registers the initial receive chunk and caller pools on that rail's PD.
   // Later chunks register lazily on the rail of the connection that leases
@@ -268,7 +270,7 @@ class RdmaServer {
   friend class RdmaServerTestPeer;
   friend class RdmaLeaseServerTestPeer;
   // Test barrier immediately before endpoint destruction; ranges must remain
-  // owned while a delayed inbound WRITE can still reach the QP.
+  // owned while delayed inbound DMA can still reach the QP.
   std::function<void()> before_endpoint_teardown_for_test_;
   std::atomic<uint64_t> uring_reads_{0}, uring_read_batches_{0},
       uring_read_batch_max_{0}, uring_completions_{0}, uring_inflight_{0},

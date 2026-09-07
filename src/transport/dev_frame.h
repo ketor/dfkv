@@ -27,9 +27,10 @@ constexpr uint64_t kDevFrameRequestPullRead = uint64_t{1} << 62;
 // connection's inline class arrive via a per-op staging lease instead of the
 // connection-lifetime receive-slot lease.
 constexpr uint64_t kDevFrameRequestLeasedPut = uint64_t{1} << 61;
+constexpr uint64_t kDevFrameRequestDynamicPull = uint64_t{1} << 60;
 constexpr uint64_t kDevFrameMaxBlockMask =
     ~(kDevFrameRequestWriterRetirement | kDevFrameRequestPullRead |
-      kDevFrameRequestLeasedPut);
+      kDevFrameRequestLeasedPut | kDevFrameRequestDynamicPull);
 
 // Room a device name must leave in the fixed 32-byte frame: NUL terminator +
 // "DCP2" u32 + max_block_bytes u64 + protocol u8. A name at most this long
@@ -108,6 +109,10 @@ inline bool DevFrameRequestsPullRead(const char in[kDevNameBytes]) {
 
 inline bool DevFrameRequestsLeasedPut(const char in[kDevNameBytes]) {
   return (ParseDevFrameCaps(in) & kDevFrameRequestLeasedPut) != 0;
+}
+
+inline bool DevFrameRequestsDynamicPull(const char in[kDevNameBytes]) {
+  return (ParseDevFrameCaps(in) & kDevFrameRequestDynamicPull) != 0;
 }
 
 inline uint8_t ParseDevFrameProtocol(const char in[kDevNameBytes]) {
