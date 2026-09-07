@@ -48,6 +48,7 @@ constexpr uint8_t kV2ProbeCapPullRead = 1u << 1;
 // clients ignore it; new clients refuse to send lease requests without it and
 // fall back to the connection-resident receive-slot path.
 constexpr uint8_t kV2ProbeCapLeasedPut = 1u << 2;
+constexpr uint8_t kV2ProbeCapDynamicPull = 1u << 3;
 
 inline bool IsV2Probe(const char frame[kDevNameBytes]) {
   size_t n = 0;
@@ -59,7 +60,8 @@ inline bool IsV2Probe(const char frame[kDevNameBytes]) {
 inline void EncodeV2ProbeReply(
     char out[kV2ProbeReplyBytes],
     uint8_t capabilities = kV2ProbeCapWriterRetirement |
-                           kV2ProbeCapPullRead | kV2ProbeCapLeasedPut) {
+                           kV2ProbeCapPullRead | kV2ProbeCapLeasedPut |
+                           kV2ProbeCapDynamicPull) {
   std::memset(out, 0, kV2ProbeReplyBytes);
   std::memcpy(out, &kV2ProbeMagic, sizeof(kV2ProbeMagic));
   out[4] = static_cast<char>(kDevProtoV2);
@@ -92,6 +94,11 @@ inline bool V2ProbeSupportsPullRead(
 inline bool V2ProbeSupportsLeasedPut(
     const char in[kV2ProbeReplyBytes]) {
   return (ParseV2ProbeCapabilities(in) & kV2ProbeCapLeasedPut) != 0;
+}
+
+inline bool V2ProbeSupportsDynamicPull(
+    const char in[kV2ProbeReplyBytes]) {
+  return (ParseV2ProbeCapabilities(in) & kV2ProbeCapDynamicPull) != 0;
 }
 
 // Failure-path writer retirement. The client reconnects with the opaque
@@ -303,6 +310,52 @@ inline bool DecodePullReady(const char in[kPullReadyBytes],
   ready->data_len = net::GetU64(in + 16);
   ready->value_len = net::GetU64(in + 24);
   return ready->slot_generation != 0;
+}
+
+// Negotiated dynamic-pull connections omit the resident PullArenaInfo from
+// bootstrap: readiness is exactly kV2RetirementReadinessBytes (33 bytes).
+// Each kPullRange then publishes an operation-scoped READ capability; client
+// must finish READs and receive kPullRelease acknowledgement before pooling
+// its connection. Legacy connections retain their original 40-byte ready.
+struct DynamicPullReady {
+  uint32_t slot_index = 0;
+  uint64_t slot_generation = 0;
+  uint64_t data_len = 0;
+  uint64_t value_len = 0;
+  uint64_t address = 0;
+  uint32_t rkey = 0;
+};
+constexpr uint32_t kDynamicPullReadyMagic = 0x32525044u;  // "DPR2"
+constexpr size_t kDynamicPullReadyBytes = 48;
+
+inline void EncodeDynamicPullReady(const DynamicPullReady& value,
+                                   char out[kDynamicPullReadyBytes]) {
+  std::memset(out, 0, kDynamicPullReadyBytes);
+  net::PutU32(out, kDynamicPullReadyMagic);
+  net::PutU32(out + 4, value.slot_index);
+  net::PutU64(out + 8, value.slot_generation);
+  net::PutU64(out + 16, value.data_len);
+  net::PutU64(out + 24, value.value_len);
+  net::PutU64(out + 32, value.address);
+  net::PutU32(out + 40, value.rkey);
+}
+inline bool DecodeDynamicPullReady(const char in[kDynamicPullReadyBytes],
+                                   DynamicPullReady* value) {
+  if (net::GetU32(in) != kDynamicPullReadyMagic ||
+      net::GetU32(in + 44) != 0) return false;
+  DynamicPullReady parsed;
+  parsed.slot_index = net::GetU32(in + 4);
+  parsed.slot_generation = net::GetU64(in + 8);
+  parsed.data_len = net::GetU64(in + 16);
+  parsed.value_len = net::GetU64(in + 24);
+  parsed.address = net::GetU64(in + 32);
+  parsed.rkey = net::GetU32(in + 40);
+  if (!parsed.slot_generation || !parsed.address || !parsed.rkey ||
+      parsed.data_len > parsed.value_len ||
+      parsed.data_len > std::numeric_limits<uint64_t>::max() - parsed.address)
+    return false;
+  *value = parsed;
+  return true;
 }
 
 // Per-op staging lease for the in-flight leased-PUT datapath. The server

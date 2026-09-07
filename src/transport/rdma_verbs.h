@@ -172,6 +172,11 @@ class RcEndpoint {
   ibv_mr* RegisterLeaseWriteRegion(void* base, size_t size);
   void ReleaseLeaseWriteRegion(ibv_mr* mr);
   static uint64_t LeaseWriteMrActive();
+  // Exact operation-scoped READ capability, revoked before its staging range
+  // can return to the receive pool. Never retained in a broad chunk cache.
+  ibv_mr* RegisterLeaseReadRegion(void* base, size_t size);
+  void ReleaseLeaseReadRegion(ibv_mr* mr);
+  static uint64_t LeaseReadMrActive();
   // Register an exact connection-private source arena for initiator READ.
   // Unlike RegisterRemoteRegion this never widens to a shared segment MR.
   ibv_mr* RegisterRemoteReadRegion(void* base, size_t size);
@@ -346,6 +351,7 @@ class RcEndpoint {
   std::vector<ibv_mr*> connection_mr_;
   std::vector<ibv_mw*> connection_mw_;
   std::vector<ibv_mr*> lease_write_mr_;
+  std::vector<ibv_mr*> lease_read_mr_;
   QpInfo local_;
   std::atomic<bool> responder_cancelled_{false};
   size_t pending_responder_writes_ = 0;  // responder owner thread only

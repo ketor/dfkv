@@ -598,9 +598,13 @@ void RdmaServer::Serve(int boot_fd) {
       rdma::DevFrameRequestsWriterRetirement(devbuf);
   const bool pull_read_requested = rdma::DevFrameRequestsPullRead(devbuf);
   const bool leased_put_requested = rdma::DevFrameRequestsLeasedPut(devbuf);
+  const bool dynamic_pull_requested =
+      rdma::DevFrameRequestsDynamicPull(devbuf);
   const uint64_t declared = rdma::ParseDevFrameMaxBlock(devbuf);
   if (rdma::ParseDevFrameProtocol(devbuf) != rdma::kDevProtoV2 ||
-      declared == 0) {
+      declared == 0 ||
+      (dynamic_pull_requested &&
+       (!pull_read_requested || !writer_retirement_requested))) {
     DFKV_LOG_ERROR("rdma: rejecting peer without required v2 negotiation");
     ::close(boot_fd);
     return;
@@ -709,7 +713,7 @@ void RdmaServer::Serve(int boot_fd) {
     }
   }
   rdma::RecvSegmentPool::Lease pull_lease;
-  if (pull_read_requested) {
+  if (pull_read_requested && !dynamic_pull_requested) {
     pull_lease = recv_segments_.Allocate(
         K * slot_size, rdma::kV2DataOffset,
         static_cast<int>(rail_index), rail_numa);
@@ -810,8 +814,28 @@ void RdmaServer::Serve(int boot_fd) {
     uint64_t generation = 1;
     size_t data_len = 0;
     size_t value_len = 0;
+    rdma::RecvSegmentPool::Lease lease;
+    ibv_mr* mr = nullptr;  // endpoint-owned, revoked before Reset()
+    std::atomic<uint64_t>* active_count = nullptr;
+    std::atomic<uint64_t>* active_bytes = nullptr;
+    ~PullSlotState() { Reset(); }
+    void Reset() {
+      if (lease) {
+        active_bytes->fetch_sub(lease.size(), std::memory_order_relaxed);
+        active_count->fetch_sub(1, std::memory_order_relaxed);
+        lease.Reset();
+      }
+      mr = nullptr;
+      busy = false;
+      data_len = 0;
+      value_len = 0;
+    }
   };
   std::vector<PullSlotState> pull_slots(K);
+  for (auto& state : pull_slots) {
+    state.active_count = &dynamic_get_active_;
+    state.active_bytes = &dynamic_get_bytes_active_;
+  }
   std::vector<MultiPutState> multi_put(K);
   std::vector<MultiGetState> multi_get(K);
   std::vector<int32_t> multi_get_source_owner(K, -1);
@@ -851,6 +875,13 @@ void RdmaServer::Serve(int boot_fd) {
     ep.ReleaseLeaseWriteRegion(state.mr);
     state.Reset();
   };
+  auto release_pull = [&](size_t slot) {
+    PullSlotState& state = pull_slots[slot];
+    ep.ReleaseLeaseReadRegion(state.mr);
+    state.Reset();
+    ++state.generation;
+    if (state.generation == 0) ++state.generation;
+  };
   constexpr size_t conn_control = rdma::kV2ControlCap;
   if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), conn_control, K,
                /*ib_port=*/1, /*direct_io_buffers=*/false, conn_max,
@@ -869,7 +900,7 @@ void RdmaServer::Serve(int boot_fd) {
   ibv_mr* pull_pool_mr = nullptr;
   ibv_mr* pull_segment_mr = nullptr;
   uint32_t pull_rkey = 0;
-  if (pull_read_requested) {
+  if (pull_read_requested && !dynamic_pull_requested) {
     pull_pool_mr = ep.RegisterRemoteReadPool(
         pull_lease.segment()->data(), pull_lease.segment()->size());
     if (!pull_pool_mr) {
@@ -973,7 +1004,7 @@ void RdmaServer::Serve(int boot_fd) {
       recv_segment_mr->rkey, slot_size};
   char readiness[rdma::kV2PullReadinessBytes];
   size_t readiness_bytes = 0;
-  if (pull_read_requested) {
+  if (pull_read_requested && !dynamic_pull_requested) {
     const rdma::PullArenaInfo pull_info{
         reinterpret_cast<uint64_t>(pull_lease.data()), pull_lease.size(),
         writer_token, pull_rkey, static_cast<uint32_t>(K)};
@@ -1250,7 +1281,6 @@ void RdmaServer::Serve(int boot_fd) {
       return true;
     }
     if (successful_len > request.get.total_capacity ||
-        value_len > request.get.total_capacity ||
         (request.get.window_count > 1 && successful_len != value_len) ||
         (successful_len != 0 && (!data || !data_mr))) {
       return invalid_reply();
@@ -1344,11 +1374,7 @@ void RdmaServer::Serve(int boot_fd) {
       PullSlotState& state = pull_slots[slot];
       if (!state.busy || state.generation != fields.length)
         return invalid_reply();
-      state.busy = false;
-      state.data_len = 0;
-      state.value_len = 0;
-      ++state.generation;
-      if (state.generation == 0) ++state.generation;
+      release_pull(slot);
       encode_status(Status::kOk, 0);
       reply->first_len = response_prefix;
       return true;
@@ -1357,7 +1383,9 @@ void RdmaServer::Serve(int boot_fd) {
     if (fields.op == static_cast<uint8_t>(WireOp::kPullRange)) {
       if (!pull_read_requested || !range_handler_ ||
           fields.payload_len != rdma::kPullPrepareBytes ||
-          fields.length > static_cast<uint64_t>(conn_max) ||
+          (dynamic_pull_requested && fields.length == 0) ||
+          fields.length > static_cast<uint64_t>(
+                              dynamic_pull_requested ? max_msg_ : conn_max) ||
           request.contiguous_payload == nullptr)
         return invalid_reply();
       rdma::PullPrepareControl control;
@@ -1371,36 +1399,78 @@ void RdmaServer::Serve(int boot_fd) {
         if (!state.busy ||
             state.generation != control.release_generation)
           return invalid_reply();
-        state.busy = false;
-        state.data_len = 0;
-        state.value_len = 0;
-        ++state.generation;
-        if (state.generation == 0) ++state.generation;
+        release_pull(slot);
       }
       if (state.busy) {
         encode_status(Status::kCacheFull, 0);
         reply->first_len = response_prefix;
         return true;
       }
-      char* target = pull_lease.data() + slot * slot_size;
+      size_t target_capacity = slot_size;
+      char* target = nullptr;
+      if (dynamic_pull_requested) {
+        // One alignment block covers the head/tail of an unaligned DIO range;
+        // logical capacity remains the request length, not connection class.
+        target_capacity = rdma::V2SlotSize(fields.length);
+        if (target_capacity == 0) return invalid_reply();
+        state.lease = recv_segments_.Allocate(
+            target_capacity, rdma::kV2DataOffset,
+            static_cast<int>(rail_index), rail_numa);
+        if (!state.lease) {
+          encode_status(Status::kCacheFull, 0);
+          reply->first_len = response_prefix;
+          return true;
+        }
+        dynamic_get_active_.fetch_add(1, std::memory_order_relaxed);
+        dynamic_get_bytes_active_.fetch_add(state.lease.size(),
+                                             std::memory_order_relaxed);
+        target = state.lease.data();
+      } else {
+        target = pull_lease.data() + slot * slot_size;
+      }
       const char* output = nullptr;
       size_t output_len = 0;
       size_t value_len = 0;
       const Status status =
-          range_handler_(key, fields.offset, fields.length, target, slot_size,
-                         &output, &output_len, &value_len);
+          range_handler_(key, fields.offset, fields.length, target,
+                         target_capacity, &output, &output_len, &value_len);
       if (status != Status::kOk) {
+        state.Reset();
         encode_status(status, 0, value_len);
         reply->first_len = response_prefix;
         return true;
       }
-      if (output_len > slot_size || (output_len != 0 && output == nullptr))
+      if (output_len > target_capacity ||
+          (dynamic_pull_requested &&
+           (output_len > fields.length || output_len > value_len)) ||
+          (output_len != 0 && output == nullptr)) {
+        state.Reset();
         return invalid_reply();
+      }
       if (output_len != 0 && output != target)
-        std::memcpy(target, output, output_len);
+        std::memmove(target, output, output_len);
       state.busy = true;
       state.data_len = output_len;
       state.value_len = value_len;
+      if (dynamic_pull_requested) {
+        // Publish only the returned bytes, not a pool chunk (or alignment
+        // padding). Empty results still carry a revocable release token.
+        state.mr = ep.RegisterLeaseReadRegion(
+            target, std::max<size_t>(output_len, 1));
+        if (!state.mr) {
+          state.Reset();
+          encode_status(Status::kIOError, 0);
+          reply->first_len = response_prefix;
+          return true;
+        }
+        const rdma::DynamicPullReady ready{
+            static_cast<uint32_t>(slot), state.generation, output_len,
+            value_len, reinterpret_cast<uint64_t>(target), state.mr->rkey};
+        encode_status(Status::kOk, rdma::kDynamicPullReadyBytes, value_len);
+        rdma::EncodeDynamicPullReady(ready, send_buffer + response_prefix);
+        reply->first_len = response_prefix + rdma::kDynamicPullReadyBytes;
+        return true;
+      }
       const rdma::PullReady ready{static_cast<uint32_t>(slot),
                                   state.generation, output_len, value_len};
       encode_status(Status::kOk, rdma::kPullReadyBytes, value_len);
@@ -2299,7 +2369,7 @@ std::string RdmaServer::MetricsText() const {
     "RDMA rails with the initial receive chunk registered",
     recv_segment_registered_rails_);
   m(s, "dfkv_rdma_pull_connections", "gauge",
-    "Connections currently holding negotiated pull-read arenas",
+    "Connections currently using negotiated pull-read",
     pull_connections_.load(std::memory_order_relaxed));
   m(s, "dfkv_rdma_pull_memory_windows_total", "counter",
     "Pull-read connections isolated with type-2 Memory Windows",
@@ -2337,6 +2407,15 @@ std::string RdmaServer::MetricsText() const {
   m(s, "dfkv_rdma_leaseput_bytes_active", "gauge",
     "Receive-pool bytes held by in-flight leased-PUT staging",
     lease_put_bytes_active_);
+  m(s, "dfkv_rdma_dynamic_get_active", "gauge",
+    "In-flight dynamic GET staging operations currently held",
+    dynamic_get_active_);
+  m(s, "dfkv_rdma_dynamic_get_bytes_active", "gauge",
+    "Receive-pool bytes held by in-flight dynamic GET staging",
+    dynamic_get_bytes_active_);
+  m(s, "dfkv_rdma_dynamic_get_mr_active", "gauge",
+    "Process-wide exact dynamic GET READ registrations currently held",
+    rdma::RcEndpoint::LeaseReadMrActive());
   m(s, "dfkv_rdma_v2_ready", "gauge",
     "Whether RDMA v2 has a registered shared receive segment",
     recv_segment_registered_rails_ > 0 ? 1 : 0);
