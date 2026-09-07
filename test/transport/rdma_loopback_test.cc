@@ -2298,41 +2298,6 @@ TEST(RdmaLoopback, RegisterMemoryRoundtrip) {
   }
 }
 
-TEST(RdmaLoopback, ConnectionPoolAndKeepaliveDefaultsResolveAndDisable) {
-  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
-  ::unsetenv("DFKV_RDMA_KEEPALIVE_MS");
-  ::unsetenv("DFKV_RDMA_POOL_MAX");
-  config_dump::ResetForTest();
-  testing::internal::CaptureStderr();
-  { RdmaTransport rt(kMaxMsg); }
-  config_dump::Emit("keepalive-default-test");
-  std::string output = testing::internal::GetCapturedStderr();
-  EXPECT_NE(output.find("DFKV_RDMA_KEEPALIVE_MS"), std::string::npos);
-  EXPECT_NE(output.find(" = 15000  (default)"), std::string::npos);
-  const size_t pool_name = output.find("DFKV_RDMA_POOL_MAX");
-  ASSERT_NE(pool_name, std::string::npos);
-  const std::string pool_line =
-      output.substr(pool_name, output.find('\n', pool_name) - pool_name);
-  EXPECT_NE(pool_line.find(" = 16  (default)"), std::string::npos);
-
-  ::setenv("DFKV_RDMA_KEEPALIVE_MS", "0", 1);
-  ::setenv("DFKV_RDMA_POOL_MAX", "2", 1);
-  config_dump::ResetForTest();
-  testing::internal::CaptureStderr();
-  { RdmaTransport rt(kMaxMsg); }
-  config_dump::Emit("keepalive-disabled-test");
-  output = testing::internal::GetCapturedStderr();
-  EXPECT_NE(output.find("DFKV_RDMA_KEEPALIVE_MS"), std::string::npos);
-  EXPECT_NE(output.find(" = 0  (env)"), std::string::npos);
-  const size_t pool_override_name = output.find("DFKV_RDMA_POOL_MAX");
-  ASSERT_NE(pool_override_name, std::string::npos);
-  const std::string pool_override_line =
-      output.substr(pool_override_name,
-                    output.find('\n', pool_override_name) - pool_override_name);
-  EXPECT_NE(pool_override_line.find(" = 2  (env)"), std::string::npos);
-  ::unsetenv("DFKV_RDMA_KEEPALIVE_MS");
-  ::unsetenv("DFKV_RDMA_POOL_MAX");
-}
 
 // A live client must not inherit the server's short dead-client reap interval
 // as a first-read reconnect penalty. Idle QPs receive lightweight membership

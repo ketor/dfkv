@@ -51,8 +51,7 @@ struct SharedDevice {
   ibv_context* ctx;
   ibv_pd* pd;
   long refs;
-  // Registered once per PD. Entries retire at zero endpoint refs; device
-  // teardown is the safety net if ibv_dereg_mr previously refused one.
+  // Registered once per PD. Entries retire at zero endpoint refs.
   std::vector<SharedPoolMr> pool_mrs;
 };
 std::mutex g_dev_mu;
@@ -69,6 +68,7 @@ std::atomic<uint64_t> g_pool_mr_regs{0};
 std::atomic<uint64_t> g_pool_mr_reg_failures{0};
 std::atomic<uint64_t> g_pool_mr_active{0};
 std::atomic<uint64_t> g_transient_user_mr_active{0};
+std::atomic<uint64_t> g_lease_write_mr_active{0};
 std::atomic<uint64_t> g_cq_completions{0};
 std::atomic<uint64_t> g_cq_errors{0};
 
@@ -83,6 +83,19 @@ size_t g_test_write_faults_consumed = 0;
 size_t g_test_write_cancellations = 0;
 size_t g_test_write_releases = 0;
 
+// A failed revocation is not cleanup success: the NIC may still hold a key or
+// pinned pages. Continuing would let the allocator reuse DMA-visible storage.
+// There is no recoverable ownership path here; fail closed before any free.
+void RequireVerbsRelease(int result, const char* operation) {
+  if (result == 0) return;
+  DFKV_LOG_ERROR(std::string("rdma: unsafe resource release: ") + operation +
+                 " failed (" + std::to_string(result) + ")");
+  std::abort();
+}
+
+void DeregisterMr(ibv_mr* mr) {
+  if (mr) RequireVerbsRelease(ibv_dereg_mr(mr), "ibv_dereg_mr");
+}
 
 int ObserveCqPoll(ibv_wc* out, int got) {
   if (got < 0) {
@@ -135,11 +148,11 @@ void ReleaseSharedDevice(ibv_context* ctx) {
     if (it->second.ctx != ctx) continue;
     if (--it->second.refs == 0) {
       for (auto& p : it->second.pool_mrs) {
-        if (p.mr) ibv_dereg_mr(p.mr);
+        DeregisterMr(p.mr);
         g_pool_mr_active.fetch_sub(1, std::memory_order_relaxed);
       }
-      ibv_dealloc_pd(it->second.pd);
-      ibv_close_device(it->second.ctx);
+      RequireVerbsRelease(ibv_dealloc_pd(it->second.pd), "ibv_dealloc_pd");
+      RequireVerbsRelease(ibv_close_device(it->second.ctx), "ibv_close_device");
       g_devs.erase(it);
     }
     return;
@@ -198,7 +211,8 @@ void SharedReleasePoolMr(ibv_context* ctx, ibv_mr* mr) {
     if (device.ctx != ctx) continue;
     for (auto it = device.pool_mrs.begin(); it != device.pool_mrs.end(); ++it) {
       if (it->mr != mr) continue;
-      if (--it->refs == 0 && ibv_dereg_mr(it->mr) == 0) {
+      if (--it->refs == 0) {
+        DeregisterMr(it->mr);
         device.pool_mrs.erase(it);
         g_pool_mr_active.fetch_sub(1, std::memory_order_relaxed);
       }
@@ -343,14 +357,24 @@ QpInfo ParseQpInfo(const char in[kQpInfoBytes]) {
 RcEndpoint::~RcEndpoint() { Close(); }
 
 void RcEndpoint::Close() {
-  if (qp_) { ibv_destroy_qp(qp_); qp_ = nullptr; }
-  for (auto* mw : connection_mw_) if (mw) ibv_dealloc_mw(mw);
+  // Successful QP destruction is the inbound-DMA fence on every exit,
+  // including bootstrap failure and paths without responder WRITE CQEs.
+  if (qp_) {
+    RequireVerbsRelease(ibv_destroy_qp(qp_), "ibv_destroy_qp");
+    qp_ = nullptr;
+  }
+  for (auto* mw : connection_mw_)
+    if (mw) RequireVerbsRelease(ibv_dealloc_mw(mw), "ibv_dealloc_mw");
   connection_mw_.clear();
-  for (auto* m : smr_) if (m) ibv_dereg_mr(m);
-  for (auto* m : rmr_) if (m) ibv_dereg_mr(m);
-  for (auto* m : dmr_) if (m) ibv_dereg_mr(m);
-  for (auto* mr : transient_mr_) if (mr) ibv_dereg_mr(mr);
-  for (auto* mr : connection_mr_) if (mr) ibv_dereg_mr(mr);
+  for (auto* mr : lease_write_mr_) DeregisterMr(mr);
+  g_lease_write_mr_active.fetch_sub(lease_write_mr_.size(),
+                                   std::memory_order_relaxed);
+  lease_write_mr_.clear();
+  for (auto* m : smr_) DeregisterMr(m);
+  for (auto* m : rmr_) DeregisterMr(m);
+  for (auto* m : dmr_) DeregisterMr(m);
+  for (auto* mr : transient_mr_) DeregisterMr(mr);
+  for (auto* mr : connection_mr_) DeregisterMr(mr);
   connection_mr_.clear();
   g_transient_user_mr_active.fetch_sub(transient_mr_.size(),
                                        std::memory_order_relaxed);
@@ -740,6 +764,30 @@ ibv_mr* RcEndpoint::RegisterRemoteRegion(void* base, size_t size) {
   return nullptr;
 }
 
+ibv_mr* RcEndpoint::RegisterLeaseWriteRegion(void* base, size_t size) {
+  if (!pd_ || !base || size == 0) return nullptr;
+  ibv_mr* mr = ibv_reg_mr(
+      pd_, base, size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+  if (!mr) return nullptr;
+  lease_write_mr_.push_back(mr);
+  g_lease_write_mr_active.fetch_add(1, std::memory_order_relaxed);
+  return mr;
+}
+
+void RcEndpoint::ReleaseLeaseWriteRegion(ibv_mr* mr) {
+  if (!mr) return;
+  const auto it = std::find(lease_write_mr_.begin(), lease_write_mr_.end(), mr);
+  if (it == lease_write_mr_.end()) std::abort();
+  // Synchronous revocation completes before the caller may recycle the range.
+  DeregisterMr(mr);
+  lease_write_mr_.erase(it);
+  g_lease_write_mr_active.fetch_sub(1, std::memory_order_relaxed);
+}
+
+uint64_t RcEndpoint::LeaseWriteMrActive() {
+  return g_lease_write_mr_active.load(std::memory_order_relaxed);
+}
+
 ibv_mr* RcEndpoint::RegisterRemoteReadRegion(void* base, size_t size) {
   if (!base || size == 0) return nullptr;
   ibv_mr* mr = ibv_reg_mr(
@@ -781,16 +829,18 @@ bool RcEndpoint::BindRemoteReadWindow(ibv_mr* pool_mr, void* base,
   wr.bind_mw.bind_info.length = size;
   wr.bind_mw.bind_info.mw_access_flags = IBV_ACCESS_REMOTE_READ;
   if (ibv_post_send(qp_, &wr, &bad) != 0) {
-    ibv_dealloc_mw(mw);
+    RequireVerbsRelease(ibv_dealloc_mw(mw), "ibv_dealloc_mw");
     return false;
   }
+  // Once posted, even an ambiguous bind owns its MW until QP destruction.
+  // Dropping the pointer after a timeout can orphan a still-bound window,
+  // making the backing MR impossible to revoke safely.
+  connection_mw_.push_back(mw);
   ibv_wc wc{};
   const int got = WaitComp(&wc, 1, 10000);
-  if (got != 1 || wc.status != IBV_WC_SUCCESS) {
-    ibv_dealloc_mw(mw);
+  if (got != 1 || wc.status != IBV_WC_SUCCESS ||
+      wc.wr_id != wr.wr_id || wc.opcode != IBV_WC_BIND_MW)
     return false;
-  }
-  connection_mw_.push_back(mw);
   *rkey = wr.bind_mw.rkey;
   return true;
 }
@@ -833,7 +883,7 @@ void RcEndpoint::ReleaseTransient(ibv_mr* mr) {
   if (!mr) return;
   const auto it = std::find(transient_mr_.begin(), transient_mr_.end(), mr);
   if (it == transient_mr_.end()) return;
-  ibv_dereg_mr(mr);
+  DeregisterMr(mr);
   transient_mr_.erase(it);
   g_transient_user_mr_active.fetch_sub(1, std::memory_order_relaxed);
 }

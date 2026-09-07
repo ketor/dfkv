@@ -212,7 +212,7 @@ jobs:
       - name: Build (RDMA + tests)
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDFKV_WITH_RDMA=ON
-          cmake --build build -j --target rdma_loopback_test
+          cmake --build build -j --target rdma_loopback_test rdma_lease_loopback_test rdma_lease_client_test
       # Probe-then-gate: blanket continue-on-error masked real assertion failures
       # for weeks (two broken tests stayed green). Instead, first check that rxe
       # can actually round-trip RC traffic with the simplest datapath case; only
@@ -222,17 +222,21 @@ jobs:
         id: rxe_probe
         run: |
           ulimit -l unlimited 2>/dev/null || true
-          if ./build/rdma_loopback_test --gtest_filter=RdmaLoopback.PutGetExistMissOverRdma; then
+          if ./build/rdma_loopback_test --gtest_filter=RdmaLoopback.PutGetExistMissOverRdma --gtest_output=xml:rdma-probe.xml \
+             && python3 -c 'import xml.etree.ElementTree as E; r=E.parse("rdma-probe.xml").getroot(); assert int(r.attrib["tests"]) == 1 and not list(r.iter("skipped")) and not list(r.iter("failure"))'; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::rxe loopback cannot round-trip RC traffic on this runner; datapath suite skipped"
+            echo "::warning::RDMA NOT EXERCISED: no successful non-skipped loopback probe; a real-HCA acceptance run is still required"
           fi
       - name: Run RDMA datapath test (hard gate when rxe works)
         if: steps.rxe_probe.outputs.ok == 'true'
         run: |
           ulimit -l unlimited 2>/dev/null || true
           ./build/rdma_loopback_test
+          ./build/rdma_lease_loopback_test --gtest_output=xml:lease.xml
+          ./build/rdma_lease_client_test --gtest_output=xml:lease-client.xml
+          python3 -c 'import xml.etree.ElementTree as E; roots=[E.parse(p).getroot() for p in ("lease.xml","lease-client.xml")]; assert all(int(r.attrib["tests"]) > 0 and not list(r.iter("skipped")) and not list(r.iter("failure")) for r in roots)'
       - name: Build + run RDMA datapath test under ThreadSanitizer (hard gate when rxe works)
         if: steps.rxe_probe.outputs.ok == 'true'
         run: |
@@ -240,9 +244,12 @@ jobs:
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1" \
             -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread \
             -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread
-          cmake --build build-tsan -j --target rdma_loopback_test
+          cmake --build build-tsan -j --target rdma_loopback_test rdma_lease_loopback_test rdma_lease_client_test
           ulimit -l unlimited 2>/dev/null || true
           TSAN_OPTIONS=halt_on_error=1 ./build-tsan/rdma_loopback_test
+          TSAN_OPTIONS=halt_on_error=1 ./build-tsan/rdma_lease_loopback_test --gtest_output=xml:lease-tsan.xml
+          TSAN_OPTIONS=halt_on_error=1 ./build-tsan/rdma_lease_client_test --gtest_output=xml:lease-client-tsan.xml
+          python3 -c 'import xml.etree.ElementTree as E; roots=[E.parse(p).getroot() for p in ("lease-tsan.xml","lease-client-tsan.xml")]; assert all(int(r.attrib["tests"]) > 0 and not list(r.iter("skipped")) and not list(r.iter("failure")) for r in roots)'
 
   portable-static-build:
     name: portable static artifacts

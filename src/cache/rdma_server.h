@@ -266,6 +266,10 @@ class RdmaServer {
   std::function<UringReader::Backend*()> uring_backend_factory_for_test_;
 #endif
   friend class RdmaServerTestPeer;
+  friend class RdmaLeaseServerTestPeer;
+  // Test barrier immediately before endpoint destruction; ranges must remain
+  // owned while a delayed inbound WRITE can still reach the QP.
+  std::function<void()> before_endpoint_teardown_for_test_;
   std::atomic<uint64_t> uring_reads_{0}, uring_read_batches_{0},
       uring_read_batch_max_{0}, uring_completions_{0}, uring_inflight_{0},
       uring_inflight_max_{0}, uring_replies_posted_{0},
