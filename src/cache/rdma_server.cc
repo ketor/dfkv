@@ -773,17 +773,31 @@ void RdmaServer::Serve(int boot_fd) {
     PreparedRead completion;
   };
   // In-flight leased-PUT staging state, one entry per connection recv slot.
-  // `lease` owns a receive-pool range sized for exactly this object; the range
-  // is returned the moment the store holds the bytes (handler returned), so
-  // receive memory tracks data in flight instead of connection count.
-  // `generation` survives slot reuse (monotonic, never 0) for lease
-  // diagnostics and future release/retry extensions.
+  // State is declared before ep: every exceptional/early/normal exit destroys
+  // the QP and revokes its MRs before these ranges and their gauges unwind.
+  // Successful operations explicitly revoke the exact MR before Reset().
   struct LeasePutState {
     bool active = false;
     uint64_t generation = 0;
     BlockKey key;
     uint64_t payload_len = 0;
     rdma::RecvSegmentPool::Lease lease;
+    ibv_mr* mr = nullptr;  // owned by ep, never by the receive-pool chunk
+    std::atomic<uint64_t>* active_count = nullptr;
+    std::atomic<uint64_t>* active_bytes = nullptr;
+    ~LeasePutState() { Reset(); }
+    void Reset() {
+      const size_t bytes = lease.size();
+      lease.Reset();
+      if (active) {
+        active_bytes->fetch_sub(bytes, std::memory_order_relaxed);
+        active_count->fetch_sub(1, std::memory_order_relaxed);
+      }
+      active = false;
+      key = BlockKey{};
+      payload_len = 0;
+      mr = nullptr;
+    }
   };
   struct PendingCompletion {
     PreparedRead read;
@@ -803,17 +817,10 @@ void RdmaServer::Serve(int boot_fd) {
   std::vector<int32_t> multi_get_source_owner(K, -1);
   std::vector<PendingCompletion> complete_on_send(K);
   std::vector<LeasePutState> lease_put(K);
-  auto release_lease_put = [&](size_t slot) {
-    LeasePutState& state = lease_put[slot];
-    if (!state.active || !state.lease) return;
-    lease_put_bytes_active_.fetch_sub(state.lease.size(),
-                                      std::memory_order_relaxed);
-    lease_put_active_.fetch_sub(1, std::memory_order_relaxed);
-    state.active = false;
-    state.key = BlockKey{};
-    state.payload_len = 0;
-    state.lease.Reset();  // range returns to the receive pool immediately
-  };
+  for (auto& state : lease_put) {
+    state.active_count = &lease_put_active_;
+    state.active_bytes = &lease_put_bytes_active_;
+  }
   // generation is the only field that survives release: it monotones upward
   // so every LeasePutReady names a distinct op for diagnostics and any future
   // release/retry wire extension. Never emit 0 (treated as "absent").
@@ -835,6 +842,15 @@ void RdmaServer::Serve(int boot_fd) {
   };
 
   rdma::RcEndpoint ep;
+  struct BeforeEndpointTeardown {
+    const std::function<void()>& hook;
+    ~BeforeEndpointTeardown() { if (hook) hook(); }
+  } before_endpoint_teardown{before_endpoint_teardown_for_test_};
+  auto release_lease_put = [&](size_t slot) {
+    LeasePutState& state = lease_put[slot];
+    ep.ReleaseLeaseWriteRegion(state.mr);
+    state.Reset();
+  };
   constexpr size_t conn_control = rdma::kV2ControlCap;
   if (!ep.Open(dev.empty() ? nullptr : dev.c_str(), conn_control, K,
                /*ib_port=*/1, /*direct_io_buffers=*/false, conn_max,
@@ -1421,14 +1437,14 @@ void RdmaServer::Serve(int boot_fd) {
       lease_put_active_.fetch_add(1, std::memory_order_relaxed);
       lease_put_bytes_active_.fetch_add(state.lease.size(),
                                         std::memory_order_relaxed);
-      // The lease may live in ANY receive-pool chunk, including one grown
-      // after this connection opened — recv_segment_mr only covers the
-      // chunk carrying the connection's resident slots. Resolve the lease's
-      // own chunk: RegisterRemoteRegion dedupes, so repeated lookups cost
-      // nothing once the chunk is registered for remote writes.
-      ibv_mr* const lease_region_mr = ep.RegisterRemoteRegion(
-          state.lease.segment()->data(), state.lease.segment()->size());
-      if (!lease_region_mr) {
+      // A broad chunk rkey survives operation completion and authorizes stale
+      // WRITEs into recycled ranges. An exact, uncached MR grants only this
+      // lease; synchronous deregistration revokes it before pool reuse/trim.
+      // The setup-only MW helper cannot be used here: it consumes CQEs that
+      // belong to other pipelined requests.
+      state.mr = ep.RegisterLeaseWriteRegion(state.lease.data(),
+                                            state.lease.size());
+      if (!state.mr) {
         release_lease_put(slot);
         encode_status(Status::kIOError, 0);
         reply->first_len = response_prefix;
@@ -1436,7 +1452,7 @@ void RdmaServer::Serve(int boot_fd) {
       }
       const rdma::LeasePutReady ready{
           static_cast<uint32_t>(slot), next_lease_generation(slot),
-          lease_region_mr->rkey,
+          state.mr->rkey,
           reinterpret_cast<uint64_t>(state.lease.data()),
           state.lease.size()};
       encode_status(Status::kOk, rdma::kLeasePutReadyBytes);
@@ -1611,7 +1627,6 @@ void RdmaServer::Serve(int boot_fd) {
             fields.payload_len > lstate.payload_len ||
             fields.payload_len >
                 lstate.lease.size() - rdma::kV2DataOffset) {
-          release_lease_put(request.data_slot);
           return false;
         }
         cache_data = lstate.lease.data() + rdma::kV2DataOffset;
@@ -1635,8 +1650,8 @@ void RdmaServer::Serve(int boot_fd) {
       encode_status(status, 0);
       reply->first_len = response_prefix;
       // The store consumed the bytes synchronously (O_DIRECT write or RAM
-      // admit copy), so the staging range returns to the pool now — before
-      // the status SEND, which never touches the lease.
+      // admit copy). Revoke remote WRITE access before returning the staging
+      // range to the pool; the status SEND never touches the lease.
       if (from_lease) release_lease_put(request.data_slot);
       return true;
     }
@@ -2138,11 +2153,6 @@ void RdmaServer::Serve(int boot_fd) {
       ring.Drain();
     if (metric_inflight != 0)
       uring_inflight_.fetch_sub(metric_inflight, std::memory_order_relaxed);
-    // Any still-active per-op staging leases are connection losses; release
-    // them through the accounting path before RAII teardown so the gauge
-    // pair (lease_put_active / lease_put_bytes_active) stays exact.
-    for (size_t slot = 0; slot < K; ++slot) release_lease_put(slot);
-
     rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
     active_conns_.fetch_sub(1, std::memory_order_relaxed);
     { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
@@ -2219,15 +2229,12 @@ sync_serve_loop:;
     }
   }
   // Any prepared sends without completions destructor-abort below.
-  // Same release sweep for the sync loop: active leases were in flight when
-  // the connection ended, so their accounting must unwind before teardown.
-  for (size_t slot = 0; slot < K; ++slot) release_lease_put(slot);
   rail_stats.active_conns.fetch_sub(1, std::memory_order_relaxed);
   active_conns_.fetch_sub(1, std::memory_order_relaxed);
   { std::lock_guard<std::mutex> lk(conn_mu_); live_eps_.erase(&ep); }
   retire_writer();
-  // Writer retirement proof, not ep destruction, fences client destinations.
-  // The endpoint destructor below only releases verbs resources.
+  // Retirement proves outbound WRITEs terminal. ep destruction additionally
+  // fences inbound DMA and revokes lease MRs before lease_put RAII unwinds.
 }
 
 

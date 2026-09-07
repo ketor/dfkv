@@ -1,268 +1,219 @@
-/* In-process server+fan-out-client memory benchmark for the staged-lease
- * datapath. Runs entirely on one RDMA host: an embedded cache node serves
- * real verbs, N threads open N independent client connections, and the tool
- * reports the server's residency split (connection-resident receive bytes vs
- * in-flight lease bytes) so the KDA-style deployment math is observable:
- *
- *   dfkvleasebench --clients 200 --obj-size 32MiB --ops 20
- *
- * Compare runs with --inline-bytes 0 (legacy connection-resident class) and
- * the default 4MiB threshold (staged-lease path) to see the receive-pool
- * footprint converge from "connections x max object class x depth" down to
- * "bytes actually in flight". */
-#include "cache/kv_node_server.h"
+// Fan-out client benchmark against an EXTERNAL cache server. Client objects
+// remain alive throughout active and idle sampling; server RSS never includes
+// the benchmark's payloads. Every requested PUT is attempted exactly once by
+// this tool (transport retry policy remains in effect); readback checks bytes.
 #include "cache/rdma_server.h"
-#include "client/kv_client.h"
 #include "client/key_map.h"
-#include <array>
-#include "common/status.h"
+#include "client/kv_client.h"
 #include "transport/rdma_transport.h"
+#include "utils/http_client.h"
+#include "utils/net_util.h"
+#include "utils/prom_parse.h"
 
+#include <sys/socket.h>
+#include <unistd.h>
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
-#include <cstdio>
-#include <cstdlib>
+#include <condition_variable>
+#include <cstdint>
 #include <cstring>
-#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
-namespace fs = std::filesystem;
-using namespace dfkv;  // NOLINT
-
 namespace {
-
-size_t ParseSize(const char* text, size_t fallback) {
-  char* end = nullptr;
-  const unsigned long long v = std::strtoull(text, &end, 10);
-  if (end == text) return fallback;
-  unsigned long long scaled = v;
-  if (end && *end) {
-    switch (std::tolower(*end)) {
-      case 'k': scaled = v << 10; break;
-      case 'm': scaled = v << 20; break;
-      case 'g': scaled = v << 30; break;
-      default: return fallback;
-    }
-  }
-  return static_cast<size_t>(scaled);
+using Clock = std::chrono::steady_clock;
+size_t Size(const char* text) {
+  const std::string input(text);
+  size_t value = 0;
+  const auto parsed = std::from_chars(input.data(), input.data()+input.size(), value);
+  if (parsed.ec != std::errc() || parsed.ptr == input.data())
+    throw std::runtime_error("invalid nonnegative integer: " + input);
+  const std::string suffix(parsed.ptr, input.data()+input.size());
+  size_t factor = 1;
+  if (suffix == "k" || suffix == "KiB") factor = 1ull<<10;
+  else if (suffix == "m" || suffix == "MiB") factor = 1ull<<20;
+  else if (suffix == "g" || suffix == "GiB") factor = 1ull<<30;
+  else if (!suffix.empty()) throw std::runtime_error("invalid size suffix: " + input);
+  if (value > std::numeric_limits<size_t>::max()/factor)
+    throw std::runtime_error("size overflow");
+  return value*factor;
 }
-
-// One Prometheus value line (rfind skips HELP/TYPE lines).
-long MetricOf(const RdmaServer& server, const std::string& name) {
-  const std::string text = server.MetricsText();
-  const size_t at = text.rfind(name + " ");
-  if (at == std::string::npos) return -1;
-  const size_t sp = text.find(' ', at);
-  if (sp == std::string::npos) return -1;
-  return std::strtol(text.c_str() + sp + 1, nullptr, 10);
+std::string Scrape(const std::string& endpoint) {
+  const int fd = dfkv::net::Dial(endpoint, 2000, 2000);
+  if (fd < 0) throw std::runtime_error("cannot connect to metrics endpoint");
+  const std::string req = "GET /metrics HTTP/1.0\r\nHost: " + endpoint +
+                          "\r\nConnection: close\r\n\r\n";
+  std::string response;
+  if (!dfkv::net::WriteAll(fd, req.data(), req.size())) {
+    ::close(fd); throw std::runtime_error("metrics request failed");
+  }
+  char buf[16384];
+  ssize_t n;
+  while ((n=::recv(fd, buf, sizeof(buf), 0)) > 0) {
+    response.append(buf, static_cast<size_t>(n));
+    if (response.size() > (8u<<20)) break;
+  }
+  ::close(fd);
+  int status = 0; long content = 0; size_t head = 0;
+  if (n < 0 || !dfkv::ParseResponseHead(response, &status, &content, &head) ||
+      status != 200) throw std::runtime_error("invalid metrics response");
+  return response.substr(head);
 }
-
-// Labelled variant: takes the exact "name{label...}" key, rfinds it.
-long MetricOf(const RdmaServer& server, const std::string& key,
-               const std::string& name) {
-  const std::string text = server.MetricsText();
-  const size_t at = text.rfind(key + " ");
-  if (at == std::string::npos) return -1;
-  const size_t sp = text.find(' ', at);
-  if (sp == std::string::npos) return -1;
-  return std::strtol(text.c_str() + sp + 1, nullptr, 10);
+uint64_t Metric(const std::string& body, const std::string& name) {
+  uint64_t value = 0;
+  if (!dfkv::PromMetricValue(body, name, &value))
+    throw std::runtime_error("required metric missing: " + name);
+  return value;
 }
-
-std::string BytesHuman(size_t bytes) {
-  char buf[64];
-  if (bytes >= (1ull << 30))
-    std::snprintf(buf, sizeof(buf), "%.2f GiB", bytes / 1073741824.0);
-  else if (bytes >= (1ull << 20))
-    std::snprintf(buf, sizeof(buf), "%.1f MiB", bytes / 1048576.0);
-  else
-    std::snprintf(buf, sizeof(buf), "%zu B", bytes);
-  return buf;
+uint64_t Rss(size_t pid) {
+  std::ifstream in("/proc/"+std::to_string(pid)+"/status");
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.rfind("VmRSS:",0)==0) return std::stoull(line.substr(6))*1024;
+  }
+  throw std::runtime_error("server PID has no readable VmRSS");
 }
-
-}  // namespace
-
-int main(int argc, const char* argv[]) {
-  size_t clients = 200;
-  size_t obj_size = 33554432;  // KDA TP16 temporal state ≈ 32 MiB lease step
-  size_t ops_per_client = 10;
-  size_t inline_bytes = 4194304;  // staged-lease threshold; 0 = legacy
-  size_t depth = 4;
-  size_t small_ratio_pct = 0;
-
-  for (int i = 1; i + 1 < argc; i += 2) {
-    const std::string flag = argv[i];
-    const char* value = argv[i + 1];
-    if (flag == "--clients") clients = ParseSize(value, clients);
-    else if (flag == "--obj-size") obj_size = ParseSize(value, obj_size);
-    else if (flag == "--ops") ops_per_client = ParseSize(value, ops_per_client);
-    else if (flag == "--inline-bytes") inline_bytes = ParseSize(value, inline_bytes);
-    else if (flag == "--depth") depth = ParseSize(value, depth);
-    else if (flag == "--small-ratio-pct") small_ratio_pct = ParseSize(value, 0);
-    else {
-      std::fprintf(stderr, "unknown flag %s\n", flag.c_str());
-      return 2;
-    }
-  }
-
-  if (!RdmaTransport::Available()) {
-    std::fprintf(stderr, "no RDMA device\n");
-    return 1;
-  }
-
-  const std::string dir = (fs::temp_directory_path() / "dfkvleasebench")
-                              .string();
-  fs::remove_all(dir);
-  fs::create_directories(dir);
-
-  // Server fixture (same shape as the loopback suite's node: KvNodeServer
-  // owns disk, RdmaServer serves data). A hard receive budget that a
-  // legacy 32MiB-class * resident connection model could not fit makes the
-  // contrast part of correctness: legacy runs must hit oversize/busy
-  // rejections, lease runs must pass.
-  setenv("DFKV_RDMA_POOL_MAX", "2048", 1);  // let every client keep its conn
-  setenv("DFKV_RDMA_RECV_SEGMENT_SIZE", std::to_string(4ull << 30).c_str(), 1);
-  setenv("DFKV_RDMA_RECV_CHUNK_BYTES", std::to_string(256ull << 20).c_str(), 1);
-  setenv("DFKV_RDMA_MAX_BLOCK_BYTES", std::to_string(1ull << 30).c_str(), 1);
-  setenv("DFKV_RDMA_DEPTH", std::to_string(depth).c_str(), 1);
-  setenv("DFKV_RDMA_INLINE_PUT_MAX_BYTES",
-         std::to_string(inline_bytes).c_str(), 1);
-  setenv("DFKV_RDMA_ENDPOINT_CACHE_MAX", "4096", 1);
-
-  auto srv = std::make_unique<KvNodeServer>(dir, 8ull << 30);
-  if (srv->Start(0) != Status::kOk) {
-    std::fprintf(stderr, "storage node failed to start\n");
-    return 1;
-  }
-  auto rsrv = std::make_unique<RdmaServer>(
-      [&srv](uint8_t op, const BlockKey& key, uint64_t off, uint64_t len,
-             const char* pl, uint64_t pll, std::string* out,
-             size_t* value_len) {
-        return srv->ProcessRequestForKey(op, key, off, len, pl, pll, out,
-                                         value_len);
-      },
-      1ull << 30);
-  rsrv->set_range_handler(
-      [&srv](const BlockKey& key, uint64_t off, uint64_t len, char* io_buf,
-             size_t cap, const char** out_data, size_t* out_len,
-             size_t* value_len) {
-        return srv->RangeDirectForKey(key, off, len, io_buf, cap, out_data,
-                                      out_len, value_len);
-      });
-  rsrv->set_cache_direct_handler(
-      [&srv](const BlockKey& key, char* data, size_t len, size_t cap) {
-        return srv->CacheDirectForKey(key, data, len, cap);
-      });
-  if (rsrv->Start(0) != Status::kOk) {
-    std::fprintf(stderr, "rdma server failed to start\n");
-    return 1;
-  }
-  const std::string addr = "127.0.0.1:" + std::to_string(rsrv->port());
-
-  std::vector<std::string> payload_large(1, std::string(obj_size, '\0'));
-  for (size_t i = 0; i < obj_size; ++i)
-    payload_large[0][i] = static_cast<char>((i * 131 + 11) & 0xFF);
-  std::string payload_small(256ull << 10, '\0');
-  for (size_t i = 0; i < payload_small.size(); ++i)
-    payload_small[i] = static_cast<char>((i * 7 + 3) & 0xFF);
-
-  std::atomic<size_t> put_ok{0}, put_fail{0};
-  std::array<std::atomic<size_t>, 8> status_counts{};
-  std::atomic<uint64_t> put_bytes{0};
-  const auto t0 = std::chrono::steady_clock::now();
-  std::vector<std::thread> workers;
-  workers.reserve(clients);
-  for (size_t c = 0; c < clients; ++c) {
-    workers.emplace_back([&, c] {
-      RdmaTransport rt(1ull << 30);
-      KVClient client({{"n", addr}}, "bench/model-kda", &rt);
-      for (size_t o = 0; o < ops_per_client; ++o) {
-        const bool small = small_ratio_pct != 0 &&
-                           (o * 100 / ops_per_client) < small_ratio_pct;
-        const std::string key = "c" + std::to_string(c) + "/o" +
-                                std::to_string(o);
-        const std::string& payload = small ? payload_small : payload_large[0];
-        if (client.Put(key, payload.data(), payload.size())) {
-          put_ok.fetch_add(1, std::memory_order_relaxed);
-          put_bytes.fetch_add(payload.size(), std::memory_order_relaxed);
-        } else {
-          put_fail.fetch_add(1, std::memory_order_relaxed);
-          // Failure forensics: bucket the raw transport status once so a
-          // fan-out regression names its stage (kIOError=4 kQuota=3
-          // kFull=2 kInvalid=5).
-          std::vector<CacheSrc> src{
-              CacheSrc{ToBlockKey("bench/model-kda", key),
-                       const_cast<char*>(payload.data()), payload.size()}};
-          const Status st = rt.CacheFrom(addr, src)[0];
-          size_t code = static_cast<size_t>(st);
-          if (code >= status_counts.size()) code = status_counts.size() - 1;
-          status_counts[code].fetch_add(1, std::memory_order_relaxed);
-        }
+struct Worker {
+  std::unique_ptr<dfkv::RdmaTransport> transport;
+  std::unique_ptr<dfkv::KVClient> client;
+  std::vector<char> value;
+  std::vector<char> readback;
+};
+}
+int main(int argc, char** argv) {
+  try {
+    std::string member, metrics, key_seed = "leasebench-"+std::to_string(getpid());
+    size_t clients=16, bytes=32ull<<20, ops=8, idle_ms=2000, sample_ms=50,
+           pid=0, sg_segs=1;
+    for (int i=1; i<argc; ++i) {
+      const std::string flag(argv[i]);
+      if (flag=="--help") {
+        std::cout << "dfkvleasebench --member IP:RDMA_PORT --metrics IP:PORT --server-pid PID "
+          "[--clients N --obj-size 32MiB --ops N --sg-segs N --idle-ms N --sample-ms N --key-seed S]\n"
+          "Configure DFKV_RDMA_DEV/MAX_BLOCK_BYTES/INLINE_PUT_MAX_BYTES in the environment.\n";
+        return 0;
       }
-    });
-  }
-  for (auto& t : workers) t.join();
-  const double seconds =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
-          .count();
-
-  const long resident_data =
-      MetricOf(*rsrv, "dfkv_rdma_connection_bytes{class=\"data\"}",
-               "dfkv_rdma_connection_bytes");
-  const long resident_total =
-      MetricOf(*rsrv, "dfkv_rdma_recv_segment_used_bytes");
-  const long lease_ops = MetricOf(*rsrv, "dfkv_rdma_leaseput_ops_total");
-  const long lease_active = MetricOf(*rsrv, "dfkv_rdma_leaseput_active");
-  const long lease_bytes_active =
-      MetricOf(*rsrv, "dfkv_rdma_leaseput_bytes_active");
-  const long busy = MetricOf(*rsrv, "dfkv_rdma_leaseput_busy_rejects_total");
-  const long conn_errors =
-      MetricOf(*rsrv, "dfkv_rdma_completion_errors");
-  const long v2conns = MetricOf(*rsrv, "dfkv_rdma_v2_conns_opened_total");
-  const std::string srv_metrics = srv->MetricsText();
-  auto line_value = [&srv_metrics](const std::string& key) -> long {
-    const size_t at = srv_metrics.rfind(key + " ");
-    if (at == std::string::npos) return -1;
-    const size_t sp = srv_metrics.find(' ', at);
-    if (sp == std::string::npos) return -1;
-    return std::strtol(srv_metrics.c_str() + sp + 1, nullptr, 10);
-  };
-  const long srv_put_io = line_value(
-      "dfkv_errors_total{op=\"put\",status=\"io\"}");
-  const long srv_invalid = line_value(
-      "dfkv_errors_total{op=\"any\",status=\"invalid\"}");
-  const long conns = MetricOf(*rsrv, "dfkv_rdma_active_conns");
-  const long completion_errors =
-      MetricOf(*rsrv, "dfkv_rdma_completion_errors_total");
-
-  const long evictions = MetricOf(*rsrv, "dfkv_rdma_segment_evictions_total");
-  const long idle_reclaims = MetricOf(*rsrv, "dfkv_rdma_idle_reclaims_total");
-
-  std::printf(
-      "dfkvleasebench inline=%zu obj=%s clients=%zu ops/client=%zu\n"
-      "  puts ok=%zu fail=%zu bytes=%llu in %.2fs (%.1f MB/s)"
-      " fail[io=%zu quota=%zu full=%zu invalid=%zu other=%zu]\n"
-      "  server: active_conns=%ld v2_conns=%ld class-data-resident=%s "
-      "recv_used=%s leaseput_ops=%ld leaseput_active=%ld "
-      "lease_bytes_active=%s busy_rejects=%ld "
-      "completion_errors=%ld evictions=%ld idle_reclaims=%ld"
-      " srv_put_io=%ld srv_invalid=%ld\n",
-      inline_bytes, BytesHuman(obj_size).c_str(), clients, ops_per_client,
-      put_ok.load(), put_fail.load(), put_bytes.load(), seconds,
-      put_bytes.load() / seconds / (1ull << 20),
-      status_counts[4].load(), status_counts[3].load(),
-      status_counts[2].load(), status_counts[5].load(),
-      status_counts[6].load() + status_counts[7].load(), conns, v2conns,
-      BytesHuman(resident_data < 0 ? 0 : resident_data).c_str(),
-      BytesHuman(resident_total < 0 ? 0 : resident_total).c_str(), lease_ops,
-      lease_active,
-      BytesHuman(lease_bytes_active < 0 ? 0 : lease_bytes_active).c_str(),
-      busy, completion_errors, evictions, idle_reclaims, srv_put_io,
-      srv_invalid);
-
-  rsrv->Stop();
-  srv->Stop();
-  fs::remove_all(dir);
-  return put_fail.load() == 0 ? 0 : 1;
+      if (++i==argc) throw std::runtime_error("missing value for "+flag);
+      if (flag=="--member") member=argv[i];
+      else if (flag=="--metrics") metrics=argv[i];
+      else if (flag=="--key-seed") key_seed=argv[i];
+      else if (flag=="--clients") clients=Size(argv[i]);
+      else if (flag=="--obj-size") bytes=Size(argv[i]);
+      else if (flag=="--ops") ops=Size(argv[i]);
+      else if (flag=="--sg-segs") sg_segs=Size(argv[i]);
+      else if (flag=="--server-pid") pid=Size(argv[i]);
+      else if (flag=="--idle-ms") idle_ms=Size(argv[i]);
+      else if (flag=="--sample-ms") sample_ms=Size(argv[i]);
+      else throw std::runtime_error("unknown option: "+flag);
+    }
+    if (member.empty() || metrics.empty() || !pid || !clients || clients>1024 ||
+        !bytes || !ops || !sg_segs || sg_segs>bytes || !sample_ms)
+      throw std::runtime_error("invalid benchmark geometry; see --help");
+    if (!dfkv::RdmaTransport::Available()) throw std::runtime_error("no RDMA device");
+    std::vector<Worker> workers(clients);
+    std::vector<std::thread> threads;
+    std::mutex mu;
+    std::condition_variable cv;
+    size_t initialized=0;
+    bool start=false;
+    std::atomic<size_t> done{0}, failures{0}, corrupt{0};
+    std::array<std::atomic<uint64_t>, 16> statuses{};
+    std::atomic<uint64_t> delivered{0};
+    for (size_t c=0; c<clients; ++c) {
+      threads.emplace_back([&, c] {
+        bool announced=false;
+        try {
+          auto& w=workers[c];
+          w.transport=std::make_unique<dfkv::RdmaTransport>();
+          w.client=std::make_unique<dfkv::KVClient>(
+              std::vector<std::pair<std::string,std::string>>{{"bench",member}},
+              "leasebench",w.transport.get());
+          w.value.resize(bytes); w.readback.resize(bytes);
+          for (size_t i=0;i<bytes;++i) w.value[i]=static_cast<char>((i*131+c*17)&255);
+          { std::unique_lock<std::mutex> lk(mu); ++initialized; announced=true;
+            cv.notify_all(); cv.wait(lk,[&]{return start;}); }
+          for (size_t o=0;o<ops;++o) {
+            const auto key=dfkv::ToBlockKey("leasebench",key_seed+"/"+std::to_string(c)+"/"+std::to_string(o));
+            dfkv::Status status;
+            if (sg_segs==1) {
+              status=w.transport->CacheFrom(member,{{key,w.value.data(),bytes}})[0];
+            } else {
+              dfkv::CacheSrcMulti source; source.key=key;
+              for(size_t s=0;s<sg_segs;++s) {
+                const size_t begin=s*bytes/sg_segs,end=(s+1)*bytes/sg_segs;
+                source.payloads.emplace_back(w.value.data()+begin,end-begin);
+              }
+              status=w.transport->CacheFromMulti(member,{source})[0];
+            }
+            const size_t index=static_cast<size_t>(status);
+            statuses[std::min(index,statuses.size()-1)].fetch_add(1);
+            if(status!=dfkv::Status::kOk) { ++failures; continue; }
+            delivered.fetch_add(bytes);
+            std::vector<uint64_t> lengths;
+            std::fill(w.readback.begin(),w.readback.end(),0);
+            const auto got=w.transport->RangeInto(member,{key},{{w.readback.data(),bytes}},&lengths);
+            if(got[0]!=dfkv::Status::kOk || lengths.size()!=1 || lengths[0]!=bytes ||
+               std::memcmp(w.value.data(),w.readback.data(),bytes)!=0) ++corrupt;
+          }
+        } catch(const std::exception& e) {
+          ++failures;
+          std::lock_guard<std::mutex> lk(mu);
+          std::cerr << "worker " << c << ": " << e.what() << '\n';
+          if(!announced) {++initialized; cv.notify_all();}
+        }
+        ++done;
+      });
+    }
+    { std::unique_lock<std::mutex> lk(mu); cv.wait(lk,[&]{return initialized==clients;}); }
+    const auto begin=Clock::now();
+    uint64_t peak_rss=0,peak_committed=0,peak_used=0;
+    size_t samples=0;
+    bool sampling_failed=false;
+    auto sample=[&](const char* phase) {
+      const auto body=Scrape(metrics);
+      const auto rss=Rss(pid);
+      const auto committed=Metric(body,"dfkv_rdma_recv_segment_bytes");
+      const auto used=Metric(body,"dfkv_rdma_recv_segment_used_bytes");
+      const auto connections=Metric(body,"dfkv_rdma_active_conns");
+      peak_rss=std::max(peak_rss,rss); peak_committed=std::max(peak_committed,committed);
+      peak_used=std::max(peak_used,used); ++samples;
+      std::cout << "{\"phase\":\""<<phase<<"\",\"ms\":"
+        <<std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-begin).count()
+        <<",\"server_rss_bytes\":"<<rss<<",\"committed_bytes\":"<<committed
+        <<",\"used_bytes\":"<<used<<",\"connections\":"<<connections<<"}\n";
+    };
+    try { sample("before"); } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';sampling_failed=true;}
+    {std::lock_guard<std::mutex> lk(mu); start=true; cv.notify_all();}
+    while(done.load()<clients) {
+      try {sample("active");} catch(const std::exception& e) {std::cerr<<e.what()<<'\n';sampling_failed=true;}
+      std::this_thread::sleep_for(std::chrono::milliseconds(sample_ms));
+    }
+    for(auto& t:threads)t.join();
+    const double seconds=std::chrono::duration<double>(Clock::now()-begin).count();
+    // Worker owns transport/client beyond thread exit: connections remain live
+    // through the idle window, allowing MR/chunk reclamation to be observed.
+    const auto idle_end=Clock::now()+std::chrono::milliseconds(idle_ms);
+    do {
+      try {sample("idle_clients_alive");} catch(const std::exception& e) {std::cerr<<e.what()<<'\n';sampling_failed=true;}
+      std::this_thread::sleep_for(std::chrono::milliseconds(sample_ms));
+    } while(Clock::now()<idle_end);
+    std::cout << "{\"summary\":true,\"clients\":"<<clients<<",\"operations\":"<<clients*ops
+      <<",\"put_failures\":"<<failures<<",\"readback_failures\":"<<corrupt
+      <<",\"put_bytes\":"<<delivered<<",\"workload_wall_seconds\":"<<seconds
+      <<",\"peak_server_rss_bytes\":"<<peak_rss<<",\"peak_committed_bytes\":"<<peak_committed
+      <<",\"peak_used_bytes\":"<<peak_used<<",\"samples\":"<<samples<<",\"statuses\":[";
+    for(size_t i=0;i<statuses.size();++i)std::cout<<(i?",":"")<<statuses[i];
+    std::cout << "]}\n";
+    return failures || corrupt || sampling_failed ? 1 : 0;
+  } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 2;}
 }

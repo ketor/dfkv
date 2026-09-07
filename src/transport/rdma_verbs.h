@@ -165,6 +165,13 @@ class RcEndpoint {
   // Register a shared server receive segment for remote PUT writes and return
   // the MR carrying both the local lkey and peer-visible rkey.
   ibv_mr* RegisterRemoteRegion(void* base, size_t size);
+  // Exact per-operation remote WRITE capability. Never enters the pool cache:
+  // a later lease at the same VA must not inherit an earlier operation's rkey.
+  // The backing allocation must outlive this endpoint, unless explicitly
+  // revoked with ReleaseLeaseWriteRegion before returning it to its pool.
+  ibv_mr* RegisterLeaseWriteRegion(void* base, size_t size);
+  void ReleaseLeaseWriteRegion(ibv_mr* mr);
+  static uint64_t LeaseWriteMrActive();
   // Register an exact connection-private source arena for initiator READ.
   // Unlike RegisterRemoteRegion this never widens to a shared segment MR.
   ibv_mr* RegisterRemoteReadRegion(void* base, size_t size);
@@ -338,6 +345,7 @@ class RcEndpoint {
   std::vector<ibv_mr*> transient_mr_;
   std::vector<ibv_mr*> connection_mr_;
   std::vector<ibv_mw*> connection_mw_;
+  std::vector<ibv_mr*> lease_write_mr_;
   QpInfo local_;
   std::atomic<bool> responder_cancelled_{false};
   size_t pending_responder_writes_ = 0;  // responder owner thread only

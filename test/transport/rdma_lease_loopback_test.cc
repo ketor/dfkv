@@ -17,6 +17,12 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <chrono>
+#include <condition_variable>
+#include <future>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -26,12 +32,50 @@
 namespace fs = std::filesystem;
 using namespace dfkv;  // NOLINT
 
+namespace dfkv {
+class RdmaLeaseServerTestPeer {
+ public:
+  static size_t Trim(RdmaServer& server) {
+    return server.recv_segments_.TrimIdle(1);
+  }
+  static void BeforeTeardown(RdmaServer& server, std::function<void()> hook) {
+    server.before_endpoint_teardown_for_test_ = std::move(hook);
+  }
+};
+}  // namespace dfkv
+
 namespace {
 
 constexpr size_t kMsg = 64ull << 20;  // like production rings' --max-msg
 
 bool HaveRdma() { return RdmaTransport::Available(); }
 std::string SelfHdr() { return "test/model"; }
+
+class RdmaLeaseLoopback : public ::testing::Test {
+ protected:
+  RdmaLeaseLoopback() {
+    for (const char* key : {"DFKV_RDMA_MAX_BLOCK_BYTES",
+                            "DFKV_RDMA_RECV_SEGMENT_SIZE",
+                            "DFKV_RDMA_RECV_CHUNK_BYTES",
+                            "DFKV_RDMA_INLINE_PUT_MAX_BYTES",
+                            "DFKV_RDMA_RECV_CHUNK_IDLE_MS",
+                            "DFKV_RDMA_IDLE_MS",
+                            "DFKV_RDMA_DEPTH"}) {
+      const char* value = std::getenv(key);
+      saved_.emplace_back(key, value ? std::optional<std::string>(value)
+                                    : std::nullopt);
+    }
+    setenv("DFKV_RDMA_RECV_CHUNK_IDLE_MS", "0", 1);
+    setenv("DFKV_RDMA_IDLE_MS", "0", 1);
+  }
+  ~RdmaLeaseLoopback() override {
+    for (const auto& [key, value] : saved_) {
+      if (value) setenv(key.c_str(), value->c_str(), 1);
+      else unsetenv(key.c_str());
+    }
+  }
+  std::vector<std::pair<std::string, std::optional<std::string>>> saved_;
+};
 
 // rfind lands on the VALUE line emitted after the # HELP / # TYPE lines,
 // exactly like rdma_loopback_test's CounterVal.
@@ -105,9 +149,107 @@ std::string Value(size_t len, uint8_t seed) {
   return v;
 }
 
+// Raw v2 peer keeps one live QP while tests retain or deliberately replay a
+// lease capability. No client retries may hide a server ownership violation.
+struct LeasePeer {
+  rdma::RcEndpoint ep;
+  rdma::RecvSegmentInfo resident;
+  bool Open(const LeaseNode& node) {
+    const auto& dev = node.rsrv->DeviceNames().front();
+    if (!ep.Open(dev.c_str(), rdma::kV2ControlCap, 1)) return false;
+    int fd = net::Dial(node.addr, 10000, 10000);
+    if (fd < 0) return false;
+    char frame[rdma::kDevNameBytes], mine[rdma::kQpInfoBytes],
+        peer[rdma::kQpInfoBytes], ready[rdma::kV2LegacyReadinessBytes];
+    rdma::EncodeDevFrame(dev, (1u << 20) |
+                                 rdma::kDevFrameRequestLeasedPut, frame);
+    auto info = ep.Local();
+    info.depth = 1;
+    info.protocol_version = rdma::kDevProtoV2;
+    rdma::SerializeQpInfo(info, mine);
+    uint64_t token = 0;
+    bool ok = net::WriteAll(fd, frame, sizeof(frame)) &&
+              net::WriteAll(fd, mine, sizeof(mine)) &&
+              net::ReadAll(fd, peer, sizeof(peer)) &&
+              ep.Connect(rdma::ParseQpInfo(peer)) &&
+              net::ReadAll(fd, ready, sizeof(ready)) &&
+              rdma::DecodeV2Readiness(ready, sizeof(ready), false,
+                                      &resident, &token);
+    ::close(fd);
+    return ok;
+  }
+  bool Response(Status* status, uint64_t* bytes) {
+    bool sent = false, received = false;
+    while (!sent || !received) {
+      ibv_wc wc{};
+      if (ep.WaitComp(&wc, 1, 10000) != 1 || wc.status != IBV_WC_SUCCESS)
+        return false;
+      if (wc.opcode == IBV_WC_RECV) {
+        if (wc.byte_len < kRespPrefix ||
+            !DecodeRespVersion(ep.rbuf(0), kNativeProtoRdmaV2,
+                               status, bytes) ||
+            wc.byte_len != kRespPrefix + *bytes)
+          return false;
+        received = true;
+      } else {
+        sent = true;
+      }
+    }
+    return true;
+  }
+  bool Lease(const BlockKey& key, size_t size, Status* status,
+             rdma::LeasePutReady* lease) {
+    EncodeReqVersion(ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kLeasePut,
+                     key, 0, 0, size);
+    uint64_t bytes = 0;
+    if (!ep.PostRecv(0) || !ep.PostSend(0, kReqPrefix) ||
+        !Response(status, &bytes)) return false;
+    return *status != Status::kOk ||
+           (bytes == rdma::kLeasePutReadyBytes &&
+            rdma::DecodeLeasePutReady(ep.rbuf(0) + kRespPrefix, lease));
+  }
+  bool Put(const BlockKey& key, const rdma::LeasePutReady& lease,
+           const std::string& value, bool multi = false) {
+    ibv_mr* mr = ep.RegisterTransient(
+        const_cast<char*>(value.data()), value.size(), false);
+    if (!mr) return false;
+    const size_t windows = multi ? 2 : 1;
+    size_t offset = 0;
+    for (size_t window = 0; window < windows; ++window) {
+      const size_t size = window + 1 == windows
+                              ? value.size() - offset : value.size() / 2;
+      const size_t header = window == 0 ? kReqPrefix : 0;
+      EncodeReqVersion(ep.sbuf(0), kNativeProtoRdmaV2, WireOp::kCache,
+                       key, multi ? rdma::kV2MultiWrPutMagic : 0,
+                       multi ? windows : 0, value.size());
+      std::vector<std::pair<const void*, uint32_t>> segments;
+      std::vector<ibv_mr*> mrs;
+      const size_t first = multi && ep.max_sge() >= 3 ? size / 2 : size;
+      segments.emplace_back(value.data() + offset, first);
+      mrs.push_back(mr);
+      if (first != size) {
+        segments.emplace_back(value.data() + offset + first, size - first);
+        mrs.push_back(mr);
+      }
+      const uint64_t address = lease.write_base + rdma::kV2DataOffset +
+                               offset - header;
+      Status status = Status::kIOError;
+      uint64_t bytes = 0;
+      if (!ep.PostRecv(0) ||
+          !ep.PostWriteImmScatterMulti(0, header, segments, mrs, address,
+                                       lease.rkey, lease.slot) ||
+          !Response(&status, &bytes) || status != Status::kOk)
+        return false;
+      offset += size;
+    }
+    ep.ReleaseTransient(mr);
+    return true;
+  }
+};
+
 }  // namespace
 
-TEST(RdmaLeaseLoopback, LargeObjectRoundTripsThroughStagedLease) {
+TEST_F(RdmaLeaseLoopback, LargeObjectRoundTripsThroughStagedLease) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   setenv("DFKV_RDMA_INLINE_PUT_MAX_BYTES", std::to_string(1ull << 20).c_str(),
          1);
@@ -128,7 +270,7 @@ TEST(RdmaLeaseLoopback, LargeObjectRoundTripsThroughStagedLease) {
   EXPECT_EQ(out, v);
 }
 
-TEST(RdmaLeaseLoopback, InlineObjectKeepsResidentPath) {
+TEST_F(RdmaLeaseLoopback, InlineObjectKeepsResidentPath) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   setenv("DFKV_RDMA_INLINE_PUT_MAX_BYTES", std::to_string(1ull << 20).c_str(),
          1);
@@ -146,7 +288,7 @@ TEST(RdmaLeaseLoopback, InlineObjectKeepsResidentPath) {
   EXPECT_EQ(out, v);
 }
 
-TEST(RdmaLeaseLoopback, MixedBatchSplitAcrossBothBuckets) {
+TEST_F(RdmaLeaseLoopback, MixedBatchSplitAcrossBothBuckets) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   setenv("DFKV_RDMA_INLINE_PUT_MAX_BYTES", std::to_string(1ull << 20).c_str(),
          1);
@@ -175,7 +317,7 @@ TEST(RdmaLeaseLoopback, MixedBatchSplitAcrossBothBuckets) {
   EXPECT_GT(CounterOf(*node.rsrv, "dfkv_rdma_leaseput_ops_total"), 0);
 }
 
-TEST(RdmaLeaseLoopback, MultipleLargeObjectsConcurrentWindows) {
+TEST_F(RdmaLeaseLoopback, MultipleLargeObjectsConcurrentWindows) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   setenv("DFKV_RDMA_INLINE_PUT_MAX_BYTES", std::to_string(1ull << 20).c_str(),
          1);
@@ -210,7 +352,7 @@ TEST(RdmaLeaseLoopback, MultipleLargeObjectsConcurrentWindows) {
   }
 }
 
-TEST(RdmaLeaseLoopback, DisabledThresholdKeepsLegacyBehavior) {
+TEST_F(RdmaLeaseLoopback, DisabledThresholdKeepsLegacyBehavior) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   setenv("DFKV_RDMA_INLINE_PUT_MAX_BYTES", "0", 1);
   // Without the lease datapath the object ceiling stays the declared block
@@ -239,4 +381,154 @@ TEST(RdmaLeaseLoopback, DisabledThresholdKeepsLegacyBehavior) {
   std::string out(v.size(), '\0');
   ASSERT_TRUE(c.Get("legacy-big", &out[0], out.size()));
   EXPECT_EQ(out, v);
+}
+
+TEST_F(RdmaLeaseLoopback, RetiredKeyCannotOverwriteReusedLease) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  LeaseNode node("revoke");
+  const std::string value = Value(2u << 20, 0x62);
+  std::string late(64, 'X');
+  LeasePeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  const BlockKey key = ToBlockKey(SelfHdr(), "reused");
+  rdma::LeasePutReady old, current;
+  Status status = Status::kIOError;
+  ASSERT_TRUE(peer.Lease(key, value.size(), &status, &old));
+  ASSERT_EQ(status, Status::kOk);
+  ASSERT_TRUE(peer.Put(key, old, value));
+  ASSERT_TRUE(peer.Lease(key, value.size(), &status, &current));
+  ASSERT_EQ(status, Status::kOk);
+  ASSERT_EQ(current.write_base, old.write_base)
+      << "the allocator must actually recycle the tested range";
+  char* target = reinterpret_cast<char*>(current.write_base) +
+                 rdma::kV2DataOffset;
+  std::memset(target, 0x5a, late.size());
+  ibv_mr* mr = peer.ep.RegisterTransient(late.data(), late.size(), false);
+  ASSERT_NE(mr, nullptr);
+  ASSERT_TRUE(peer.ep.PostWrite(0, late.data(), late.size(), mr,
+                                old.write_base + rdma::kV2DataOffset,
+                                old.rkey));
+  ibv_wc wc{};
+  ASSERT_EQ(peer.ep.WaitComp(&wc, 1, 10000), 1);
+  EXPECT_NE(wc.status, IBV_WC_SUCCESS)
+      << "a completed operation's rkey must no longer authorize DMA";
+  EXPECT_EQ(std::string(target, late.size()), std::string(late.size(), '\x5a'));
+  peer.ep.ReleaseTransient(mr);
+}
+
+TEST_F(RdmaLeaseLoopback, LiveConnectionTrimReallocationBoundsMrs) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  LeaseNode node("trim");
+  // Larger than the initial chunk: every cycle grows and then trims a chunk,
+  // while the very same QP and resident receive lease remain alive.
+  const std::string value = Value(40u << 20, 0x29);
+  LeasePeer peer;
+  ASSERT_TRUE(peer.Open(node));
+  const auto pool_mrs = rdma::RcEndpoint::PoolMrActiveRegistrations();
+  const auto write_mrs = rdma::RcEndpoint::LeaseWriteMrActive();
+  const long committed = CounterOf(*node.rsrv,
+                                    "dfkv_rdma_recv_segment_bytes");
+  for (int cycle = 0; cycle != 3; ++cycle) {
+    const BlockKey key = ToBlockKey(SelfHdr(), "trim-" + std::to_string(cycle));
+    Status status = Status::kIOError;
+    rdma::LeasePutReady lease;
+    ASSERT_TRUE(peer.Lease(key, value.size(), &status, &lease));
+    ASSERT_EQ(status, Status::kOk);
+    EXPECT_EQ(rdma::RcEndpoint::LeaseWriteMrActive(), write_mrs + 1);
+    ASSERT_TRUE(peer.Put(key, lease, value, true));
+    EXPECT_EQ(rdma::RcEndpoint::LeaseWriteMrActive(), write_mrs);
+    EXPECT_EQ(rdma::RcEndpoint::PoolMrActiveRegistrations(), pool_mrs)
+        << "a live connection must not retain staging chunk registrations";
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    EXPECT_GE(RdmaLeaseServerTestPeer::Trim(*node.rsrv), lease.lease_bytes);
+    EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_recv_segment_bytes"),
+              committed);
+    std::string stored;
+    size_t stored_len = 0;
+    ASSERT_EQ(node.srv->ProcessRequestForKey(
+                  static_cast<uint8_t>(WireOp::kRange), key, 0, value.size(),
+                  nullptr, 0, &stored, &stored_len), Status::kOk);
+    EXPECT_EQ(stored, value) << "every SG window must survive trim/reallocation";
+  }
+}
+
+TEST_F(RdmaLeaseLoopback, ExhaustionRetainsLiveLeasesUntilCompletion) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  LeaseNode node("pressure");
+  const std::string value = Value(64u << 20, 0x49);
+  LeasePeer first, second, third;
+  ASSERT_TRUE(first.Open(node));
+  ASSERT_TRUE(second.Open(node));
+  ASSERT_TRUE(third.Open(node));
+  const BlockKey key = ToBlockKey(SelfHdr(), "pressure");
+  rdma::LeasePutReady a, b, c;
+  Status status = Status::kIOError;
+  ASSERT_TRUE(first.Lease(key, value.size(), &status, &a));
+  ASSERT_EQ(status, Status::kOk);
+  ASSERT_TRUE(second.Lease(key, value.size(), &status, &b));
+  ASSERT_EQ(status, Status::kOk);
+  ASSERT_TRUE(third.Lease(key, value.size(), &status, &c));
+  ASSERT_EQ(status, Status::kCacheFull);
+  EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_leaseput_active"), 2);
+  EXPECT_LE(CounterOf(*node.rsrv, "dfkv_rdma_recv_segment_bytes"),
+            192l << 20);
+  ASSERT_TRUE(first.Put(key, a, value, true));
+  // The rejected QP stays usable; a genuine completion, not a timeout/retry
+  // policy, makes exactly one range available to it.
+  ASSERT_TRUE(third.Lease(key, value.size(), &status, &c));
+  ASSERT_EQ(status, Status::kOk);
+  EXPECT_EQ(c.write_base, a.write_base);
+  ASSERT_TRUE(third.Put(key, c, value, true));
+  ASSERT_TRUE(second.Put(key, b, value, true));
+  EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_leaseput_active"), 0);
+}
+
+TEST_F(RdmaLeaseLoopback, TeardownHoldsRangeUntilDelayedWriteIsFenced) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  LeaseNode node("teardown");
+  std::string late(64, 'D');
+  LeasePeer peer;
+  std::promise<void> entered, release;
+  auto entered_future = entered.get_future();
+  auto release_future = release.get_future().share();
+  ASSERT_TRUE(peer.Open(node));
+  rdma::LeasePutReady lease;
+  Status status = Status::kIOError;
+  ASSERT_TRUE(peer.Lease(ToBlockKey(SelfHdr(), "abandoned"), 40u << 20,
+                          &status, &lease));
+  ASSERT_EQ(status, Status::kOk);
+  const long held = CounterOf(*node.rsrv, "dfkv_rdma_recv_segment_used_bytes");
+  ibv_mr* mr = peer.ep.RegisterTransient(late.data(), late.size(), false);
+  ASSERT_NE(mr, nullptr);
+  RdmaLeaseServerTestPeer::BeforeTeardown(
+      *node.rsrv, [&] { entered.set_value(); release_future.wait(); });
+  auto stopped = std::async(std::launch::async, [&] { node.rsrv->Stop(); });
+  const bool at_fence = entered_future.wait_for(std::chrono::seconds(10)) ==
+                        std::future_status::ready;
+  if (at_fence) {
+    // Serve has exited, but destruction is gated before QP teardown. This real
+    // delayed WRITE still succeeds and therefore must target owned storage.
+    EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_leaseput_active"), 1);
+    EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_recv_segment_used_bytes"), held);
+    const bool posted = peer.ep.PostWrite(
+        0, late.data(), late.size(), mr,
+        lease.write_base + rdma::kV2DataOffset, lease.rkey);
+    EXPECT_TRUE(posted);
+    if (posted) {
+      ibv_wc wc{};
+      const int got = peer.ep.WaitComp(&wc, 1, 10000);
+      EXPECT_EQ(got, 1);
+      if (got == 1) EXPECT_EQ(wc.status, IBV_WC_SUCCESS);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    EXPECT_EQ(RdmaLeaseServerTestPeer::Trim(*node.rsrv), 0u)
+        << "unfenced inbound DMA must prevent idle trim";
+  }
+  release.set_value();  // always unblock teardown, including failed expectations
+  stopped.get();
+  ASSERT_TRUE(at_fence);
+  EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_leaseput_active"), 0);
+  EXPECT_EQ(CounterOf(*node.rsrv, "dfkv_rdma_leaseput_bytes_active"), 0);
+  EXPECT_EQ(rdma::RcEndpoint::LeaseWriteMrActive(), 0u);
+  peer.ep.ReleaseTransient(mr);
 }

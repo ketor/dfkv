@@ -158,6 +158,7 @@ class RdmaTransport : public Transport {
     // peer advertises the capability; the request bit is then echoed on the
     // bootstrap frame.
     bool request_leased_put = false;
+    size_t leased_inline_bytes = 0;
     RailMask excluded;
     std::shared_ptr<const rdma::PeerRailSnapshot> peer;
   };
@@ -227,6 +228,14 @@ class RdmaTransport : public Transport {
   // Scalar and SG operations share data endpoints. An acquired connection is
   // never concurrently reused, while operation framing remains self-describing.
   std::unordered_map<std::string, std::vector<Conn*>> pool_;
+  // Optional capability observations belong to one peer publication, just like
+  // pooled endpoints. A topology update invalidates both at the same boundary.
+  struct PeerPutCapability {
+    std::string peer_id;
+    uint64_t publication = 0;
+    bool leased_put = false;
+  };
+  std::unordered_map<std::string, PeerPutCapability> peer_put_capabilities_;
   // Exist/Remove/Members remain isolated from payload transfers.
   std::vector<size_t> IdleDataBounds(const std::string& node) const;
   std::vector<size_t> IdleDataDepths(const std::string& node) const;

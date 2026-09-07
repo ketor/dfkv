@@ -102,6 +102,7 @@ add_executable(dfkv_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_bench_main.
 target_link_libraries(dfkv_bench PRIVATE dfkv_core)
 add_executable(dfkv_discover_smoke ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_discover_smoke_main.cc)
 target_link_libraries(dfkv_discover_smoke PRIVATE dfkv_core)
+include(GNUInstallDirs)
 if(DFKV_WITH_RDMA)
   # In-process server+fan-out client memory benchmark; needs real verbs.
   add_executable(dfkvleasebench
@@ -115,7 +116,6 @@ endif()
 add_executable(dfkv_gpu_dedup_repro ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/dfkv_gpu_dedup_repro_main.cc)
 target_link_libraries(dfkv_gpu_dedup_repro PRIVATE dfkv_core)
 
-include(GNUInstallDirs)
 install(TARGETS dfkv dfkv_server dfkv_mds dfkv_smoke dfkvctl dfkv_bench
         dfkv_discover_smoke dfkv_gpu_dedup_repro dfkv_core
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -171,6 +171,7 @@ if(DFKV_BUILD_TESTS)
   # rdma_loopback_test needs the RDMA transport/server symbols -> RDMA build only.
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_lease_loopback_test.cc)
+  list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_lease_client_test.cc)
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/qp_depth_negotiation_test.cc)
   list(REMOVE_ITEM DFKV_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_topology_test.cc)
   # Backend semantics have dedicated tests below. Keep unrelated functional
@@ -201,12 +202,18 @@ if(DFKV_BUILD_TESTS)
     add_executable(rdma_loopback_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
     add_executable(rdma_lease_loopback_test
       ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_lease_loopback_test.cc)
+    add_executable(rdma_lease_client_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_lease_client_test.cc)
     target_link_libraries(rdma_loopback_test PRIVATE dfkv_core GTest::gtest_main)
     target_link_libraries(rdma_lease_loopback_test PRIVATE dfkv_core GTest::gtest_main)
+    target_link_libraries(rdma_lease_client_test PRIVATE dfkv_core GTest::gtest_main)
     gtest_discover_tests(rdma_loopback_test PROPERTIES
       RESOURCE_LOCK gpu_rdma_hw
       ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
     gtest_discover_tests(rdma_lease_loopback_test PROPERTIES
+      RESOURCE_LOCK gpu_rdma_hw
+      ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
+    gtest_discover_tests(rdma_lease_client_test PROPERTIES
       RESOURCE_LOCK gpu_rdma_hw
       ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
     add_executable(qp_depth_negotiation_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/qp_depth_negotiation_test.cc)
