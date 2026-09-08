@@ -427,11 +427,21 @@ struct RdmaTransport::Conn {
   }
 };
 
+// Enumerability is not usability: a hosted machine can enumerate an active
+// HCA, pass port/GID queries, and still reject the verbs objects the data
+// path builds (observed on GitHub-hosted jobs: discovery succeeds, then every
+// lease-suite server aborts with "failed to open required v2 device"). The
+// availability probe therefore constructs the minimal endpoint the suites
+// themselves require, instead of trusting discovery alone.
 bool RdmaTransport::Available() {
   const char* configured = std::getenv("DFKV_RDMA_DEV");
   const auto filter =
       ParseDeviceList(configured ? std::string(configured) : std::string());
-  return !rdma::RdmaTopology::Discover(filter).empty();
+  for (const rdma::RdmaDevInfo& device : rdma::RdmaTopology::Discover(filter)) {
+    rdma::RcEndpoint probe;
+    if (probe.Open(device.name.c_str(), rdma::kV2ControlCap, 1)) return true;
+  }
+  return false;
 }
 
 RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
