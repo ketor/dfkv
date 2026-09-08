@@ -106,6 +106,16 @@ readiness 与连接级 arena。字符串 Range/RangeMany 保持已有 staged-WRI
 及 offset/length 语义。所有路径共用显式 `DFKV_RDMA_MAX_BLOCK_BYTES` 上限；
 不能用提高 inline 阈值绕过它。control response 上限仍为 32 KiB。
 
+**GPUDirect RDMA 内存顺序（所有 device-direct GET）**：RDMA 写入 GPU 显存
+的完成队列应答只证明“已发出”，不证明数据已抵达 GPU BAR；设计指南
+（Synchronization and Memory Ordering）明确要求在任何后续 CUDA kernel
+启动前完成排序，否则 kernel 可能读到旧数据——实测表现为：对象全命中、
+字节量全对，但生成退化成空转推理。注册期会尝试置
+`CU_POINTER_ATTRIBUTE_SYNC_MEMOPS`（普通 cudaMalloc 分配可用；vLLM 的
+LBHNC/VMM `cuMemMap` 池会被驱动拒绝并告警一次），连接器在每次命中
+scatter 后执行设备同步作为排序栅栏；`DFKV_GPU_LOAD_FENCE=0` 可关闭
+栅栏，仅建议在确认无 GPUDirect 直载读路径时使用。
+
 **CUDA GET publication 要区分传输路径**：原生 RDMA scalar/SG GET 可直接 READ
 到调用方已注册的 CUDA buffer。READ 完成后才报告命中；失败会 fence QP/MR，
 防止返回后仍有 DMA，但不会撤销已完成的部分写入。调用方必须忽略 miss/error
@@ -500,7 +510,8 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
   应在对应 SGLang 源码树先执行 `git apply --check`，再应用、重建或部署受控
   overlay。不要盲目覆盖其它引擎版本。启动池描述必须包含 `INDEXER`，并对原始
   长提示执行完整进程重启后的 L3 回载与答案校验；旧的缺 indexer 缓存不能视为
-  完整命中。本轮验收使用了这项引擎修复，不能声称未修改的混合引擎已通过。
+  上游 SGLang main（2026-09-08 核对）仍未在 `build_hybrid_mamba_stack` 注册
+  INDEXER，该补丁对当前上游同样适用，并非仅限旧镜像。
 - **identity/layout 必须协同发布。** namespace 使用 SGLang runtime 给出的精确
   `model_name` + `sglang-hicache/raw-v1`；同一模型的 pool/hash/并行坐标/component
   进入 canonical object key。dfkv value 只有 raw bytes，不会检查 page size、

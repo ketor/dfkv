@@ -77,10 +77,18 @@ class ExternalCachedBlockPool:
         return None
 
 
+def _prefix_cacheable(spec):
+    """Older engines name this participates_in_prefix_caching."""
+    for name in ("prefix_cacheable", "participates_in_prefix_caching"):
+        value = getattr(spec, name, None)
+        if value is not None:
+            return bool(value)
+    return True
+
+
 class DfkvStoreCoordinator:
     """Mirror of ``HybridKVCacheCoordinator.find_longest_cache_hit`` over an
     ``ExternalCachedBlockPool``."""
-
     def __init__(
         self,
         kv_cache_groups: list[KVCacheGroupSpec],
@@ -88,11 +96,20 @@ class DfkvStoreCoordinator:
         hash_block_size: int,
         use_eagle: bool = False,
     ) -> None:
-        assert all(
-            g.kv_cache_spec.block_size % hash_block_size == 0
+
+        participating = [
+            (_prefix_cacheable(g.kv_cache_spec), g.kv_cache_spec.block_size)
             for g in kv_cache_groups
-            if getattr(_unwrap_spec(g.kv_cache_spec), "participates_in_prefix_caching", True)
-        ), "block_size must be divisible by hash_block_size"
+        ]
+        assert all(
+            size % hash_block_size == 0
+            for participates, size in participating
+            if participates
+        ), (
+            f"block_size must be divisible by hash_block_size "
+            f"(hash={hash_block_size}, scheduler={scheduler_block_size}, "
+            f"groups={participating})"
+        )
         assert scheduler_block_size % hash_block_size == 0, (
             f"scheduler_block_size ({scheduler_block_size}) must be a multiple of "
             f"hash_block_size ({hash_block_size})"
@@ -116,7 +133,7 @@ class DfkvStoreCoordinator:
         ] = []
         for i, g in enumerate(self.kv_cache_groups):
             spec = _unwrap_spec(g.kv_cache_spec)
-            if not getattr(spec, "participates_in_prefix_caching", True):
+            if not _prefix_cacheable(g.kv_cache_spec):
                 continue
             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
             assert manager_cls is not None, (

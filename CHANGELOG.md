@@ -42,6 +42,15 @@
   sidecar in hybrid Mamba stacks. Correct recurrent bytes alone do not make a
   complete DSA cache; the indexer must survive the same fresh-process reload.
 
+### GPUDirect load memory ordering
+
+- Fence device-direct GET completions with a post-batch device
+  synchronization so kernels launched after the load observe the RDMA BAR
+  writes; arming `CU_POINTER_ATTRIBUTE_SYNC_MEMOPS` at registration where the
+  driver accepts it (VMM/cuMemMap pools reject it with a one-shot warning).
+  Observed live as exact-hit loads whose generation degraded into empty
+  reasoning until reordered. `DFKV_GPU_LOAD_FENCE=0` disables the fence.
+
 
 ### SGLang Prefill-CP storage identity and physical rail affinity
 

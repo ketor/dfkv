@@ -26,6 +26,8 @@ struct CUipcMemHandle {
 };
 constexpr CUresult kCudaSuccess = 0;
 constexpr unsigned kCuIpcMemLazyEnablePeerAccess = 0x1;
+// CU_POINTER_ATTRIBUTE_SYNC_MEMOPS.
+constexpr int kCuPointerAttributeSyncMemops = 6;  // CU_POINTER_ATTRIBUTE_SYNC_MEMOPS
 constexpr int kCuPointerAttributeMemoryType = 2;    // CU_POINTER_ATTRIBUTE_MEMORY_TYPE
 constexpr int kCuPointerAttributeDeviceOrdinal = 9; // CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
 constexpr unsigned kCuMemoryTypeDevice = 2;         // CU_MEMORYTYPE_DEVICE
@@ -55,6 +57,10 @@ class CudaLib {
   bool HasCurrentCtx() const;
   int CurrentDevice() const;  // -1 without a context
   bool BindPrimaryCtx(int dev) const;
+  // Arm CU_POINTER_ATTRIBUTE_SYNC_MEMOPS on a GPUDirect destination so CUDA
+  // work submissions ordered after an RDMA completion observe the BAR writes.
+  // False when the driver lacks cuPointerSetAttribute or rejects the pointer.
+  bool SetSyncMemops(const void* p) const;
 
   CUresult (*MemHostAlloc)(void**, size_t, unsigned) = nullptr;
   CUresult (*MemFreeHost)(void*) = nullptr;
@@ -76,6 +82,12 @@ class CudaLib {
   CUresult (*IpcGetMemHandle)(CUipcMemHandle*, CUdeviceptr) = nullptr;
   CUresult (*IpcOpenMemHandle)(CUdeviceptr*, CUipcMemHandle, unsigned) = nullptr;
   CUresult (*IpcCloseMemHandle)(CUdeviceptr) = nullptr;
+  // cuPointerSetAttribute: data points at the attribute's value. Used to arm
+  // CU_POINTER_ATTRIBUTE_SYNC_MEMOPS on GPUDirect destinations so a CPU thread
+  // that observed an RDMA completion cannot launch a CUDA kernel that reads
+  // the destination before the BAR writes are memory-ordered (GPUDirect RDMA
+  // design guide, "Synchronization and Memory Ordering").
+  CUresult (*PointerSetAttribute)(void*, int, const void*) = nullptr;
 
  private:
   CudaLib() = default;
