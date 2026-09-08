@@ -52,6 +52,25 @@ from dfkv_telemetry import tracing as _tracing
 # ranks" line to be readable as a pair.
 _log = logging.getLogger(__name__)
 
+
+def _gpu_load_fence() -> None:
+    """Order GPUDirect RDMA writes before subsequent CUDA kernels.
+
+    The GPUDirect RDMA design guide (Synchronization and Memory Ordering)
+    requires that writes landing via the GPU BAR complete before the CPU
+    thread returns to launch dependent kernels; a completion reaped from the
+    CQ proves transmission, not arrival in device memory. Drivers reject
+    CU_POINTER_ATTRIBUTE_SYNC_MEMOPS on VMM/cuMemMap pools (vLLM LBHNC), so
+    the connector issues a device synchronization as the ordering fence
+    after any hit scatter. Disable with DFKV_GPU_LOAD_FENCE=0.
+    """
+    if os.environ.get("DFKV_GPU_LOAD_FENCE", "1") != "1":
+        return
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 _FLAG_IS_MLA = 0x1
 
 # Historical/default width: ConnectX-era max_sge=30 and SGE[0] carries the wire
@@ -1514,7 +1533,9 @@ class DfkvHiCache(HiCacheStorage):
             self._h, karr, klens, parr, carr, narr, n, out_hit, out_len)
         if rc != 0:
             return [0] * n, [0] * n
-        del key_owners
+        del inner_p; del inner_c; del parr; del carr; del narr
+        if any(h == 1 for h in out_hit):
+            _gpu_load_fence()
         return [out_hit[i] for i in range(n)], [int(out_len[i]) for i in range(n)]
 
     def batch_get_v1_device(self, keys, device_indices, extra_info=None) -> List[bool]:

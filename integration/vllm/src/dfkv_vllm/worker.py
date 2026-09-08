@@ -24,6 +24,7 @@ import zlib
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+
 from typing import Any, TypeVar
 
 import torch
@@ -66,7 +67,7 @@ from .client_ranks import (
     resolve_client_ranks,
     should_create_client,
 )
-from .coordinator import DfkvStoreCoordinator, _unwrap_spec
+from .coordinator import DfkvStoreCoordinator, _prefix_cacheable, _unwrap_spec
 from .data import (
     VLLM_RAW_LAYOUT,
     ChunkedTokenDatabase,
@@ -875,7 +876,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         [key_diagnostic_label(key) for key in keys[:3]],
                         e,
                     )
-
             if self.enable_kv_event and successful_events:
                 self.update_kv_event(successful_events)
         finally:
@@ -1329,6 +1329,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 for i, (hit, got_len) in enumerate(zip(hits, lens, strict=True))
                 if hit != 1 or got_len != chunk_totals[i]
             ]
+            # GPUDirect RDMA ordering fence: the CQ completion proves
+            # transmission, not arrival of the BAR writes in device memory;
+            # drivers reject CU_POINTER_ATTRIBUTE_SYNC_MEMOPS on VMM pools, so
+            # synchronize the device before the scheduler launches kernels over
+            # the loaded blocks. DFKV_GPU_LOAD_FENCE=0 disables.
+            if (
+                os.environ.get("DFKV_GPU_LOAD_FENCE", "1") == "1"
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.synchronize()
             failed_block_ids = [rotated_block_ids[i] for i in failed_indices]
             self._record_operation(
                 "load_get",
@@ -1528,7 +1538,7 @@ class DfkvStoreWorker:
             g_idx
             for g_idx, group in enumerate(kv_cache_config.kv_cache_groups)
             if isinstance(_unwrap_spec(group.kv_cache_spec), MambaSpec)
-            and getattr(_unwrap_spec(group.kv_cache_spec), "participates_in_prefix_caching", True)
+            and _prefix_cacheable(group.kv_cache_spec)
         )
         self._kv_cache_groups: list[KVCacheGroupSpec] = [
             dataclasses.replace(
@@ -1758,9 +1768,7 @@ class DfkvStoreWorker:
                 ),
                 g.kv_cache_spec.block_size,
                 hash_block_size=self.hash_block_size,
-                cacheable=getattr(
-                    _unwrap_spec(g.kv_cache_spec), "participates_in_prefix_caching", True
-                ),
+                cacheable=_prefix_cacheable(g.kv_cache_spec),
             )
             for g_idx, g in enumerate(self._kv_cache_groups)
         ]
@@ -1941,7 +1949,6 @@ class DfkvStoreWorker:
             ]
             if seg_layout:
                 db.set_seg_layout(seg_layout)
-
         # Start transfer threads
         if self.kv_role in ["kv_producer", "kv_both"]:
             ready_event_sending = threading.Event()

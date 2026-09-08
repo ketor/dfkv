@@ -250,6 +250,23 @@ bool KVClient::RegisterMemory(void* base, size_t size) {
   const DestinationMemoryKind kind =
       cuda && cuda->IsDevicePtr(base) ? DestinationMemoryKind::kDevice
                                       : DestinationMemoryKind::kHost;
+  if (kind == DestinationMemoryKind::kDevice) {
+    // GPUDirect RDMA memory-ordering contract (design guide, "Synchronization
+    // and Memory Ordering"): without ordering, a CUDA kernel launched right
+    // after an RDMA completion may read the destination before its BAR writes
+    // land (observed live as exact-hit loads with degraded generation). Arm
+    // SYNC_MEMOPS where the driver accepts it (plain cudaMalloc allocations);
+    // VMM/cuMemMap pools commonly reject it and use the load-path fence.
+    static std::once_flag sync_memops_unavailable;
+    if (!cuda->SetSyncMemops(base)) {
+      std::call_once(sync_memops_unavailable, [] {
+        DFKV_LOG_WARN(
+            "dfkv: cuPointerSetAttribute(SYNC_MEMOPS) rejected for a GPU pool "
+            "(VMM/cuMemMap allocation); GPUDirect loads rely on the "
+            "load-completion CUDA fence for memory ordering");
+      });
+    }
+  }
   if (!t_->RegisterMemory(base, size)) return false;
 
   const uintptr_t end = address + size;

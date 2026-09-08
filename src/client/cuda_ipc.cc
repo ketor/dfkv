@@ -408,6 +408,13 @@ bool PublishThroughBounce(const CudaLib* cuda, PublisherCudaState* state,
 }
 
 }  // namespace
+bool CudaLib::SetSyncMemops(const void* p) const {
+  if (!PointerSetAttribute || !p) return false;
+  const int enabled = 1;
+  return PointerSetAttribute(const_cast<void*>(p), kCuPointerAttributeSyncMemops,
+                             &enabled) == kCudaSuccess;
+}
+
 PinnedBouncePoolStats GetPinnedBouncePoolStatsForTest() {
   return ProcessBouncePool().Snapshot();
 }
@@ -448,6 +455,8 @@ bool CudaLib::Resolve() {
       SymV2(h, "cuIpcOpenMemHandle_v2", "cuIpcOpenMemHandle"));
   IpcCloseMemHandle = reinterpret_cast<CUresult (*)(CUdeviceptr)>(
       ::dlsym(h, "cuIpcCloseMemHandle"));
+  PointerSetAttribute = reinterpret_cast<CUresult (*)(void*, int, const void*)>(
+      ::dlsym(h, "cuPointerSetAttribute"));
   ctx_get_current_ = reinterpret_cast<CUresult (*)(CUcontext*)>(
       ::dlsym(h, "cuCtxGetCurrent"));
   ctx_set_current_ = reinterpret_cast<CUresult (*)(CUcontext)>(
