@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+### Operation-scoped RDMA staging
+
+- Large scalar and scatter/gather PUTs negotiate exact operation-scoped
+  staging leases. Successful STORE revokes the remote MR before recycling
+  storage; failed connections keep storage until QP/MR teardown completes.
+- Direct scalar/SG GETs negotiate dynamic pull descriptors and explicitly
+  acknowledge release after local READ completions. Supported endpoints no
+  longer reserve a connection-lifetime pull arena.
+- `DFKV_RDMA_MAX_BLOCK_BYTES` remains the common PUT/GET object ceiling.
+  `DFKV_RDMA_INLINE_PUT_MAX_BYTES` defaults to 4 MiB (0 disables leased PUT);
+  `DFKV_RDMA_DYNAMIC_PULL` defaults to enabled (0 retains legacy pull).
+  Both capabilities are optional and negotiated before connection sizing.
+- Preserve mixed-batch invalid results and first-write-wins ordering; reuse
+  pooled legacy endpoints without repeated capability-probe/QP churn.
+  Insufficient GET capacity returns `kInvalid` without cooling a healthy peer.
+- Add delayed-DMA, MR/chunk reclamation, pressure, generation, old-peer and
+  posted-READ abandonment regressions. Hardware CI invokes the lease suites
+  in SYNC/io_uring and TSan modes and distinguishes skipped hardware probes.
+- Replace the in-process memory benchmark with an external-server client:
+  retain clients during idle sampling, record sampled server RSS/committed/
+  leased peaks, and validate every successful PUT with byte-exact GET.
+  Samples are not exact hardware high-water counters.
+
+### Hybrid inference cache correctness
+
+- Revalidate vLLM's length-dependent state mask after shortening a lookup
+  prefix, and reserve the sampling tail before lookup rather than truncating
+  an already validated hit.
+- Preserve each cache group's effective physical block coverage instead of
+  treating a small attention block as a whole scheduler-LCM region. Respect
+  nonpersistent scratch pools without forcing them into the hash geometry.
+- Store every TP-sharded recurrent checkpoint under its physical rank in the
+  `mamba` pool; retain attention replica striping without eliding required
+  state-shard clients. Old collapsed state keys and affected underfilled
+  heterogeneous layouts cold-miss after the identity correction; native wire,
+  raw payload and C ABI formats remain compatible.
+- Include the tested SGLang engine patch registering the missing DSA indexer
+  sidecar in hybrid Mamba stacks. Correct recurrent bytes alone do not make a
+  complete DSA cache; the indexer must survive the same fresh-process reload.
+
+
 ### SGLang Prefill-CP storage identity and physical rail affinity
 
 - Fixed SGLang DP-attention rail affinity to use the world-group node-local

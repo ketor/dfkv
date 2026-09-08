@@ -16,7 +16,7 @@ v1.35 two-sided 数据面实测，v2 one-sided 需重测）。
 dfkv 把**控制面**与**数据面**解耦：
 
 - **控制面 = TCP + 两边 SEND/RECV**：bootstrap TCP 只交换设备/QP/receive-segment 描述；RDMA QP 的 request descriptor 有界，response buffer 显式预留 `18-byte prefix + 32 KiB`，使 32-KiB `Members` 在 control lane 完整返回；更大响应直接失败、不截断。
-- **payload = one-sided RDMA**：v2 PUT 用 `RDMA_WRITE_WITH_IMM` 直落 server 共享 receive-segment slot，GET 由 server `RDMA_WRITE` 到 client 提交的 `{addr,rkey,len}`。数据 fabric 无需 IP。
+- **payload = one-sided RDMA**：inline PUT 用 `RDMA_WRITE_WITH_IMM`；大对象通过操作级 lease 接收。直接 GET 由 client RDMA READ 拉取，支持动态 pull 的新 peer 不再保留连接级 pull arena。两项能力均独立协商，旧 peer 保留原数据面。数据 fabric 无需 IP。
 - **设备发现与拓扑**：留空时自动发现保持 `ACTIVE`-only（两端各选本地首个 port 1 `ACTIVE` HCA）；显式逗号白名单定义固定 topology，按首次出现顺序去重，server 会接纳**存在但启动时 DOWN** 的设备完成 anchor/MR 初始化并持续监控。运行期至少一条 initialized rail 健康即可承载 placement；最后一条健康 rail 丢失立即退环，0→非 0 恢复仍通过连续采样门。
 - **失败策略**：未设 `DFKV_RDMA` 时选择 TCP；一旦选择 RDMA，显式设备缺失、open/port/GID query 失败，或任一 configured rail 的 anchor、共享 receive-segment MR、RAM/user MR 初始化失败，均拒绝启动而不缩小 topology。client 配置 `DFKV_RDMA_RAIL_TIERS` 后还要求 MDS 返回完整 HLT1 peer topology；缺失/不完整或无兼容健康轨以 client-local `kNoCompatibleRail` fail closed，不切 TCP、不惩罚 peer。
 
@@ -362,11 +362,12 @@ journalctl -u dfkv -n 10 --no-pager
 > `kNoCompatibleRail` 均不增加 local rail error。cooldown 到期仍只准入一个真实
 > recovery probe。
 >
-> **v2 receive-pool 预算**：每条data QP按实际block/depth二维class计算
-> `slot=align4K(4096 + block_class)`，pull-read lease为
-> `2 × depth_class × slot`。`DFKV_RDMA_RECV_SEGMENT_SIZE`是hard budget，
-> `_CHUNK_BYTES`是惰性提交粒度，`_CHUNK_IDLE_MS`控制空chunk返还。
-> 上线看committed/max/chunks、used/free、growth/shrink/failure和MW/fallback。
+> **receive-pool 预算**：`slot=align4K(4096 + block_class)`。
+> 旧 peer 的 resident lease 是 `2 × depth_class × slot`；动态 pull peer
+> 只保留 `depth_class × slot` 的 receive slots，直接 GET 使用 minimum class。
+> 在飞 PUT/GET 租约也计入 `DFKV_RDMA_RECV_SEGMENT_SIZE` hard budget。
+> 上线同时观察 committed/used/真实 RSS 与动态租约归还；不能把操作结束后的
+> used_bytes 当作整个运行过程的峰值或 pinned memory。
 
 ### 3a. 每节点 tenant quota
 
@@ -467,6 +468,8 @@ flag 为 env facade）；未列 flag 的全部 env 均从源码排查就不误�
 | `DFKV_RDMA_RECV_CHUNK_BYTES` | `256 MiB` | server 启动与增量提交粒度 |
 | `DFKV_RDMA_RECV_CHUNK_IDLE_MS` | `60000` | 空闲非初始chunk返还延迟；`0`关闭缩容 |
 | `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | `256 KiB` | client adaptive data-QP 最小 class；实际对象向上取 power-of-two |
+| `DFKV_RDMA_INLINE_PUT_MAX_BYTES` | `4 MiB` | client 超阈 PUT 使用操作级 lease；`0`/空值禁用，不改变业务对象上限 |
+| `DFKV_RDMA_DYNAMIC_PULL` | `1` | client 协商动态 direct GET 与显式 release ACK；`0`保留旧 pull arena |
 | `DFKV_RDMA_CONNECT_MS` | — | client：IB QP 建连超时 |
 | `DFKV_RDMA_IO_MS` | — | client：控制面帧读写超时 |
 | `DFKV_RDMA_BATCH_OP_TIMEOUT_MS` | 0=跟随 RDMA_OP | client：multi-item Cache/Range/Exist、SG 窗口总期限 |

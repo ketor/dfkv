@@ -51,7 +51,9 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
     resolve_kv_cache_block_sizes,
 )
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec, KVCacheConfig, KVCacheGroupSpec, MambaSpec,
+)
 
 # dfkv: get_dp_engine_index replaces mooncake_utils.get_mooncake_dp_engine_index;
 # dfkv handles its own RDMA bootstrap so the transfer-engine helpers are dropped.
@@ -64,9 +66,9 @@ from .client_ranks import (
     resolve_client_ranks,
     should_create_client,
 )
-from .coordinator import DfkvStoreCoordinator
+from .coordinator import DfkvStoreCoordinator, _unwrap_spec
 from .data import (
-    VLLM_MULTIWR_V2,
+    VLLM_RAW_LAYOUT,
     ChunkedTokenDatabase,
     DfkvStoreConnectorMetadata,
     KeyMetadata,
@@ -146,6 +148,13 @@ class _KeyStripeIdentity:
     stripe_step: int
 
 
+def _effective_cache_spec(spec, dcp_size: int):
+    """Use the same outer-spec DCP rule as resolve_kv_cache_block_sizes."""
+    if dcp_size == 1 or not isinstance(spec, AttentionSpec):
+        return spec
+    return dataclasses.replace(spec, block_size=spec.block_size * dcp_size)
+
+
 def _key_stripe_identity(
     *,
     tp_rank: int,
@@ -222,8 +231,16 @@ def _logical_block_ids(
     mask: Sequence[bool],
     block_ids: Sequence[int],
 ) -> list[int]:
+    # Full allocator tables may include future, uncomputed blocks. Select by
+    # logical position, not from their tail. Only an actually compact state
+    # table maps its entries consecutively onto selected mask positions.
+    if len(block_ids) >= len(mask):
+        return [
+            int(block_ids[index]) if selected else -1
+            for index, selected in enumerate(mask)
+        ]
     positions = [index for index, selected in enumerate(mask) if selected]
-    if len(block_ids) < len(positions):
+    if len(block_ids) != len(positions):
         raise ValueError(
             f"block table has {len(block_ids)} ids for "
             f"{len(positions)} selected state slots"
@@ -231,7 +248,7 @@ def _logical_block_ids(
     logical = [-1] * len(mask)
     for position, block_id in zip(
         positions,
-        block_ids[-len(positions) :] if positions else (),
+        block_ids,
         strict=True,
     ):
         logical[position] = int(block_id)
@@ -569,6 +586,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         enable_kv_event: bool = False,
         record_operation: Callable[..., None] | None = None,
         queue_capacity: int = DEFAULT_TRANSFER_QUEUE_CAPACITY,
+        tp_sharded_groups: frozenset[int] = frozenset(),
     ):
         super().__init__(
             client,
@@ -585,6 +603,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # stripe_idx=None for a non-participant.
         self.stripe_idx: int | None = stripe_idx
         self.stripe_step = stripe_step
+        self.tp_sharded_groups = tp_sharded_groups
         self.coord = coord
         self.kv_role = kv_role
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
@@ -665,6 +684,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             block_hashes: list[BlockHash] = []
             group_indices: list[int] = []
             logical_block_ids_per_group: list[list[int]] = []
+            stripe_position = 0
             for g_idx, db in enumerate(self.token_databases):
                 mask = store_masks[g_idx]
                 logical_block_ids_per_group.append(
@@ -675,24 +695,23 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 ):
                     if chunk_idx >= len(mask) or not mask[chunk_idx]:
                         continue
+                    # State checkpoints contain this physical TP rank's shard;
+                    # every rank must save them. Only payload replicas stripe.
+                    # Count all selected chunks to retain the attention stripe
+                    # positions used before introducing per-group ownership.
+                    selected = g_idx in self.tp_sharded_groups or (
+                        self.stripe_idx is not None
+                        and stripe_position % self.stripe_step == self.stripe_idx
+                    )
+                    stripe_position += 1
+                    if not selected:
+                        continue
                     starts.append(start)
                     ends.append(end)
                     keys.append(key.to_bytes())
                     block_hashes.append(BlockHash(bytes.fromhex(key.chunk_hash)))
                     group_indices.append(g_idx)
 
-            # Split chunks across the workers that share this exact key
-            # coordinate. A converged CLIENT_RANKS non-participant selects
-            # nothing while preserving request bookkeeping and completion.
-            if self.stripe_idx is None:
-                sl = slice(0, 0)
-            else:
-                sl = slice(self.stripe_idx, None, self.stripe_step)
-            starts = starts[sl]
-            ends = ends[sl]
-            keys = keys[sl]
-            block_hashes = block_hashes[sl]
-            group_indices = group_indices[sl]
 
             if not keys:
                 return
@@ -1503,12 +1522,26 @@ class DfkvStoreWorker:
         self.dcp_rank = key_stripe.dcp_rank
         self.stripe_idx = key_stripe.stripe_idx
         self.stripe_step = key_stripe.stripe_step
+        # Mamba/KDA states are TP-sharded even when attention uses a replicated
+        # MLA latent. UniformTypeKVCacheSpecs must be classified by inner spec.
+        self._tp_sharded_groups = frozenset(
+            g_idx
+            for g_idx, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(_unwrap_spec(group.kv_cache_spec), MambaSpec)
+            and getattr(_unwrap_spec(group.kv_cache_spec), "participates_in_prefix_caching", True)
+        )
+        self._kv_cache_groups: list[KVCacheGroupSpec] = [
+            dataclasses.replace(
+                group, kv_cache_spec=_effective_cache_spec(group.kv_cache_spec, self.dcp_size)
+            )
+            for group in kv_cache_config.kv_cache_groups
+        ]
 
         # CLIENT_RANKS (issue #111): converge store-side dfkv clients onto a
         # subset of ranks when the KV object is fully TP-replicated.
         # Layout-clamped, never rejects (one fleet-wide env template must be
         # safe everywhere).
-        replicated = self.head_or_tp_rank < 0
+        replicated = self.head_or_tp_rank < 0 and not self._tp_sharded_groups
         requested = os.environ.get(CLIENT_RANKS_ENV)
         self.client_ranks, cr_reason = resolve_client_ranks(
             requested, self.tp_size, replicated
@@ -1586,7 +1619,7 @@ class DfkvStoreWorker:
         )
         key_namespace = canonical_namespace(
             model_identity,
-            VLLM_MULTIWR_V2.decode("ascii"),
+            VLLM_RAW_LAYOUT.decode("ascii"),
             tenant_id=str(extra.get("tenant_id", "default")),
             model_revision=str(_model_revision),
             dtype=_cache_dtype,
@@ -1596,7 +1629,7 @@ class DfkvStoreWorker:
             dp_size=self.dp_size,
             pp_size=self.pp_size,
             layout_fields={
-                "storage_layout": VLLM_MULTIWR_V2.decode("ascii"),
+                "storage_layout": VLLM_RAW_LAYOUT.decode("ascii"),
                 "cache_dtype": _cache_dtype,
                 "model_dtype": str(getattr(model_config, "dtype", "unknown")),
                 "block_size": self.block_size,
@@ -1694,46 +1727,6 @@ class DfkvStoreWorker:
         self.kv_connector_stats = DfkvStoreConnectorStats()
 
         self._kv_cache_config = kv_cache_config
-        # PCP/DCP > 1 (single- OR multi-group): scale EACH group's
-        # spec.block_size to self.block_size (= scheduler_block_size) so the
-        # coordinator's ``block_size % hash_block_size == 0`` and
-        # ``scheduler_block_size % block_size == 0`` invariants hold. Under CP
-        # different groups shard differently (e.g. GLM-5.2 DSA: the MLA group is
-        # DCP-sharded while the indexer group is not), but normalizing every
-        # group to scheduler_block_size keeps the per-group hashing / store-load
-        # masks uniform; each rank still only holds (and stores under its
-        # @pcp{r}@dcp{r} key) its own physical shard of the cache.
-        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
-
-        def _scale_spec(spec):
-            # UniformTypeKVCacheSpecs wraps inner per-layer specs; the
-            # coordinator unwraps to the inner spec (see _unwrap_spec), so the
-            # inner block_size(s) must be scaled too, not just the wrapper's.
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                inner = {
-                    name: (
-                        dataclasses.replace(s, block_size=self.block_size)
-                        if s.block_size != self.block_size
-                        else s
-                    )
-                    for name, s in spec.kv_cache_specs.items()
-                }
-                if spec.block_size == self.block_size and all(
-                    s.block_size == self.block_size for s in inner.values()
-                ):
-                    return spec
-                return dataclasses.replace(
-                    spec, block_size=self.block_size, kv_cache_specs=inner
-                )
-            if spec.block_size != self.block_size:
-                return dataclasses.replace(spec, block_size=self.block_size)
-            return spec
-
-        groups = [
-            dataclasses.replace(g, kv_cache_spec=_scale_spec(g.kv_cache_spec))
-            for g in kv_cache_config.kv_cache_groups
-        ]
-        self._kv_cache_groups: list[KVCacheGroupSpec] = groups
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         use_eagle = bool(
             spec_cfg.use_eagle()
@@ -1750,9 +1743,24 @@ class DfkvStoreWorker:
         # register_kv_caches once the kv-cache layout is known.
         self.token_dbs: list[ChunkedTokenDatabase] = [
             ChunkedTokenDatabase(
-                dataclasses.replace(self.metadata, group_id=g_idx),
+                dataclasses.replace(
+                    self.metadata,
+                    group_id=g_idx,
+                    # Old state objects used attention's collapsed rank
+                    # coordinates. Keep them outside the corrected state pool,
+                    # including legacy numeric GQA/DCP coordinate collisions.
+                    pool_name="mamba" if g_idx in self._tp_sharded_groups else "kv",
+                    tp_rank=(
+                        self.tp_rank
+                        if g_idx in self._tp_sharded_groups
+                        else self.head_or_tp_rank
+                    ),
+                ),
                 g.kv_cache_spec.block_size,
                 hash_block_size=self.hash_block_size,
+                cacheable=getattr(
+                    _unwrap_spec(g.kv_cache_spec), "participates_in_prefix_caching", True
+                ),
             )
             for g_idx, g in enumerate(self._kv_cache_groups)
         ]
@@ -1862,6 +1870,9 @@ class DfkvStoreWorker:
         # semantic layer name so independently constructed producer/consumer
         # mappings gather and scatter the same ordered byte stream.
         for layer_name in sorted(kv_caches):
+            g_idx = layer_to_group[layer_name]
+            if not self.token_dbs[g_idx].cacheable:
+                continue
             cache = _repr_tensor(kv_caches[layer_name])
             cache_storage = cache.untyped_storage()
             base_addr = cache_storage.data_ptr()
@@ -1879,7 +1890,6 @@ class DfkvStoreWorker:
                 if self.client is not None:
                     self.client.register_memory(base_addr, region_len)
 
-            g_idx = layer_to_group[layer_name]
             layer_addr = cache.data_ptr()
             el = cache.element_size()
             page_size_bytes = region_len // self.num_blocks
@@ -1895,7 +1905,7 @@ class DfkvStoreWorker:
                 # transpose); represent every run explicitly rather than
                 # silently transferring the whole stride and crossing slots.
                 block_stride, runs = split_block_contiguous_runs(
-                    cache.shape, cache.stride(), el
+                    cache.shape, cache.stride(), el, logical_blocks=self.num_blocks
                 )
                 for offset, content in runs:
                     group_seg_layouts[g_idx].append(
@@ -1950,6 +1960,7 @@ class DfkvStoreWorker:
                 queue_capacity=getattr(
                     self, "transfer_queue_capacity", DEFAULT_TRANSFER_QUEUE_CAPACITY
                 ),
+                tp_sharded_groups=self._tp_sharded_groups,
             )
             if self.client_ranks < self.tp_size:
                 # Converged mode: re-stripe stores over the participant set.
@@ -2184,159 +2195,185 @@ class DfkvStoreWorker:
         return finished_sending
 
     def lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
-        """Check how many prefix tokens exist in the store.
-
-        Checks across all TP ranks at this worker's own PP rank.
-        """
-        if not block_hashes or token_len <= 0:
-            return 0
-
-        # Build every physical object required by each logical LCM chunk.
-        # Object metadata retains the logical chunk index so repeated hashes
-        # cannot collapse accounting across distinct prefix positions.
-        candidate_keys: list[bytes] = []
-        candidate_meta: list[tuple[int, int, int, bytes]] = []
-        expected_per_object: dict[tuple[int, int, int, bytes], int] = {}
-        tp_count = min(self.tp_size, self.num_kv_head)
-        # dfkv: gate candidates by store_mask -- the SAME per-(group,chunk) set
-        # the SAVE path stores (worker.py save gate) and the LOAD path reads
-        # (load_mask delegates to store_mask). For SlidingWindow groups (V4-Flash
-        # has 4 of them besides the full-MLA group) store_mask keeps only the
-        # in-window tail chunks; without this gate the lookup enumerated every
-        # chunk (4830 vs the 1058 actually stored), so find_longest_cache_hit's
-        # SWA walk demanded never-stored pre-window chunks and collapsed to 0.
-        aligned_token_len = (
-            token_len // self.coord.lcm_block_size * self.coord.lcm_block_size
-        )
-        store_masks = self.coord.store_mask(aligned_token_len)
-        if aligned_token_len == 0:
-            return 0
-        num_prefix_chunks = aligned_token_len // self.coord.lcm_block_size
-        required_objects_per_chunk = [0] * num_prefix_chunks
-        missing_required_per_chunk = [False] * num_prefix_chunks
-        for g_idx, db in enumerate(self.token_dbs):
-            spec_block_size = db.block_size
-            mask = store_masks[g_idx]
-            group_hashes = self.coord.block_hashes_for_spec(
-                block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
+        """Return a prefix whose length-dependent load objects all exist."""
+        def lookup_candidate(token_len: int) -> int:
+            """Check how many prefix tokens exist in the store.
+    
+            Checks across all TP ranks at this worker's own PP rank.
+            """
+            if not block_hashes or token_len <= 0:
+                return 0
+    
+            # Build every physical object required by each logical LCM chunk.
+            # Object metadata retains the logical chunk index so repeated hashes
+            # cannot collapse accounting across distinct prefix positions.
+            candidate_keys: list[bytes] = []
+            candidate_meta: list[tuple[int, int, int, bytes]] = []
+            expected_per_object: dict[tuple[int, int, int, bytes], int] = {}
+            tp_count = min(self.tp_size, self.num_kv_head)
+            # dfkv: gate candidates by store_mask -- the SAME per-(group,chunk) set
+            # the SAVE path stores (worker.py save gate) and the LOAD path reads
+            # (load_mask delegates to store_mask). For SlidingWindow groups (V4-Flash
+            # has 4 of them besides the full-MLA group) store_mask keeps only the
+            # in-window tail chunks; without this gate the lookup enumerated every
+            # chunk (4830 vs the 1058 actually stored), so find_longest_cache_hit's
+            # SWA walk demanded never-stored pre-window chunks and collapsed to 0.
+            aligned_token_len = (
+                token_len // self.coord.lcm_block_size * self.coord.lcm_block_size
             )
-            # Replicated MLA stores every SAVE under the single canonical
-            # tp_rank=-1 coordinate (see metadata init): expanding to
-            # tp_rank=0..tp_count-1 would never match it. Probe the stored
-            # coordinate as-is when negative; else expand across the per-TP
-            # head coordinates used by GQA/DCP saves.
-            tp_candidates = (
-                [db.metadata.tp_rank] if db.metadata.tp_rank < 0 else range(tp_count)
-            )
-            rank_probes = max(1, len(tp_candidates))
-            processed_chunks = 0
-            for chunk_id, h in enumerate(group_hashes):
-                start_idx = chunk_id * spec_block_size
-                if start_idx >= aligned_token_len:
-                    break
-                processed_chunks = chunk_id + 1
-                if chunk_id >= len(mask) or not mask[chunk_id]:
+            store_masks = self.coord.store_mask(aligned_token_len)
+            if aligned_token_len == 0:
+                return 0
+            num_prefix_chunks = aligned_token_len // self.coord.lcm_block_size
+            required_objects_per_chunk = [0] * num_prefix_chunks
+            missing_required_per_chunk = [False] * num_prefix_chunks
+            for g_idx, db in enumerate(self.token_dbs):
+                spec_block_size = db.block_size
+                mask = store_masks[g_idx]
+                if not mask:
                     continue
-                logical_chunk_idx = start_idx // self.coord.lcm_block_size
-                object_meta = (logical_chunk_idx, g_idx, chunk_id, bytes(h))
-                expected_per_object[object_meta] = rank_probes
-                required_objects_per_chunk[logical_chunk_idx] += 1
-                for tp in tp_candidates:
-                    # Keep this worker's own pp_rank (db.metadata.pp_rank): PP
-                    # partitions layers, so each (group, chunk) lives under a
-                    # single stage's pp_rank, matching the SAVE/LOAD keys. Probing
-                    # every pp_rank matched nothing and forced present=0 on PP>1.
-                    md = dataclasses.replace(db.metadata, tp_rank=tp)
-                    candidate_keys.append(PoolKey(md, h.hex()).to_bytes())
-                    candidate_meta.append(object_meta)
-            # A truncated hash vector is malformed metadata. Mark only its
-            # ungenerated required suffix chunks incomplete; the normal path
-            # has no second full mask scan.
-            for chunk_id in range(
-                processed_chunks,
-                min(len(mask), aligned_token_len // spec_block_size),
-            ):
-                if mask[chunk_id]:
-                    logical_chunk_idx = (
-                        chunk_id * spec_block_size // self.coord.lcm_block_size
-                    )
-                    missing_required_per_chunk[logical_chunk_idx] = True
-
-        if not candidate_keys:
-            return 0
-
-        lookup_start = time.perf_counter()
-        try:
-            res = self.client.batch_exist(candidate_keys)
-            if len(res) != len(candidate_keys):
-                raise RuntimeError(
-                    "batch_exist returned incomplete per-key results: "
-                    f"keys={len(candidate_keys)} statuses={len(res)}"
+                group_hashes = self.coord.block_hashes_for_spec(
+                    block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
                 )
-        except Exception as e:
+                # State pools need every physical TP shard, independently of
+                # attention head replication. MLA retains its canonical -1;
+                # GQA/DCP attention retains its existing head coordinates.
+                tp_sharded = isinstance(
+                    _unwrap_spec(self._kv_cache_groups[g_idx].kv_cache_spec),
+                    MambaSpec,
+                )
+                if tp_sharded:
+                    tp_candidates = range(self.tp_size)
+                elif db.metadata.tp_rank < 0:
+                    tp_candidates = [db.metadata.tp_rank]
+                else:
+                    tp_candidates = range(tp_count)
+                rank_probes = max(1, len(tp_candidates))
+                processed_chunks = 0
+                for chunk_id, h in enumerate(group_hashes):
+                    start_idx = chunk_id * spec_block_size
+                    if start_idx >= aligned_token_len:
+                        break
+                    processed_chunks = chunk_id + 1
+                    if chunk_id >= len(mask) or not mask[chunk_id]:
+                        continue
+                    logical_chunk_idx = start_idx // self.coord.lcm_block_size
+                    object_meta = (logical_chunk_idx, g_idx, chunk_id, bytes(h))
+                    expected_per_object[object_meta] = rank_probes
+                    required_objects_per_chunk[logical_chunk_idx] += 1
+                    for tp in tp_candidates:
+                        # Keep this worker's own pp_rank (db.metadata.pp_rank): PP
+                        # partitions layers, so each (group, chunk) lives under a
+                        # single stage's pp_rank, matching the SAVE/LOAD keys. Probing
+                        # every pp_rank matched nothing and forced present=0 on PP>1.
+                        md = dataclasses.replace(
+                            db.metadata,
+                            tp_rank=tp,
+                            dcp_rank=(
+                                (tp * db.metadata.pcp_size + db.metadata.pcp_rank)
+                                % db.metadata.dcp_size
+                                if tp_sharded
+                                else db.metadata.dcp_rank
+                            ),
+                        )
+                        candidate_keys.append(PoolKey(md, h.hex()).to_bytes())
+                        candidate_meta.append(object_meta)
+                # A truncated hash vector is malformed metadata. Mark only its
+                # ungenerated required suffix chunks incomplete; the normal path
+                # has no second full mask scan.
+                for chunk_id in range(
+                    processed_chunks,
+                    min(len(mask), aligned_token_len // spec_block_size),
+                ):
+                    if mask[chunk_id]:
+                        logical_chunk_idx = (
+                            chunk_id * spec_block_size // self.coord.lcm_block_size
+                        )
+                        missing_required_per_chunk[logical_chunk_idx] = True
+    
+            if not candidate_keys:
+                return 0
+    
+            lookup_start = time.perf_counter()
+            try:
+                res = self.client.batch_exist(candidate_keys)
+                if len(res) != len(candidate_keys):
+                    raise RuntimeError(
+                        "batch_exist returned incomplete per-key results: "
+                        f"keys={len(candidate_keys)} statuses={len(res)}"
+                    )
+            except Exception as e:
+                self._record_kv_connector_operation(
+                    "lookup_exists",
+                    time.perf_counter() - lookup_start,
+                    len(candidate_keys),
+                    num_logical_keys=len(expected_per_object),
+                    status="error",
+                    num_failed_keys=len(candidate_keys),
+                )
+                logger.error("Remote connection failed in lookup: %s", e)
+                return 0
+    
             self._record_kv_connector_operation(
                 "lookup_exists",
                 time.perf_counter() - lookup_start,
                 len(candidate_keys),
                 num_logical_keys=len(expected_per_object),
-                status="error",
-                num_failed_keys=len(candidate_keys),
             )
-            logger.error("Remote connection failed in lookup: %s", e)
-            return 0
-
-        self._record_kv_connector_operation(
-            "lookup_exists",
-            time.perf_counter() - lookup_start,
-            len(candidate_keys),
-            num_logical_keys=len(expected_per_object),
-        )
-
-        # A semantic object exists only if every TP*PP coordinate exists. A
-        # logical LCM chunk is complete only if all of its semantic objects do.
-        # Scan logical chunks in order and cap the semantic coordinator at the
-        # first incomplete one, so an isolated later hit can never be loaded.
-        present_per_object: dict[tuple[int, int, int, bytes], int] = {}
-        for object_meta, exists in zip(candidate_meta, res, strict=True):
-            if exists == 1:
-                present_per_object[object_meta] = (
-                    present_per_object.get(object_meta, 0) + 1
-                )
-
-        complete_chunks = [
-            required > 0 and not missing_required_per_chunk[idx]
-            for idx, required in enumerate(required_objects_per_chunk)
-        ]
-        exists_set: set[tuple[int, bytes]] = set()
-        for object_meta, expected in expected_per_object.items():
-            logical_chunk_idx, g_idx, _chunk_id, chunk_hash = object_meta
-            if present_per_object.get(object_meta, 0) != expected:
-                complete_chunks[logical_chunk_idx] = False
-            else:
-                exists_set.add((g_idx, chunk_hash))
-
-        prefix_chunks = 0
-        for chunk_idx, complete in enumerate(complete_chunks):
-            if required_objects_per_chunk[chunk_idx] == 0 or not complete:
-                break
-            prefix_chunks += 1
-        complete_prefix_tokens = prefix_chunks * self.coord.lcm_block_size
-
-        # candidate_keys are derived from the same manager-selected store mask
-        # used by save and load. Once every required object for the contiguous
-        # prefix exists, re-running cross-group convergence can only discard
-        # intentionally sparse stateful groups.
-        hit_length = complete_prefix_tokens
-        logger.debug(
-            "dfkv lookup: token_len=%d candidates=%d complete_chunks=%d/%d "
-            "-> hit_length=%d",
-            token_len,
-            len(candidate_keys),
-            prefix_chunks,
-            num_prefix_chunks,
-            hit_length,
-        )
-        return hit_length
+    
+            # A semantic object exists only if every TP*PP coordinate exists. A
+            # logical LCM chunk is complete only if all of its semantic objects do.
+            # Scan logical chunks in order and cap the semantic coordinator at the
+            # first incomplete one, so an isolated later hit can never be loaded.
+            present_per_object: dict[tuple[int, int, int, bytes], int] = {}
+            for object_meta, exists in zip(candidate_meta, res, strict=True):
+                if exists == 1:
+                    present_per_object[object_meta] = (
+                        present_per_object.get(object_meta, 0) + 1
+                    )
+    
+            complete_chunks = [
+                required > 0 and not missing_required_per_chunk[idx]
+                for idx, required in enumerate(required_objects_per_chunk)
+            ]
+            exists_set: set[tuple[int, bytes]] = set()
+            for object_meta, expected in expected_per_object.items():
+                logical_chunk_idx, g_idx, _chunk_id, chunk_hash = object_meta
+                if present_per_object.get(object_meta, 0) != expected:
+                    complete_chunks[logical_chunk_idx] = False
+                else:
+                    exists_set.add((g_idx, chunk_hash))
+    
+            prefix_chunks = 0
+            for chunk_idx, complete in enumerate(complete_chunks):
+                if required_objects_per_chunk[chunk_idx] == 0 or not complete:
+                    break
+                prefix_chunks += 1
+            complete_prefix_tokens = prefix_chunks * self.coord.lcm_block_size
+    
+            # This is only a candidate boundary. The outer loop checks the
+            # mask at that exact length before admitting it for LOAD.
+            hit_length = complete_prefix_tokens
+            logger.debug(
+                "dfkv lookup: token_len=%d candidates=%d complete_chunks=%d/%d "
+                "-> hit_length=%d",
+                token_len,
+                len(candidate_keys),
+                prefix_chunks,
+                num_prefix_chunks,
+                hit_length,
+            )
+            return hit_length
+    
+        candidate = token_len // self.coord.lcm_block_size * self.coord.lcm_block_size
+        while candidate > 0:
+            hit = lookup_candidate(candidate)
+            if hit == candidate:
+                return hit
+            # Tail-only state masks move when the candidate prefix shrinks.
+            # Revalidate that boundary rather than loading unprobed checkpoints.
+            candidate = hit
+        return 0
 
     def get_kv_events(self) -> list[BlockStored]:
         if self.enable_kv_events and self.kv_send_thread is not None:

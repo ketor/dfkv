@@ -35,6 +35,9 @@ class RdmaLeaseServerTestPeer {
   static size_t Trim(RdmaServer& server) {
     return server.recv_segments_.TrimIdle(1);
   }
+  static rdma::RecvSegmentPool::Lease Allocate(RdmaServer& server, size_t bytes) {
+    return server.recv_segments_.Allocate(bytes);
+  }
   static void BeforeTeardown(RdmaServer& server, std::function<void()> hook) {
     server.before_endpoint_teardown_for_test_ = std::move(hook);
   }
@@ -85,10 +88,8 @@ long CounterOf(const RdmaServer& rsrv, const std::string& name) {
   return std::strtol(text.c_str() + sp + 1, nullptr, 10);
 }
 
-// One cache node: KvNodeServer owns the storage; RdmaServer serves the
-// bootstrap + datapath. Server-side receive budget is small enough that the
-// suite could never pass with connection-resident geometry for large objects —
-// the lease datapath is the only way these PUTs fit.
+// Production-equivalent handler wiring. Run this suite with
+// DFKV_SERVER_URING=0 and =1 to exercise both serving loops.
 struct LeaseNode {
   fs::path dir;
   std::unique_ptr<KvNodeServer> srv;
@@ -126,6 +127,11 @@ struct LeaseNode {
     rsrv->set_cache_direct_handler(
         [this](const BlockKey& key, char* data, size_t len, size_t cap) {
           return srv->CacheDirectForKey(key, data, len, cap);
+        });
+    rsrv->set_prepare_read_handler(
+        [this](const BlockKey& key, uint64_t off, uint64_t len,
+               char* staging, size_t cap) {
+          return srv->PrepareReadForKey(key, off, len, staging, cap);
         });
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
     addr = "127.0.0.1:" + std::to_string(rsrv->port());
@@ -475,17 +481,18 @@ TEST_F(RdmaLeaseLoopback, RetiredKeyCannotOverwriteReusedLease) {
   LeasePeer peer;
   ASSERT_TRUE(peer.Open(node));
   const BlockKey key = ToBlockKey(SelfHdr(), "reused");
-  rdma::LeasePutReady old, current;
+  rdma::LeasePutReady old;
   Status status = Status::kIOError;
   ASSERT_TRUE(peer.Lease(key, value.size(), &status, &old));
   ASSERT_EQ(status, Status::kOk);
   ASSERT_TRUE(peer.Put(key, old, value));
-  ASSERT_TRUE(peer.Lease(key, value.size(), &status, &current));
-  ASSERT_EQ(status, Status::kOk);
-  ASSERT_EQ(current.write_base, old.write_base)
-      << "the allocator must actually recycle the tested range";
-  char* target = reinterpret_cast<char*>(current.write_base) +
-                 rdma::kV2DataOffset;
+  // Recycle the storage without granting this peer any new remote access.
+  // A subsequent authorized MR may reuse the numeric rkey; this test checks
+  // revocation, not indefinite uniqueness of provider-generated keys.
+  auto current = RdmaLeaseServerTestPeer::Allocate(*node.rsrv, old.lease_bytes);
+  ASSERT_TRUE(current);
+  ASSERT_EQ(reinterpret_cast<uint64_t>(current.data()), old.write_base);
+  char* target = current.data() + rdma::kV2DataOffset;
   std::memset(target, 0x5a, late.size());
   ibv_mr* mr = peer.ep.RegisterTransient(late.data(), late.size(), false);
   ASSERT_NE(mr, nullptr);

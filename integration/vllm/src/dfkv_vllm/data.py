@@ -26,10 +26,10 @@ from vllm.v1.core.kv_cache_utils import (
 
 logger = init_logger(__name__)
 
-# Source-controlled object-layout discriminator. It is framed into every pool
-# key and also binds the native namespace, so sg-v1 and multiwr-v2 objects can
-# never collide or be read through a compatibility fallback.
-VLLM_MULTIWR_V2 = b"vllm-multiwr-v2"
+# Bind complete logical-block payloads and per-TP state to a new identity.
+# Older layouts may contain only one kernel tile for a whole logical block;
+# they must cold-miss, never be decoded through a compatibility fallback.
+VLLM_RAW_LAYOUT = b"vllm-multiwr-v3"
 
 def key_diagnostic_label(key: bytes) -> str:
     """Return the standard non-reversible diagnostic label for a store key."""
@@ -45,12 +45,13 @@ def split_block_contiguous_runs(
     shape: Sequence[int],
     strides: Sequence[int],
     element_size: int,
+    logical_blocks: int | None = None,
 ) -> tuple[int, list[tuple[int, int]]]:
     """Return ``(block_stride, [(offset, size), ...])`` in bytes.
 
-    Dimension 0 indexes KV blocks. Expand padded or transposed in-block
-    dimensions into deterministic contiguous runs; overlapping views fail
-    closed instead of transferring the whole block stride.
+    Dimension 0 indexes kernel blocks. If their count is a multiple of the
+    allocator's logical block count, fold those kernel tiles into each logical
+    block before deriving runs. Padded/transposed dimensions remain explicit.
     """
     if len(shape) != len(strides) or not shape:
         raise ValueError("shape and strides must have the same non-zero rank")
@@ -58,6 +59,16 @@ def split_block_contiguous_runs(
         raise ValueError("shape dimensions and element_size must be positive")
     if any(int(s) < 0 for s in strides):
         raise ValueError("negative KV-cache strides are not supported")
+    if logical_blocks is not None:
+        if logical_blocks <= 0 or int(shape[0]) % logical_blocks:
+            raise ValueError(
+                f"kernel block count {shape[0]} does not divide into "
+                f"{logical_blocks} logical blocks"
+            )
+        tiles = int(shape[0]) // logical_blocks
+        if tiles != 1:
+            shape = (logical_blocks, tiles, *shape[1:])
+            strides = (int(strides[0]) * tiles, int(strides[0]), *strides[1:])
 
     block_stride = int(strides[0]) * element_size
     if block_stride <= 0:
@@ -143,6 +154,7 @@ class KeyMetadata:
     pp_size: int
     pp_rank: int
     group_id: int = 0
+    pool_name: str = "kv"
 
 
 @dataclass(order=True)
@@ -167,6 +179,7 @@ class PoolKey:
                 self.key_metadata.pp_size,
                 self.key_metadata.pp_rank,
                 self.key_metadata.group_id,
+                self.key_metadata.pool_name,
                 self.chunk_hash,
             )
         )
@@ -174,7 +187,7 @@ class PoolKey:
     def to_bytes(self) -> bytes:
         return pool_key(
             self.chunk_hash,
-            pool="kv",
+            pool=self.key_metadata.pool_name,
             dp_size=self.key_metadata.dp_size,
             dp_rank=self.key_metadata.dp_rank,
             tp_size=self.key_metadata.tp_size,
@@ -186,7 +199,7 @@ class PoolKey:
             pp_size=self.key_metadata.pp_size,
             pp_rank=self.key_metadata.pp_rank,
             group_id=self.key_metadata.group_id,
-            component=VLLM_MULTIWR_V2.decode("ascii"),
+            component=VLLM_RAW_LAYOUT.decode("ascii"),
         )
 
 
@@ -198,11 +211,13 @@ class ChunkedTokenDatabase:
         metadata: KeyMetadata,
         block_size: int,
         hash_block_size: int | None = None,
+        cacheable: bool = True,
     ):
         self.metadata = metadata
         self.block_size = block_size
         self.hash_block_size = hash_block_size or block_size
-        if self.block_size % self.hash_block_size != 0:
+        self.cacheable = cacheable
+        if cacheable and self.block_size % self.hash_block_size != 0:
             raise ValueError(
                 f"block_size ({self.block_size}) must be a multiple of "
                 f"hash_block_size ({self.hash_block_size})"
@@ -345,7 +360,7 @@ class ChunkedTokenDatabase:
                 up to the group's ``block_size`` via ``BlockHashListWithBlockSize``.
             mask_num: Number of tokens to skip from the beginning.
         """
-        if not block_hashes:
+        if not self.cacheable or not block_hashes:
             return
         if self.block_size == self.hash_block_size:
             chunk_hashes: Iterable[BlockHash] = block_hashes

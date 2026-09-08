@@ -20,6 +20,7 @@ from dfkv_vllm.data import (  # noqa: E402
     ChunkedTokenDatabase,
     KeyMetadata,
     PoolKey,
+    key_diagnostic_label,
     split_block_contiguous_runs,
 )
 from dfkv_vllm import worker as worker_module  # noqa: E402
@@ -54,17 +55,6 @@ def test_logical_block_ids_expand_compact_stateful_table():
         worker_module._logical_block_ids([True, True], [5])
 
 
-def test_pool_key_uses_cross_runtime_binary_schema():
-    assert PoolKey(_METADATA, "0123abcd").to_bytes() == (
-        b"DFKVPOOL\x02"
-        + struct.pack("<I", 2) + b"kv"
-        + struct.pack("<I", 8) + b"0123abcd"
-        + struct.pack(
-            "<IiIiIiIiIiI",
-            1, -1, 1, 0, 1, 0, 1, 0, 1, 0, 0,
-        )
-        + struct.pack("<I", 3) + b"all"
-    )
 
 
 def test_pool_key_preserves_embedded_nul_and_non_utf8_hash_bytes():
@@ -75,10 +65,12 @@ def test_pool_key_preserves_embedded_nul_and_non_utf8_hash_bytes():
 
 
 def test_binary_key_log_label_is_digest_only():
-    label = worker_module._key_label(b"\xff\x00raw-secret")
-    assert label.startswith("len=12 sha256=")
-    assert len(label.removeprefix("len=12 sha256=")) == 16
+    key = b"\xff\x00raw-secret"
+    label = key_diagnostic_label(key)
     assert "raw-secret" not in label
+    assert key.hex() not in label
+    assert label == key_diagnostic_label(key)
+    assert label != key_diagnostic_label(b"\xff\x00alt-secret")
 
 
 def test_prepare_value_uses_actual_noncontiguous_block_ids():

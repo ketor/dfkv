@@ -672,10 +672,10 @@ void RdmaServer::Serve(int boot_fd) {
     const uint64_t evict_started = SteadyUs();
     for (int round = 0; round < 32 && !recv_lease; ++round) {
       if (SteadyUs() - evict_started > 5000000) break;  // bound: <= 5 s total
-      rdma::RcEndpoint* victim = nullptr;
-      uint64_t victim_active = std::numeric_limits<uint64_t>::max();
       {
         std::lock_guard<std::mutex> lk(conn_mu_);
+        rdma::RcEndpoint* victim = nullptr;
+        uint64_t victim_active = std::numeric_limits<uint64_t>::max();
         for (rdma::RcEndpoint* ep : live_eps_) {
           const uint64_t a =
               ep->last_active_us_.load(std::memory_order_relaxed);
@@ -686,10 +686,13 @@ void RdmaServer::Serve(int boot_fd) {
             victim_active = a;
           }
         }
-        if (victim) live_eps_.erase(victim);  // claim it: no other evictor
-      }                                        // can Wake a freed stack endpoint
-      if (!victim) break;  // every connection is recently active; refuse
-      victim->Wake();  // Serve exits; the Lease destructor returns its range
+        if (!victim) break;  // every connection is recently active; refuse
+        live_eps_.erase(victim);  // claim it: no other evictor can pick it.
+        // Wake under conn_mu_: a Serve thread taking the erase exit (2235/
+        // 2304) must hold conn_mu_ before destroying its stack endpoint, so
+        // an idle waiter cannot retire and free it between unlock and Wake.
+        victim->Wake();  // Serve exits; its Lease destructor returns the range
+      }
       segment_evictions_.fetch_add(1, std::memory_order_relaxed);
       // Poll for the freed range (bounded). The victim's Serve thread tears
       // down its endpoint and releases the lease asynchronously.
