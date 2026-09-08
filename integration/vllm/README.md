@@ -233,12 +233,12 @@ contains before/after metric evidence.
 
 `model_name` is the exact vLLM `model_config.model`, not an extra-config key.
 The binary namespace and every object key bind it to the source-controlled
-`vllm-multiwr-v2` storage-layout ID; operator-supplied aliases are rejected.
+`vllm-multiwr-v3` storage-layout ID; operator-supplied aliases are rejected.
 
 Object keys are self-delimiting binary bytes: `DFKVPOOL\x02`, uint32-LE
 length-framed pool and full page hash, fixed `(uint32 size, int32 rank)` pairs
 for DP/TP/PCP/DCP/PP, uint32 KV-cache group, and the length-framed
-`vllm-multiwr-v2` component. There is exactly one key per logical chunk,
+`vllm-multiwr-v3` component. There is exactly one key per logical chunk,
 independent of its GPU segment count or the negotiated HCA `max_sge`. Every
 native operation receives a pointer plus its exact uint64 length (parallel
 pointer/length arrays for batch and SG); no C-string, decode/re-encode,
@@ -250,11 +250,15 @@ envelope. A read is accepted only when the object hits and its returned length
 exactly equals the complete destination-vector capacity; otherwise that logical
 chunk is failed closed and recomputed.
 
-`multiwr-v2` is a clean cutover from the former `sg-v1` physical-key layout.
-Old objects are cold misses by namespace/key identity: readers do not probe,
-assemble, or clean up v1 scatter-group siblings. Roll producers and consumers
-together; expect a cold external cache after rollout. Do not mix connector
-versions in one deployment.
+`multiwr-v3` is a clean cutover from `multiwr-v2` and `sg-v1`. Earlier
+payloads can contain only one physical kernel tile for an entire logical
+block or an incomplete set of TP state shards; those objects cannot be
+safely reused. Writers now gather every kernel tile belonging to a logical
+block, and Mamba state uses the `mamba` pool with physical TP coordinates.
+Old objects cold-miss by namespace/key identity; there is no legacy read,
+dual write, alias, or sibling cleanup. Roll Python producers and consumers
+together and expect a cold external cache. Native C ABI and server protocol
+compatibility are separate from this corrected Python raw-layout identity.
 
 Different namespace/key bytes are a cold miss. The same namespace+key with a
 different dtype, page/block size, shape, layer order, or KV memory layout is a

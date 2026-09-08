@@ -99,7 +99,7 @@ block-token and layer geometry, group, and replicated topology sizes.
 Connector-specific shape/stride fields feed the deterministic 64-bit layout
 fingerprint.
 
-The source-controlled layout IDs are `sglang-hicache/raw-v1`, `vllm/raw-v1`,
+The source-controlled layout IDs are `sglang-hicache/raw-v1`, `vllm-multiwr-v3`,
 and `lmcache/raw-v1`. Model/revision strings are preserved verbatim. Operators
 cannot alias namespaces through configuration: an identity-bearing schema
 change requires code review and a layout-ID bump, which deliberately starts a
@@ -162,20 +162,31 @@ Production discovery uses MDS.
 ### 4.1 RDMA v2 resource and failure invariants
 
 - `RdmaServer::Start` commits one aligned receive chunk. Additional chunks are
-  committed on allocation misses up to `DFKV_RDMA_RECV_SEGMENT_SIZE`; only the
-  chunk leased by a connection is registered on that endpoint's rail.
-- `DFKV_RDMA_MAX_BLOCK_BYTES` is the logical object safety ceiling. Each data
-  connection advertises `next_power_of_two(max(actual operation bytes,
-  DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES))`, capped by that ceiling.
+  committed on allocation misses up to `DFKV_RDMA_RECV_SEGMENT_SIZE`.
+  Resident receive slots pin their chunk through endpoint lifetime; operation
+  leases use exact MRs rather than retaining growth-chunk MRs in endpoint caches.
+- `DFKV_RDMA_MAX_BLOCK_BYTES` remains the logical safety ceiling for every API.
+  Inline operations select a power-of-two resident class. Leased PUT excludes
+  oversized objects from that resident geometry; dynamic direct GET uses the
+  minimum class independently of its operation's logical capacity.
 - The client selects a second power-of-two class from the operation's requested
   window: scalar QPs open at depth 1, while batches reuse/open the smallest
   sufficient depth up to the client/server ceiling.
-- The server validates the block class, negotiates the depth class, and leases
-  that many receive plus pull slots from rail-affinitized chunks. Pull arenas
-  use type-2 Memory Windows over a shared chunk MR, with exact-MR fallback.
-- A data slot is `align4K(4096 + connection_class)`. The hard receive budget
-  covers worst-case live/pooled QPs; resident memory grows by chunk and empty
+- Optional PUT and dynamic-pull capabilities are negotiated before geometry
+  selection and cached by peer identity/publication. Legacy peers retain
+  receive plus pull slots and their 73-byte readiness frame. Dynamic peers
+  omit the resident pull arena and use the 33-byte retirement readiness frame.
+- A resident slot is `align4K(4096 + connection_class)`. Both resident slots
+  and transient PUT/GET leases consume the same process hard budget. Empty
   non-initial chunks return after `DFKV_RDMA_RECV_CHUNK_IDLE_MS`.
+- Successful PUT deregisters its exact remote-WRITE MR before recycling the
+  range. Dynamic GET publishes an exact READ MR and waits for an explicit
+  generation-checked RELEASE; the client sends RELEASE only after local READ
+  completions and waits for ACK before idling. Failed connections destroy the
+  QP and revoke MRs before RAII returns backing ranges and decrements gauges.
+- Numeric rkeys can be recycled by providers after fresh registration; they
+  are not permanent nonces. Correctness relies on completion/release ordering,
+  generation checks for control messages, and endpoint fencing on failures.
 - Client host/device pools are registered once per rail at declaration time.
   Re-declaring the same base with a larger size registers the larger extent; the
   registration call returns false/nonzero unless the full range is ready. Buffers

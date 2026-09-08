@@ -63,7 +63,7 @@ def test_empty_ring_and_counter_deltas():
 
 def test_missing_metrics_are_absent_not_false_zeroes():
     poller = ClientStatsPoller(
-        lambda: "dfkv_client_ring_members 2\\n", tp_rank=0, interval_s=0)
+        lambda: "dfkv_client_ring_members 2\n", tp_rank=0, interval_s=0)
     poller.poll_once()
     assert poller.gauges() == {"dfkv_client_ring_members": 2.0}
 

@@ -87,6 +87,8 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 | `DFKV_RDMA_DEPTH` | `4` ceiling | 两侧保持上限一致 | scalar QP=depth1；batch按实际window选择最小power-of-two depth class，再由server cap钳制。 |
 | `DFKV_RDMA_MAX_BLOCK_BYTES` | 4 MiB 逻辑上限 | 覆盖最大合法对象 | 只做 deterministic oversize guard；不再让所有连接按最大值预留。 |
 | `DFKV_RDMA_CONNECTION_MIN_BLOCK_BYTES` | 256 KiB | 覆盖常见小块，保持默认起步 | 当前操作最大对象按 power-of-two 向上取 connection class；idle pool 选最小可满足 QP。 |
+| `DFKV_RDMA_INLINE_PUT_MAX_BYTES` | 4 MiB | 保持默认 | 超阈 scalar/SG PUT 协商操作级 staging lease；`0` 或空值禁用。不会放宽 `MAX_BLOCK_BYTES` 的业务上限。 |
+| `DFKV_RDMA_DYNAMIC_PULL` | `1` | 保持默认 | 支持的新 peer 逐 GET 申请 pull lease，READ 完成后显式释放并等待 ACK；`0` 保留旧连接级 pull arena。 |
 | `DFKV_RDMA_RECV_SEGMENT_SIZE` | 128 GiB | 按 peak live/pooled QP 设 hard budget | server receive-pool 最大提交量；不再启动期全量申请。 |
 | `DFKV_RDMA_RECV_CHUNK_BYTES` | 256 MiB | 保持默认，除非常见 connection class 更大 | server 启动只提交一个 chunk，后续 allocation miss 按需增长，不超过 hard budget。 |
 | `DFKV_RDMA_RECV_CHUNK_IDLE_MS` | 60 s | 保持默认 | 空闲非初始chunk到期返还；`0`关闭。增长chunk绑定首次使用rail/NUMA。 |
@@ -95,25 +97,28 @@ tp_rank=..,ver=<lib>`（无 `role`——HiCache 是前缀 L3 缓存，无生产/
 | `DFKV_CUDA_PINNED_POOL_BYTES` | 64 MiB（67108864） | 按进程允许的 CUDA pinned host memory / memlock 设置 | vLLM CUDA GET publication 的进程级 bounce pool 预算。取正十进制字节数，最大 4 GiB；预算向下取整为完整 slot，且至少容纳一个 slot、最多 4096 个。非法或与 slot 不兼容的组合告警并回退整组默认值。slot 按需创建，因此实际 pinned high-water 不超过取整后的预算。 |
 | `DFKV_CUDA_PINNED_SLOT_BYTES` | 4 MiB（4194304） | 保持能容纳常见单块；不必按最大 payload 预分配 | 固定 publication slot 大小，取 4 KiB–64 MiB 的正十进制字节数。非法值告警并回退默认 sizing。大 payload 按 slot 大小分块发布，不要求一个 payload 对应一个 slot。 |
 
-**v2 数据面**：PUT 把 `[request prefix | raw payload]` 以
-`RDMA_WRITE_WITH_IMM` 直接写入 server 租出的 slot；GET 先用 SEND 提交
-`{addr,rkey,len}` 目标描述符，server 再以 RDMA WRITE 直接散射到调用方
-buffer，最后只 SEND 状态与 authoritative stored length。两向 block payload
-都不经过 control buffer。`kMembers` 在隔离的 control lane 上使用显式
-`18-byte prefix + 32-KiB data` 容量；边界值完整返回，更大响应失败而不截断。
+**当前协商数据面**：inline PUT 仍使用 `RDMA_WRITE_WITH_IMM`；
+超阈 PUT 在 `kLeasePut` 返回 exact-MR 描述符后，将完整对象写入操作级租约。
+直接 scalar/SG GET 使用 `kPullRange` 返回的地址/rkey 发起 RDMA READ，
+随后发送 `kPullRelease` 并等待 ACK，才将连接归入 idle pool。
+新 peer 的 bootstrap 不再发布常驻 pull arena；旧 peer 保持原 73-byte
+readiness 与连接级 arena。字符串 Range/RangeMany 保持已有 staged-WRITE
+及 offset/length 语义。所有路径共用显式 `DFKV_RDMA_MAX_BLOCK_BYTES` 上限；
+不能用提高 inline 阈值绕过它。control response 上限仍为 32 KiB。
 
-**CUDA GET publication**：RDMA 仍写入每次请求自有的 pageable retry
-staging，而不是直接写调用方 CUDA 地址。这样失败 rail 的部分写入不会污染调用方
-buffer；只有最终获胜的完整尝试才进入 publication。进程级 pool 对固定大小 slot
-进行独占租赁；无空闲 slot 且预算已用尽时调用会阻塞等待（backpressure），不会
-继续分配。每个 slot 首次按需创建时使用 portable CUDA pinned host allocation；
-若该分配路径不可用，则以对齐 host allocation 加 portable CUDA host registration
-作为回退。slot 在其生命周期内只分配并 pin/register 一次。publication 对每块先
-从 pageable staging 复制到当次 leased slot，再在保留调用线程 CUDA context 的前提下
-排入异步 H2D copy；该块 stream 同步完成后才归还 slot。大 payload 逐块重复
-lease/copy/sync/release 流程。因此 CUDA GET 仍是 staged H2D，而不是 direct
-GPUDirect GET：后者无法满足“失败重试不得改动 caller buffer”的 publication
-fence。PUT 的 GPUDirect 路径不变。
+**CUDA GET publication 要区分传输路径**：原生 RDMA scalar/SG GET 可直接 READ
+到调用方已注册的 CUDA buffer。READ 完成后才报告命中；失败会 fence QP/MR，
+防止返回后仍有 DMA，但不会撤销已完成的部分写入。调用方必须忽略 miss/error
+对应的整个对象，不能把失败目标当作有效缓存。
+
+使用 `DestinationPublisher` 的 staged 读取路径则先写入请求自有的 pageable
+staging，只在选定完整结果后发布到 CUDA 目标。publication 从进程级有界 pool
+独占租赁 pinned slot；预算耗尽时等待，而不是继续分配。slot 首次按需创建时
+使用 portable CUDA pinned host allocation；必要时采用对齐 host allocation
+加 portable CUDA host registration。每个 slot 只 pin/register 一次。publication
+先复制到 slot，再在保留调用线程 CUDA context 的前提下执行异步 H2D copy；
+stream 同步完成后才归还 slot。大 payload 分块重复此流程。这一 staged 路径的
+原子发布保证不能套用到上面的原生 GPUDirect READ。
 
 容器和进程的 pinned-memory / `RLIMIT_MEMLOCK` 必须覆盖 pool **实际按需分配的
 high-water**（上限是向 slot 取整后的 pool budget），还要为进程内其他 locked
@@ -136,12 +141,27 @@ connection_class =
 depth_class = min(server_depth,
                   next_power_of_two(max(actual_window, 1)))
 S_data = align4K(4096 + connection_class)
-B_connection = 2 × depth_class × S_data
+B_connection_legacy = 2 × depth_class × S_data
+B_connection_dynamic = depth_class × S_data
 ```
 
 同一 peer/rail 的 idle pool 选择最小可满足 class；没有才建新 QP。pool 满时，
 较小返回连接可替换最大的 idle QP。偶发大对象因此只放大自己的连接，不放大所有
 rank/process 的常驻连接。
+
+动态 GET 的连接只需要 minimum-class resident receive slot；直接 GET 的
+数据缓冲按请求容量从 server receive pool 申请。超阈 PUT 的 resident class
+只需覆盖当前批次的 inline 部分。两类操作级租约也占用同一个 hard budget。
+MR 为 exact operation region：成功路径先注销再还内存；异常路径先销毁
+QP/MR，再由 RAII 归还区间。数值 rkey 可能被 provider 在新授权中复用，
+不是永久唯一 nonce；release generation 防止控制消息误释放新租约。
+
+滚动升级推荐 server-first；新 client 连接旧 server 时保留旧 wire 和连接池
+复用，不要求同步切换所有客户端。RDMA 能力升级不改变 raw value、slab 或
+原生 namespace/key codec；本版 vLLM 混合模型修复另有下述缓存身份切换，不能
+把 wire 兼容等同于所有旧 Python 缓存对象仍可复用。
+`DFKV_RDMA_DYNAMIC_PULL=0` 与 `DFKV_RDMA_INLINE_PUT_MAX_BYTES=0` 可分别
+关闭两项可选能力，不能替代真实旧版本混跑验收。
 
 server receive pool 以 `DFKV_RDMA_RECV_CHUNK_BYTES` 惰性提交，累计不超过
 `DFKV_RDMA_RECV_SEGMENT_SIZE`。预算仍按所有 rank/process 的 peak live +
@@ -225,7 +245,7 @@ connector-produced binary namespace bytes, batch concurrency, and optional
 client registration identity. Unknown flags/version/short structs fail closed.
 There are no post-open membership mutators, operator namespace aliases, or
 geometry parameters. The namespace binds the exact runtime model identity and
-connector raw-layout ID (`sglang-hicache/raw-v1`, `vllm/raw-v1`,
+connector raw-layout ID (`sglang-hicache/raw-v1`, `vllm-multiwr-v3`,
 `lmcache/raw-v1`). 可调字段只有 `tenant_id`（默认 `default`）与
 `model_revision`（默认取 model identity），走各连接器的 extra_config/config 键
 （§2.2 / §3.4 / §4.5）——多租户隔离或模型版本滚动时显式分开
@@ -467,6 +487,20 @@ sglang serve /models/glm-5.2-nvfp4 --served-model-name glm-5.2 \
 - **多池模型**（Mamba/SWA/DeepSeek-V4）用 v2 PoolTransfer 接口（插件已实现）。
   DSA/DeepSeekV4 主 `kv` 池是无数据的 LogicalHostPool（`get_page_buffer_meta→None`），
   插件对其 `batch_set_v1` 写空 marker 锚定命中前缀、`batch_get_v1` no-op，真实 KV 走 v2 侧池。
+- **Mamba＋DSA 混合模型必须同时注册 `KV`、`MAMBA`、`INDEXER`。**
+  只恢复 latent 与 recurrent state、遗漏历史 indexer 数据，会出现“所有已请求
+  对象均命中，但长提示答案错误”；不能通过增加生成长度或把命中计数当作正确性
+  来跳过检查。SGLang 的普通 DSA 路径正确注册 sidecar，不代表混合路径也已注册。
+  对尚缺该接线的引擎，随包提供
+  [混合 DSA indexer 修复补丁](../integration/hicache/patches/sglang-hybrid-mamba-dsa-indexer.patch)。
+  它修复引擎的 host-pool entry 与 `SidecarPoolSpec` 两处声明，不改变 dfkv
+  value/wire 格式。补丁的实测源文件是
+  `python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py`，
+  原始 SHA256 为 `48456e7ce2cf20f839d100333404c90ba1d65b370a7f8265e9bc044ec18c2216`；
+  应在对应 SGLang 源码树先执行 `git apply --check`，再应用、重建或部署受控
+  overlay。不要盲目覆盖其它引擎版本。启动池描述必须包含 `INDEXER`，并对原始
+  长提示执行完整进程重启后的 L3 回载与答案校验；旧的缺 indexer 缓存不能视为
+  完整命中。本轮验收使用了这项引擎修复，不能声称未修改的混合引擎已通过。
 - **identity/layout 必须协同发布。** namespace 使用 SGLang runtime 给出的精确
   `model_name` + `sglang-hicache/raw-v1`；同一模型的 pool/hash/并行坐标/component
   进入 canonical object key。dfkv value 只有 raw bytes，不会检查 page size、
@@ -684,7 +718,7 @@ vllm serve <model> \
 ```
 
 `model_name` 取 vLLM 的精确 `model_config.model`（即上面的 `<model>`），不是
-extra-config 键。namespace 始终绑定该 model identity 与 `vllm/raw-v1`；没有可配置
+extra-config 键。namespace 始终绑定该 model identity 与 `vllm-multiwr-v3`；没有可配置
 的 namespace alias。
 
 **备选（单节点/简单部署）：静态成员表** —— 无 MDS 时改用 `members`，节点增减需重启：
@@ -744,6 +778,43 @@ lsmod | grep nvidia_peermem
 功能验收不能只测同进程第二次请求：必须写入长 prompt，**重启整个 engine
 进程**后重复相同 prompt，确认 key 存在、cached tokens 接近完整 prompt，
 且 `dfkv_rdma_completion_errors_total` 无增量。
+
+#### 混合模型的存储完整性与升级边界
+
+- 每个持久化 group 保留自己的有效 block size；attention 按引擎的 DCP
+  规则换算逻辑覆盖，Mamba 状态不乘 DCP。scheduler LCM 只约束请求边界，
+  不能把一块较小的物理 attention 数据冒充整个 LCM 区间。
+- 明确 `participates_in_prefix_caching=False` 的 scratch pool 不生成缓存对象，
+  不约束 hash 粒度，也不会在回载时覆盖新请求的 scratch buffer。
+- Mamba/KDA 使用独立 `mamba` pool 和物理 TP rank，所有状态分片都必须存在。
+  MLA latent 的复制语义不能用于 recurrent state；混合模型不能通过客户端
+  收敛或 elision 丢弃状态分片。复制型 attention 保持原来的 writer striping。
+- lookup 缩短候选前缀后，必须重验该边界的 state mask。采样保留尾部在 lookup
+  前处理，不能在验证后再次把命中长度截短为另一个未经验证的 checkpoint。
+- 本版使用新的 `vllm-multiwr-v3` raw-layout ID，统一隔离可能欠填充或丢失 TP
+  分片的旧对象；不双读、不双写、不保留旧格式 alias。所有 vLLM Python
+  writer/reader 应协同升级并接受一次冷缓存。原生 C ABI、slab 和 RDMA wire
+  仍兼容；这不代表旧 Python payload layout 可以继续解码。
+- 引擎可能把一个逻辑 block 降为多个 kernel tile；注册时必须按 allocator 的
+  逻辑 block 数折叠物理 tile 轴，完整收集每个逻辑 block 的所有 bytes，不能
+  直接把逻辑 block ID 用作 kernel-tile 索引。
+
+
+#### 混合模型的 KV 加载故障恢复
+
+- vLLM 上游 `_handle_invalid_blocks` 的 `(req_block_ids,) = ...` 解包在多 KV-group
+  模型上必然抛 `ValueError`，导致 EngineCore 死亡。随包提供
+  [混合 invalid-blocks 修复补丁](../integration/vllm/patches/vllm-hybrid-invalid-blocks.patch)：
+  hybrid 请求按 per-group 外层 spec（AttentionSpec 乘 DCP）计算受影响前缀，
+  命中失败时使所有参与 group 的相关 block hash 失效（仅 hash，不释放 DMA 中
+  buffer），`skip_reading_prefix_cache=True` 后复用 `_preempt_request` 回到
+  waiting 队列本地重算；async 请求在 finished_recving 之后由既有
+  `_update_waiting_for_remote_kv` 释放。单 group 请求保留原最长有效前缀与
+  共享 block 优化。fail 策略仅上报受影响请求与 eviction 集合，不做重放。
+  dfkv 调度器同步配合：重放请求查询前丢弃残余 lookup/load_spec 并返回
+  `(0, False)`，不会反复撞同一外部缓存。补丁针对实测镜像
+  `vllm/vllm-openai:glm53-flash` 的 `vllm/v1/core/sched/scheduler.py`，应用前先
+  `git apply --check`；不可盲目覆盖其它引擎版本。
 
 ### 3.2 验证
 
@@ -1389,7 +1460,7 @@ prompt ≈4 GB KV」的 TTFT）：
 control plane；不同模型和 runtime 共用节点与 LRU，不等于共用 cache identity。
 
 默认自动 namespace 同时包含精确 runtime model identity 和 connector layout ID：
-`sglang-hicache/raw-v1`、`vllm/raw-v1` 或 `lmcache/raw-v1`。因此同名模型在不同
+`sglang-hicache/raw-v1`、`vllm-multiwr-v3` 或 `lmcache/raw-v1`。因此同名模型在不同
 runtime 默认也隔离。object key 再编码 pool、完整内容 hash、DP/TP/PCP/DCP/PP
 坐标、cache group、component 和可选 binary SG 坐标。
 

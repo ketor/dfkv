@@ -89,7 +89,9 @@ class DfkvStoreCoordinator:
         use_eagle: bool = False,
     ) -> None:
         assert all(
-            g.kv_cache_spec.block_size % hash_block_size == 0 for g in kv_cache_groups
+            g.kv_cache_spec.block_size % hash_block_size == 0
+            for g in kv_cache_groups
+            if getattr(_unwrap_spec(g.kv_cache_spec), "participates_in_prefix_caching", True)
         ), "block_size must be divisible by hash_block_size"
         assert scheduler_block_size % hash_block_size == 0, (
             f"scheduler_block_size ({scheduler_block_size}) must be a multiple of "
@@ -114,6 +116,8 @@ class DfkvStoreCoordinator:
         ] = []
         for i, g in enumerate(self.kv_cache_groups):
             spec = _unwrap_spec(g.kv_cache_spec)
+            if not getattr(spec, "participates_in_prefix_caching", True):
+                continue
             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
             assert manager_cls is not None, (
                 f"No manager registered for KVCacheSpec {spec}"

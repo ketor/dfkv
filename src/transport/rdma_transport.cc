@@ -3339,10 +3339,13 @@ Status RdmaTransport::PullInto(
           segment.second, static_cast<size_t>(ready.data_len) - copied);
       if (bytes == 0) continue;
       ibv_mr* mr = ep.RegisterTransient(segment.first, bytes);
-      if (!mr || InjectPullReadFailure() ||
+      if (!mr ||
           !ep.PostRead(0, segment.first, bytes, mr,
                        ready.address + copied, ready.rkey))
         return fail();
+      // Fault injection deliberately abandons an actually posted READ, not
+      // an unissued request: fail() must fence the QP before releasing its MR.
+      if (InjectPullReadFailure()) return fail();
       ibv_wc completion{};
       const int got = ep.WaitComp(&completion, 1, deadline.Remaining());
       if (got != 1 || completion.status != IBV_WC_SUCCESS ||

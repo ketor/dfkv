@@ -192,10 +192,12 @@ def _install_vllm_stubs() -> None:
     )
     stub(
         "vllm.v1.kv_cache_interface",
+        AttentionSpec=Placeholder,
         FullAttentionSpec=Placeholder,
         KVCacheConfig=Placeholder,
         KVCacheGroupSpec=Placeholder,
         KVCacheSpec=Placeholder,
+        MambaSpec=Placeholder,
         UniformTypeKVCacheSpecs=Placeholder,
     )
     stub("vllm.v1.outputs", KVConnectorOutput=Placeholder)
@@ -494,7 +496,7 @@ class ConnectorShutdownGateTest(unittest.TestCase):
 
 
 class LogicalChunkNamespaceTest(unittest.TestCase):
-    def test_multiwr_v2_component_isolated_from_legacy_layouts(self) -> None:
+    def test_current_component_isolated_from_incomplete_legacy_payloads(self) -> None:
         metadata = KeyMetadata(
             model_name="model",
             dp_size=2,
@@ -525,7 +527,7 @@ class LogicalChunkNamespaceTest(unittest.TestCase):
             pp_rank=1,
             group_id=5,
         )
-        expected_v2 = pool_key(
+        legacy_v2 = pool_key(
             chunk_hash,
             component="vllm-multiwr-v2",
             **coordinates,
@@ -541,9 +543,7 @@ class LogicalChunkNamespaceTest(unittest.TestCase):
             **coordinates,
         )
 
-        self.assertEqual(generated, expected_v2)
-        self.assertNotEqual(generated, legacy_raw)
-        self.assertNotEqual(generated, legacy_sg)
+        self.assertNotIn(generated, {legacy_v2, legacy_raw, legacy_sg})
 
 
 class _PromMetric:

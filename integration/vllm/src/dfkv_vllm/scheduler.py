@@ -92,8 +92,14 @@ class DfkvStoreScheduler:
         Returns ``(None, False)`` while an asynchronous lookup is pending so
         vLLM retries the request on a later scheduler step.
         """
-        # Look up against the full prefill range, not just the prompt.
-        token_len = request.num_tokens // self._block_size * self._block_size
+        if getattr(request, "skip_reading_prefix_cache", False):
+            self.client.discard(request.request_id)
+            self.load_specs.pop(request.request_id, None)
+            return 0, False
+
+        # Leave the sampling tail before lookup: shortening an already
+        # validated hit can select different recurrent-state checkpoint keys.
+        token_len = (request.num_tokens - 1) // self._block_size * self._block_size
         if token_len < self._block_size:
             return 0, False
 
@@ -111,13 +117,6 @@ class DfkvStoreScheduler:
             request.request_id, request.num_tokens, num_computed_tokens,
             (time.perf_counter() - _lk0) * 1000.0, num_external_hit_tokens,
         )
-        if num_external_hit_tokens == request.num_tokens:
-            # Leave a sub-block tail uncomputed for sampling, on a block
-            # boundary so the recv-side load mask covers every yielded chunk.
-            num_external_hit_tokens = max(
-                0,
-                (request.num_tokens - 1) // self._block_size * self._block_size,
-            )
 
         if num_external_hit_tokens < num_computed_tokens:
             need_to_allocate = 0

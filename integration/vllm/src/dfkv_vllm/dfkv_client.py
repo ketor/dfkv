@@ -23,6 +23,9 @@ c_void_p = ctypes.c_void_p
 c_uint64 = ctypes.c_uint64
 c_int = ctypes.c_int
 
+
+
+
 class _FlatSgVectorView(Sequence[int]):
     """Read-only view of one key's slice in a flat ctypes descriptor array."""
 
