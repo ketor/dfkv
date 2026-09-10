@@ -342,7 +342,7 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self):
         self._begin_call()
         try:
-            # No-op: stores are issued in get_finished() for compute overlap.
+            # get_finished submits stores and fences mutable/windowed sources.
             return
         finally:
             self._finish_call()

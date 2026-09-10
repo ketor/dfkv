@@ -75,8 +75,9 @@ class PreemptFenceTest(unittest.TestCase):
                 return []
 
         t = self._mk_thread(Coord())
-        t.add_stored_request("r1")
-        t.add_request(_req_meta("r1"))
+        request = _req_meta("r1")
+        t.add_stored_request(request)
+        t.add_request(request)
         self.assertTrue(entered.wait(5), "store should be executing")
 
         # Preemption path: drop queued entries, then join the executing one.
@@ -104,9 +105,10 @@ class PreemptFenceTest(unittest.TestCase):
                 return []
 
         t = self._mk_thread(Coord())
-        t.add_stored_request("r2")
+        request = _req_meta("r2")
+        t.add_stored_request(request)
         t.delete_finished_stored_request("r2")  # preempt before dequeue
-        t.add_request(_req_meta("r2"))
+        t.add_request(request)
         t.request_queue.join()  # waits for task_done of the dropped entry
         self.assertEqual(calls, [], "dropped entry must never start a store")
         self.assertTrue(t.wait_for_inflight_put("r2", timeout_s=1))

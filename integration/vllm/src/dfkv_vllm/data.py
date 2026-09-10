@@ -26,10 +26,10 @@ from vllm.v1.core.kv_cache_utils import (
 
 logger = init_logger(__name__)
 
-# Bind complete logical-block payloads and per-TP state to a new identity.
-# Older layouts may contain only one kernel tile for a whole logical block;
-# they must cold-miss, never be decoded through a compatibility fallback.
-VLLM_RAW_LAYOUT = b"vllm-multiwr-v3"
+# Bind full cache-spec geometry and stable draft context to a new identity.
+# Older payloads may have incompatible indexer layouts or volatile draft tails;
+# they must cold-miss rather than enter the current restore path.
+VLLM_RAW_LAYOUT = b"vllm-multiwr-v4"
 
 def key_diagnostic_label(key: bytes) -> str:
     """Return the standard non-reversible diagnostic label for a store key."""
@@ -440,6 +440,8 @@ class ReqMeta:
     load_spec: LoadSpec | None = None
     is_last_chunk: bool | None = None
     current_event: torch.cuda.Event | None = None
+    # Assigned by the worker when registering a SAVE, never a cache-key field.
+    save_generation: int = 0
 
     token_ids: list[int] | None = None
 
