@@ -14,6 +14,7 @@ offload staging, ReplicateConfig/preferred_segment) are dropped.
 """
 
 import dataclasses
+import json
 import logging
 import os
 import queue
@@ -24,6 +25,8 @@ import zlib
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from enum import Enum
+from fractions import Fraction
 
 from typing import Any, TypeVar
 
@@ -47,6 +50,7 @@ from vllm.distributed import (
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import init_logger
 from vllm.utils.network_utils import make_zmq_socket
+from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     maybe_convert_block_hash,
@@ -54,6 +58,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec, KVCacheConfig, KVCacheGroupSpec, MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 # dfkv: get_dp_engine_index replaces mooncake_utils.get_mooncake_dp_engine_index;
@@ -150,10 +155,40 @@ class _KeyStripeIdentity:
 
 
 def _effective_cache_spec(spec, dcp_size: int):
-    """Use the same outer-spec DCP rule as resolve_kv_cache_block_sizes."""
+    """Use the running engine's DCP normalization, including wrapped specs."""
+    resolver = getattr(kv_cache_utils, "resolve_dcp_kv_cache_spec", None)
+    if resolver is not None:
+        return resolver(spec, dcp_size)
     if dcp_size == 1 or not isinstance(spec, AttentionSpec):
         return spec
     return dataclasses.replace(spec, block_size=spec.block_size * dcp_size)
+
+
+def _cache_group_layout(groups: Sequence[KVCacheGroupSpec]) -> str:
+    """Bind cached bytes to full per-group geometry, not only block size."""
+    def encode(value):
+        if isinstance(value, torch.dtype):
+            return str(value)
+        if isinstance(value, Fraction):
+            return {"numerator": value.numerator, "denominator": value.denominator}
+        if isinstance(value, Enum):
+            return value.value
+        raise TypeError(f"Unsupported cache-spec value: {type(value).__qualname__}")
+
+    return json.dumps(
+        [
+            {
+                "layers": sorted(group.layer_names),
+                "spec_type": type(group.kv_cache_spec).__qualname__,
+                "spec": dataclasses.asdict(group.kv_cache_spec),
+                "is_eagle_group": group.is_eagle_group,
+            }
+            for group in groups
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+        default=encode,
+    )
 
 
 def _key_stripe_identity(
@@ -608,6 +643,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.coord = coord
         self.kv_role = kv_role
         self.stored_requests: defaultdict[str, int] = defaultdict(int)
+        self._save_generations: dict[str, int] = {}
+        self._next_save_generation = 0
         self.enable_kv_event = enable_kv_event
         # Which request _handle_request is executing right now. Published under
         # done_task_lock together with the dequeue gate below, so a request is
@@ -616,26 +653,33 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self._active_req_id: str | None = None
         self._active_cv = threading.Condition(self.done_task_lock)
 
-    def add_stored_request(self, req_id: str):
+    def add_stored_request(self, request: ReqMeta):
         with self.done_task_lock:
+            req_id = request.req_id
+            if req_id not in self.stored_requests:
+                self._next_save_generation += 1
+                self._save_generations[req_id] = self._next_save_generation
+            request.save_generation = self._save_generations[req_id]
             self.stored_requests[req_id] += 1
 
-    def dec_stored_request(self, req_id: str):
+    def dec_stored_request(self, request: ReqMeta):
         with self.done_task_lock:
-            if req_id in self.stored_requests:
+            req_id = request.req_id
+            if self._save_generations.get(req_id) == request.save_generation:
                 self.stored_requests[req_id] -= 1
 
     def delete_finished_stored_request(self, req_id: str):
         with self.done_task_lock:
             if req_id in self.stored_requests:
                 del self.stored_requests[req_id]
+            self._save_generations.pop(req_id, None)
 
     def wait_for_inflight_put(self, req_id: str, timeout_s: float = 30.0) -> bool:
         """Block until no store for ``req_id`` is currently executing.
 
         Queued-but-not-started entries are handled by
-        delete_finished_stored_request() + the dequeue gate (they get dropped
-        before any GPU read); the one entry the thread may already be
+        delete_finished_stored_request() + the generation gate (old entries
+        cannot revive when the same request ID resumes); the one entry already
         executing cannot be cancelled -- it holds an RDMA read against the
         request's GPU blocks -- so the preemption path must wait it out
         before those blocks can be handed to another request. Returns False
@@ -656,13 +700,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
         req_id = req_meta.req_id
         current_event = req_meta.current_event
 
-        # Publish the active request and take the dequeue gate under ONE lock
-        # acquisition: a concurrent preemption fence either deletes the counter
-        # first (we drop the entry here) or sees _active_req_id == req_id and
-        # waits for the finally below. No window where the put runs invisibly.
+        # Publish the active request under the same lock as the generation
+        # gate. A preemption either invalidates this generation before any GPU
+        # read or observes it in flight and waits for it to complete.
         with self.done_task_lock:
             self._active_req_id = req_id
-            gate_ok = req_id in self.stored_requests
+            gate_ok = self._save_generations.get(req_id) == req_meta.save_generation
         if not gate_ok:
             with self._active_cv:
                 self._active_req_id = None
@@ -707,6 +750,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     stripe_position += 1
                     if not selected:
                         continue
+                    if logical_block_ids_per_group[g_idx][chunk_idx] <= 0:
+                        # HMA may already have released an earlier window.
+                        # Null/padding slots are not valid immutable objects.
+                        continue
                     starts.append(start)
                     ends.append(end)
                     keys.append(key.to_bytes())
@@ -717,7 +764,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if not keys:
                 return
 
-            # A multiwr-v2 chunk is exactly one dfkv object. The native client
+            # A logical chunk is exactly one dfkv object. The native client
             # owns any HCA-width windowing, so dedup probes the logical keys
             # directly and a missing object is rewritten as a whole.
             save_exists_start = time.perf_counter()
@@ -882,12 +929,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
             with self._active_cv:
                 self._active_req_id = None
                 self._active_cv.notify_all()
-            self.dec_stored_request(req_id)
+            self.dec_stored_request(req_meta)
 
     def _cancel_request(self, req_meta: Any) -> None:
         # Keep a zero-valued entry so _get_and_clear_finished_sending can
         # acknowledge a finished request whose save was rejected/cancelled.
-        self.dec_stored_request(req_meta.req_id)
+        self.dec_stored_request(req_meta)
 
 
 class KVCacheStoreRecvingThread(KVTransferThread):
@@ -928,6 +975,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             record_observation=record_observation,
             record_pool_sample=record_pool_sample,
             queue_capacity=queue_capacity,
+        )
+        # CUDA's current device is thread-local. Capture the model owner's
+        # device here; receive-pool threads must not fence their default GPU 0.
+        self._cuda_device = (
+            torch.cuda.current_device() if torch.cuda.is_available() else None
         )
         self.recv_workers = _parse_recv_workers(recv_workers)
         self.load_window_keys = _parse_load_window_keys(load_window_keys)
@@ -1238,6 +1290,11 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     if chunk_idx >= len(mask) or not mask[chunk_idx]:
                         continue
                     block_id = logical_block_ids[chunk_idx]
+                    if block_id <= 0:
+                        raise ValueError(
+                            f"LOAD requires an allocated block: group={g_idx} "
+                            f"chunk={chunk_idx} block_id={block_id}"
+                        )
                     key_list.append(key.to_bytes())
                     descriptor_chunks.append(
                         (db, start, end, logical_block_ids)
@@ -1336,9 +1393,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             # the loaded blocks. DFKV_GPU_LOAD_FENCE=0 disables.
             if (
                 os.environ.get("DFKV_GPU_LOAD_FENCE", "1") == "1"
-                and torch.cuda.is_available()
+                and self._cuda_device is not None
             ):
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(self._cuda_device)
             failed_block_ids = [rotated_block_ids[i] for i in failed_indices]
             self._record_operation(
                 "load_get",
@@ -1546,6 +1603,26 @@ class DfkvStoreWorker:
             )
             for group in kv_cache_config.kv_cache_groups
         ]
+        self._store_requires_step_fence = False
+        for group in self._kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            if not _prefix_cacheable(group_spec):
+                continue
+            specs = (
+                group_spec.kv_cache_specs.values()
+                if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                else (group_spec,)
+            )
+            if any(
+                isinstance(spec, MambaSpec)
+                or any(
+                    getattr(spec, field, None) is not None
+                    for field in ("sliding_window", "attention_chunk_size", "rswa_window")
+                )
+                for spec in specs
+            ):
+                self._store_requires_step_fence = True
+                break
 
         # CLIENT_RANKS (issue #111): converge store-side dfkv clients onto a
         # subset of ranks when the KV object is fully TP-replicated.
@@ -1621,12 +1698,7 @@ class DfkvStoreWorker:
         )
         _cache_dtype = str(
             getattr(self.cache_config, "cache_dtype", "unknown"))
-        _group_layout = "|".join(
-            f"{idx}:{type(group.kv_cache_spec).__name__}:"
-            f"{int(getattr(group.kv_cache_spec, 'block_size', 0))}:"
-            f"{','.join(sorted(group.layer_names))}"
-            for idx, group in enumerate(kv_cache_config.kv_cache_groups)
-        )
+        _group_layout = _cache_group_layout(kv_cache_config.kv_cache_groups)
         key_namespace = canonical_namespace(
             model_identity,
             VLLM_RAW_LAYOUT.decode("ascii"),
@@ -1650,6 +1722,7 @@ class DfkvStoreWorker:
                 "pcp_size": self.pcp_size,
                 "dcp_size": self.dcp_size,
                 "group_layout": _group_layout,
+                "kv_cache_layout": getattr(kv_cache_config, "kv_cache_layout", None),
             },
         )
         # Same-host rendezvous defaults on only for replicated MLA topology:
@@ -1742,7 +1815,7 @@ class DfkvStoreWorker:
             spec_cfg.use_eagle()
             if spec_cfg is not None and callable(getattr(spec_cfg, "use_eagle", None))
             else False
-        )
+        ) and not getattr(spec_cfg, "disable_eagle_block_drop", False)
         self.coord = DfkvStoreCoordinator(
             self._kv_cache_groups,
             scheduler_block_size=self.block_size,
@@ -2043,23 +2116,16 @@ class DfkvStoreWorker:
             load_spec.token_len = load_spec.kvpool_cached_tokens
             self.kv_recv_thread.load_request_sync(request)
 
-    def wait_for_save(
-        self,
-        metadata: DfkvStoreConnectorMetadata,
-    ):
-        """No-op: stores are issued in get_finished() for overlap."""
-        pass
 
     def get_finished(
         self,
         finished_req_ids: set[str],
         meta: DfkvStoreConnectorMetadata,
     ) -> tuple[set[str], set[str]]:
-        """Issue all I/O and get completed send/recv request IDs.
+        """Submit post-forward I/O and collect completed request IDs.
 
-        All load and store I/O requests are issued here (after model
-        compute is launched on the compute stream) for better
-        compute-I/O overlap.
+        Mutable and windowed stores finish before the next model step can
+        overwrite their sources; full-attention stores retain async overlap.
         """
         # Aborted/finished requests may have an outstanding remote load.  Their
         # blocks cannot be freed until that request's own GPUDirect write exits.
@@ -2094,12 +2160,18 @@ class DfkvStoreWorker:
                     continue
                 request.current_event = current_event
                 assert self.kv_send_thread is not None
-                self.kv_send_thread.add_stored_request(request.req_id)
+                self.kv_send_thread.add_stored_request(request)
                 self.kv_send_thread.add_request(request)
+
+            if current_event is not None and self._store_requires_step_fence:
+                # A following step may update recurrent state or free/reuse
+                # a window block even while this request is still running.
+                # Preserve those source bytes until the native PUT completes.
+                self.kv_send_thread.request_queue.join()
 
         # Check completion of previously queued transfers
         done_sending = (
-            self._get_and_clear_finished_sending(finished_req_ids, meta)
+            self._get_and_clear_finished_sending(finished_req_ids)
             if self.kv_role in ["kv_producer", "kv_both"]
             else set()
         )
@@ -2174,13 +2246,9 @@ class DfkvStoreWorker:
     def _get_and_clear_finished_sending(
         self,
         finished_req_ids: set[str],
-        meta: DfkvStoreConnectorMetadata,
     ) -> set[str]:
         assert self.kv_send_thread is not None
         finished_sending: set[str] = set()
-
-        for req_id in meta.preempted_req_ids:
-            self.kv_send_thread.delete_finished_stored_request(req_id)
 
         for req_id in self.kv_send_thread.stored_requests.copy():
             if (
@@ -2218,25 +2286,19 @@ class DfkvStoreWorker:
             candidate_meta: list[tuple[int, int, int, bytes]] = []
             expected_per_object: dict[tuple[int, int, int, bytes], int] = {}
             tp_count = min(self.tp_size, self.num_kv_head)
-            # dfkv: gate candidates by store_mask -- the SAME per-(group,chunk) set
-            # the SAVE path stores (worker.py save gate) and the LOAD path reads
-            # (load_mask delegates to store_mask). For SlidingWindow groups (V4-Flash
-            # has 4 of them besides the full-MLA group) store_mask keeps only the
-            # in-window tail chunks; without this gate the lookup enumerated every
-            # chunk (4830 vs the 1058 actually stored), so find_longest_cache_hit's
-            # SWA walk demanded never-stored pre-window chunks and collapsed to 0.
+            # SAVE omits volatile draft tails. Admission must instead prove
+            # every object LOAD needs at this exact candidate boundary.
             aligned_token_len = (
                 token_len // self.coord.lcm_block_size * self.coord.lcm_block_size
             )
-            store_masks = self.coord.store_mask(aligned_token_len)
+            load_masks = self.coord.load_mask(block_hashes, aligned_token_len)
             if aligned_token_len == 0:
                 return 0
             num_prefix_chunks = aligned_token_len // self.coord.lcm_block_size
-            required_objects_per_chunk = [0] * num_prefix_chunks
             missing_required_per_chunk = [False] * num_prefix_chunks
             for g_idx, db in enumerate(self.token_dbs):
                 spec_block_size = db.block_size
-                mask = store_masks[g_idx]
+                mask = load_masks[g_idx]
                 if not mask:
                     continue
                 group_hashes = self.coord.block_hashes_for_spec(
@@ -2267,7 +2329,6 @@ class DfkvStoreWorker:
                     logical_chunk_idx = start_idx // self.coord.lcm_block_size
                     object_meta = (logical_chunk_idx, g_idx, chunk_id, bytes(h))
                     expected_per_object[object_meta] = rank_probes
-                    required_objects_per_chunk[logical_chunk_idx] += 1
                     for tp in tp_candidates:
                         # Keep this worker's own pp_rank (db.metadata.pp_rank): PP
                         # partitions layers, so each (group, chunk) lives under a
@@ -2340,20 +2401,17 @@ class DfkvStoreWorker:
                     )
     
             complete_chunks = [
-                required > 0 and not missing_required_per_chunk[idx]
-                for idx, required in enumerate(required_objects_per_chunk)
+                not missing_required_per_chunk[idx]
+                for idx in range(num_prefix_chunks)
             ]
-            exists_set: set[tuple[int, bytes]] = set()
             for object_meta, expected in expected_per_object.items():
-                logical_chunk_idx, g_idx, _chunk_id, chunk_hash = object_meta
+                logical_chunk_idx = object_meta[0]
                 if present_per_object.get(object_meta, 0) != expected:
                     complete_chunks[logical_chunk_idx] = False
-                else:
-                    exists_set.add((g_idx, chunk_hash))
     
             prefix_chunks = 0
-            for chunk_idx, complete in enumerate(complete_chunks):
-                if required_objects_per_chunk[chunk_idx] == 0 or not complete:
+            for complete in complete_chunks:
+                if not complete:
                     break
                 prefix_chunks += 1
             complete_prefix_tokens = prefix_chunks * self.coord.lcm_block_size

@@ -255,7 +255,7 @@ connector-produced binary namespace bytes, batch concurrency, and optional
 client registration identity. Unknown flags/version/short structs fail closed.
 There are no post-open membership mutators, operator namespace aliases, or
 geometry parameters. The namespace binds the exact runtime model identity and
-connector raw-layout ID (`sglang-hicache/raw-v1`, `vllm-multiwr-v3`,
+connector raw-layout ID (`sglang-hicache/raw-v1`, `vllm-multiwr-v4`,
 `lmcache/raw-v1`). 可调字段只有 `tenant_id`（默认 `default`）与
 `model_revision`（默认取 model identity），走各连接器的 extra_config/config 键
 （§2.2 / §3.4 / §4.5）——多租户隔离或模型版本滚动时显式分开
@@ -729,7 +729,7 @@ vllm serve <model> \
 ```
 
 `model_name` 取 vLLM 的精确 `model_config.model`（即上面的 `<model>`），不是
-extra-config 键。namespace 始终绑定该 model identity 与 `vllm-multiwr-v3`；没有可配置
+extra-config 键。namespace 始终绑定该 model identity 与 `vllm-multiwr-v4`；没有可配置
 的 namespace alias。
 
 **备选（单节点/简单部署）：静态成员表** —— 无 MDS 时改用 `members`，节点增减需重启：
@@ -802,10 +802,13 @@ lsmod | grep nvidia_peermem
   收敛或 elision 丢弃状态分片。复制型 attention 保持原来的 writer striping。
 - lookup 缩短候选前缀后，必须重验该边界的 state mask。采样保留尾部在 lookup
   前处理，不能在验证后再次把命中长度截短为另一个未经验证的 checkpoint。
-- 本版使用新的 `vllm-multiwr-v3` raw-layout ID，统一隔离可能欠填充或丢失 TP
-  分片的旧对象；不双读、不双写、不保留旧格式 alias。所有 vLLM Python
-  writer/reader 应协同升级并接受一次冷缓存。原生 C ABI、slab 和 RDMA wire
-  仍兼容；这不代表旧 Python payload layout 可以继续解码。
+- 本版使用 `vllm-multiwr-v4` raw-layout ID，并把完整有效 cache-spec 几何绑定到
+  namespace，隔离旧布局和可能包含易变草稿状态的对象。不双读、不双写、
+  不保留旧格式 alias；所有 vLLM Python writer/reader 应协同升级并接受一次
+  冷缓存。原生 C ABI、slab 和 RDMA wire 不变，旧对象无需删除。
+- SAVE 排除易变草稿尾部，LOOKUP 按缩短后边界的实际必需对象判断，LOAD 恢复
+  已准入边界的全部必需 group。窗口/循环状态的 PUT 必须在下一步覆盖源缓存前
+  完成；异步 GET 在接收器构造时捕获的模型 CUDA device 上完成 fence。
 - 引擎可能把一个逻辑 block 降为多个 kernel tile；注册时必须按 allocator 的
   逻辑 block 数折叠物理 tile 轴，完整收集每个逻辑 block 的所有 bytes，不能
   直接把逻辑 block ID 用作 kernel-tile 索引。
@@ -1471,7 +1474,7 @@ prompt ≈4 GB KV」的 TTFT）：
 control plane；不同模型和 runtime 共用节点与 LRU，不等于共用 cache identity。
 
 默认自动 namespace 同时包含精确 runtime model identity 和 connector layout ID：
-`sglang-hicache/raw-v1`、`vllm-multiwr-v3` 或 `lmcache/raw-v1`。因此同名模型在不同
+`sglang-hicache/raw-v1`、`vllm-multiwr-v4` 或 `lmcache/raw-v1`。因此同名模型在不同
 runtime 默认也隔离。object key 再编码 pool、完整内容 hash、DP/TP/PCP/DCP/PP
 坐标、cache group、component 和可选 binary SG 坐标。
 

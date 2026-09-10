@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### vLLM stable hybrid and speculative cache restoration
+
+- Separate stable SAVE masks from LOAD requirements; exclude volatile draft
+  state and validate required objects at each shortened lookup boundary.
+- Bind full effective cache-spec geometry, including wrapped/DCP-adjusted
+  specs, into the `vllm-multiwr-v4` identity. Earlier Python layouts cold-miss;
+  the native C ABI and server wire protocol are unchanged.
+- Reject unallocated LOAD destinations and incomplete source chunks instead
+  of reading or publishing invalid cache state.
+- Drain mutable/windowed SAVE sources before the next model step can overwrite
+  them, while retaining overlap for immutable full-attention sources.
+- Fence asynchronous GET completion on the owning CUDA device captured from
+  the model thread, rather than the receive thread's default device.
+- Preserve fresh allocation and LOAD state when preemption and resumption
+  happen in the same scheduler step; clear the resume marker when MRV2
+  introduces the request again.
+- Restore MRV1 resumed requests from the complete allocated block table,
+  including asynchronously loaded blocks, rather than the step's delta.
+- Keep resumed SAVE completion accounting until finished GPU blocks can be
+  released; invalidate old SAVE generations before reuse so queued or cancelled
+  work cannot revive or decrement a new generation's counter.
+
 ### Operation-scoped RDMA staging
 
 - Large scalar and scatter/gather PUTs negotiate exact operation-scoped

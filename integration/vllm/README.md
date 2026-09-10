@@ -233,12 +233,12 @@ contains before/after metric evidence.
 
 `model_name` is the exact vLLM `model_config.model`, not an extra-config key.
 The binary namespace and every object key bind it to the source-controlled
-`vllm-multiwr-v3` storage-layout ID; operator-supplied aliases are rejected.
+`vllm-multiwr-v4` storage-layout ID; operator-supplied aliases are rejected.
 
 Object keys are self-delimiting binary bytes: `DFKVPOOL\x02`, uint32-LE
 length-framed pool and full page hash, fixed `(uint32 size, int32 rank)` pairs
 for DP/TP/PCP/DCP/PP, uint32 KV-cache group, and the length-framed
-`vllm-multiwr-v3` component. There is exactly one key per logical chunk,
+`vllm-multiwr-v4` component. There is exactly one key per logical chunk,
 independent of its GPU segment count or the negotiated HCA `max_sge`. Every
 native operation receives a pointer plus its exact uint64 length (parallel
 pointer/length arrays for batch and SG); no C-string, decode/re-encode,
@@ -250,20 +250,33 @@ envelope. A read is accepted only when the object hits and its returned length
 exactly equals the complete destination-vector capacity; otherwise that logical
 chunk is failed closed and recomputed.
 
-`multiwr-v3` is a clean cutover from `multiwr-v2` and `sg-v1`. Earlier
-payloads can contain only one physical kernel tile for an entire logical
-block or an incomplete set of TP state shards; those objects cannot be
-safely reused. Writers now gather every kernel tile belonging to a logical
-block, and Mamba state uses the `mamba` pool with physical TP coordinates.
-Old objects cold-miss by namespace/key identity; there is no legacy read,
-dual write, alias, or sibling cleanup. Roll Python producers and consumers
-together and expect a cold external cache. Native C ABI and server protocol
-compatibility are separate from this corrected Python raw-layout identity.
+`multiwr-v4` binds the full effective cache-spec geometry into the namespace,
+including wrapped specs and DCP-adjusted block coverage. It is a clean cutover
+from earlier Python layouts: old objects cold-miss, with no legacy read,
+dual write, alias, or cleanup of existing objects. Roll Python producers and
+consumers together and expect a cold external cache. The native C ABI and
+server protocol are unchanged.
 
-Different namespace/key bytes are a cold miss. The same namespace+key with a
-different dtype, page/block size, shape, layer order, or KV memory layout is a
-type-safety violation, not a guarded miss. Such changes require another
-source-controlled layout-ID bump and coordinated writer/reader deployment.
+SAVE persists only stable context, excluding the volatile speculative tail.
+LOOKUP checks the actual objects required by the shorter candidate boundary;
+LOAD restores every group needed at that admitted boundary. Missing required
+source blocks cannot publish a complete logical chunk, and unallocated LOAD
+destinations fail before writing memory. Windowed or recurrent SAVE sources
+remain protected until the native PUT finishes, before the next model step
+can recycle or overwrite them. Asynchronous GET completion fences the CUDA
+device captured from the model thread, not the receive thread's default GPU.
+Same-step preemption/resumption preserves fresh allocation and LOAD metadata;
+both runner formats restore from the complete block table, not an allocation
+delta. For an administrative reset of running requests, first drain in-flight
+GPU steps with the engine's keep-mode pause; deferred block references can
+otherwise prevent the reset. Preserve the external cache and resume afterward.
+SAVE queue entries also carry a worker-local generation. Reusing a request ID
+cannot revive an old queued SAVE or let its cancellation decrement the new
+generation's completion counter.
+
+Different namespace/key bytes are a cold miss. Byte-layout changes not captured
+by the effective cache-spec identity still require a source-controlled layout-ID
+bump and coordinated writer/reader deployment.
 Cross-runtime sharing requires both identical object keys and byte-compatible
 payload layouts.
 

@@ -81,6 +81,7 @@ class DfkvStoreScheduler:
         self._preempted_req_ids: set[str] = set()  # preempted requests
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
+        self._allocated_req_ids: set[str] = set()
 
     def get_num_new_matched_tokens(
         self,
@@ -153,6 +154,7 @@ class DfkvStoreScheduler:
 
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         self._unfinished_request_ids.add(request.request_id)
+        self._allocated_req_ids.add(request.request_id)
 
         if request.request_id not in self.load_specs:
             return
@@ -193,10 +195,13 @@ class DfkvStoreScheduler:
         self._preempted_req_ids.update(preempted_ids)
         for req_id in preempted_ids:
             self.client.discard(req_id)
-            self.load_specs.pop(req_id, None)
+            # Allocation callbacks can already describe a same-step resume.
+            # Discard only the preemption's old allocation/load state.
+            if req_id not in self._allocated_req_ids:
+                self.load_specs.pop(req_id, None)
+                self._unfinished_requests.pop(req_id, None)
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
-            self._unfinished_requests.pop(req_id, None)
 
         meta = DfkvStoreConnectorMetadata(
             self._unfinished_request_ids,
@@ -205,6 +210,7 @@ class DfkvStoreScheduler:
 
         # Handle new requests
         for request in scheduler_output.scheduled_new_reqs:
+            self._preempted_req_ids.discard(request.req_id)
             load_spec = self.load_specs.pop(request.req_id, None)
             num_tokens_to_compute = (
                 request.num_computed_tokens
@@ -250,20 +256,15 @@ class DfkvStoreScheduler:
         if not force_skip_save:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids:
+                if not new_block_ids and req_id not in self._preempted_req_ids:
                     continue
 
                 req_meta = None
                 if req_id in self._preempted_req_ids:
                     # Resumed after preemption
-                    if isinstance(new_block_ids, tuple):
-                        new_block_ids = tuple(b.copy() for b in new_block_ids)
-                    else:
-                        new_block_ids = (new_block_ids.copy(),)
                     self._preempted_req_ids.discard(req_id)
                     load_spec = self.load_specs.pop(req_id, None)
-                    request_tuple = self._unfinished_requests.get(req_id)
-                    request_real = request_tuple[0]  # type: ignore[index]
+                    request_real, allocated_block_ids = self._unfinished_requests[req_id]
                     num_tokens_to_compute = (
                         request_real.num_computed_tokens
                         + scheduler_output.num_scheduled_tokens[req_id]
@@ -274,7 +275,7 @@ class DfkvStoreScheduler:
                     request_tracker = RequestTracker(
                         req_id=req_id,
                         token_len=num_tokens_to_compute,
-                        allocated_block_ids=new_block_ids,
+                        allocated_block_ids=tuple(b.copy() for b in allocated_block_ids),
                         num_saved_tokens=0,
                         token_ids=prefill_tokens[:num_tokens_to_compute].copy(),
                         prefill_end_tokens=len(prefill_tokens),
@@ -363,6 +364,7 @@ class DfkvStoreScheduler:
                 if req_meta is not None:
                     meta.add_request(req_meta)
 
+        self._allocated_req_ids.clear()
         return meta
 
     def request_finished(
