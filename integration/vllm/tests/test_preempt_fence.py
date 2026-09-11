@@ -13,6 +13,8 @@ import types
 import unittest
 
 try:
+    from dfkv_vllm.connector import DfkvStoreConnector
+    from dfkv_vllm.data import DfkvStoreConnectorMetadata
     from dfkv_vllm.worker import KVCacheStoreSendingThread
 
     HAVE_VLLM = True
@@ -59,6 +61,29 @@ class PreemptFenceTest(unittest.TestCase):
         self.assertTrue(ready.wait(5))
         self._threads.append(t)
         return t
+
+    def test_connector_fences_preemption_before_starting_loads(self):
+        calls: list[str] = []
+
+        class Worker:
+            def handle_preemptions(self, metadata):
+                calls.append("preemption")
+
+            def start_load_kv(self, metadata):
+                calls.append("load")
+
+        connector = object.__new__(DfkvStoreConnector)
+        connector.connector_worker = Worker()
+        connector._begin_call = lambda: None
+        connector._finish_call = lambda: None
+        metadata = DfkvStoreConnectorMetadata(set(), {"resumed"})
+        connector._get_connector_metadata = lambda: metadata
+
+        connector.handle_preemptions(metadata)
+        self.assertEqual(calls, ["preemption"])
+        connector.start_load_kv(None)
+        self.assertEqual(calls, ["preemption", "load"])
+
 
     def test_wait_blocks_while_put_executes_and_returns_after(self):
         # A store that is already executing cannot be cancelled: the fence

@@ -2078,34 +2078,41 @@ class DfkvStoreWorker:
         self.kv_recv_thread.start()
         ready_event_recving.wait()
 
+    def handle_preemptions(
+        self,
+        metadata: DfkvStoreConnectorMetadata,
+    ) -> None:
+        """Fence preempted block sources before the next forward pass."""
+        if not metadata.preempted_req_ids:
+            return
+        if self.kv_recv_thread is not None:
+            self.kv_recv_thread.cancel_requests(
+                metadata.preempted_req_ids,
+                wait=True,
+                fail_closed=False,
+            )
+        send_thread = self.kv_send_thread
+        if send_thread is None:
+            return
+        # Drop queued entries first, then join whichever entry is active.
+        for req_id in metadata.preempted_req_ids:
+            send_thread.delete_finished_stored_request(req_id)
+        for req_id in metadata.preempted_req_ids:
+            wait_start = time.perf_counter()
+            while not send_thread.wait_for_inflight_put(req_id):
+                logger.error(
+                    "preemption fence still waiting for in-flight save "
+                    "of request %s after %.1fs; GPU block reuse remains "
+                    "fenced until the native save exits",
+                    req_id,
+                    time.perf_counter() - wait_start,
+                )
+
     def start_load_kv(
         self,
         metadata: DfkvStoreConnectorMetadata,
     ):
-        """Fence preemptions and perform synchronous loads before forward."""
-        if metadata.preempted_req_ids:
-            if self.kv_recv_thread is not None:
-                self.kv_recv_thread.cancel_requests(
-                    metadata.preempted_req_ids,
-                    wait=True,
-                    fail_closed=False,
-                )
-            send_thread = self.kv_send_thread
-            if send_thread is not None:
-                # Drop queued entries first, then join whichever entry is active.
-                for req_id in metadata.preempted_req_ids:
-                    send_thread.delete_finished_stored_request(req_id)
-                for req_id in metadata.preempted_req_ids:
-                    wait_start = time.perf_counter()
-                    while not send_thread.wait_for_inflight_put(req_id):
-                        logger.error(
-                            "preemption fence still waiting for in-flight save "
-                            "of request %s after %.1fs; GPU block reuse remains "
-                            "fenced until the native save exits",
-                            req_id,
-                            time.perf_counter() - wait_start,
-                        )
-
+        """Perform synchronous loads before forward."""
         if self.load_async:
             return
         assert self.kv_recv_thread is not None

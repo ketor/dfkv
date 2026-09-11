@@ -91,6 +91,43 @@ def test_cache_bypass_discards_stale_external_admission():
     assert scheduler.load_specs == {"unrelated": other_spec}
 
 
+def test_consumer_cached_resume_emits_load_without_save():
+    scheduler = object.__new__(DfkvStoreScheduler)
+    scheduler.kv_role = "kv_consumer"
+    scheduler.client = MagicMock()
+    scheduler.load_specs = {"resumed": LoadSpec(0, 4, True)}
+    scheduler._request_trackers = {}
+    scheduler._preempted_req_ids = {"resumed"}
+    scheduler._unfinished_request_ids = {"resumed"}
+    scheduler._allocated_req_ids = set()
+    scheduler._block_size = 4
+    request = SimpleNamespace(
+        request_id="resumed", block_hashes=[], all_token_ids=list(range(8)),
+        num_computed_tokens=4,
+    )
+    blocks = ([10, 11],)
+    scheduler._unfinished_requests = {"resumed": (request, blocks)}
+    step = SimpleNamespace(
+        finished_req_ids=set(), preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["resumed"], new_block_ids=[([11],)],
+            num_computed_tokens=[4],
+        ),
+        num_scheduled_tokens={"resumed": 4},
+    )
+
+    metadata = scheduler.build_connector_meta(step)
+
+    assert len(metadata.requests) == 1
+    restored = metadata.requests[0]
+    assert restored.load_spec is not None and restored.load_spec.can_load
+    assert restored.can_save is False
+    assert restored.block_ids == blocks
+    assert "resumed" not in scheduler.load_specs
+    assert "resumed" not in scheduler._preempted_req_ids
+
+
 @pytest.mark.parametrize("cached_resume", [False, True])
 @pytest.mark.parametrize("async_pending", [False, True])
 def test_same_step_preemption_keeps_new_allocation_and_load(async_pending, cached_resume):

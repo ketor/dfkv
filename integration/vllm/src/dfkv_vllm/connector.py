@@ -303,13 +303,24 @@ class DfkvStoreConnector(KVConnectorBase_V1, SupportsHMA):
         finally:
             self._finish_call()
 
+    def handle_preemptions(
+        self, kv_connector_metadata: KVConnectorMetadata
+    ) -> None:
+        self._begin_call()
+        try:
+            assert self.connector_worker is not None
+            assert isinstance(
+                kv_connector_metadata, DfkvStoreConnectorMetadata
+            )
+            self.connector_worker.handle_preemptions(kv_connector_metadata)
+        finally:
+            self._finish_call()
+
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         self._begin_call()
         try:
-            # Loads are issued in get_finished() for compute overlap; this hook
-            # only runs the preemption fence, which must happen BEFORE this step's
-            # forward pass can overwrite a preempted request's freed (and possibly
-            # re-allocated) blocks while an in-flight save still reads them.
+            # Loads are issued in get_finished() for compute overlap. Synchronous
+            # loads required by this step are submitted here before forward.
             assert self.connector_worker is not None
             metadata = self._get_connector_metadata()
             assert isinstance(metadata, DfkvStoreConnectorMetadata)

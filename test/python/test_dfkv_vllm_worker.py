@@ -675,7 +675,7 @@ class LogicalChunkTransferTest(unittest.TestCase):
 
         def preempt() -> None:
             try:
-                worker.start_load_kv(
+                worker.handle_preemptions(
                     SimpleNamespace(preempted_req_ids={request.req_id})
                 )
             except BaseException as exc:
@@ -1579,7 +1579,9 @@ class ReceiveConcurrencyTest(unittest.TestCase):
         returned = threading.Event()
 
         def preempt() -> None:
-            worker.start_load_kv(SimpleNamespace(preempted_req_ids={"preempted"}))
+            worker.handle_preemptions(
+                SimpleNamespace(preempted_req_ids={"preempted"})
+            )
             returned.set()
 
         thread = threading.Thread(target=preempt)
