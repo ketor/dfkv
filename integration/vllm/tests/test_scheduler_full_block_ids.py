@@ -91,41 +91,110 @@ def test_cache_bypass_discards_stale_external_admission():
     assert scheduler.load_specs == {"unrelated": other_spec}
 
 
-def test_consumer_cached_resume_emits_load_without_save():
+@pytest.mark.parametrize("same_step_preemption", [False, True])
+@pytest.mark.parametrize("async_pending", [False, True])
+def test_consumer_cached_resume_emits_load_without_save(
+    async_pending, same_step_preemption,
+):
     scheduler = object.__new__(DfkvStoreScheduler)
     scheduler.kv_role = "kv_consumer"
     scheduler.client = MagicMock()
-    scheduler.load_specs = {"resumed": LoadSpec(0, 4, True)}
+    scheduler.client.lookup.return_value = 4
+    scheduler.lookup_async = False
+    scheduler.load_async = async_pending
+    scheduler.load_specs = {}
     scheduler._request_trackers = {}
-    scheduler._preempted_req_ids = {"resumed"}
-    scheduler._unfinished_request_ids = {"resumed"}
+    scheduler._preempted_req_ids = set()
+    scheduler._unfinished_request_ids = set()
+    scheduler._unfinished_requests = {}
     scheduler._allocated_req_ids = set()
     scheduler._block_size = 4
     request = SimpleNamespace(
-        request_id="resumed", block_hashes=[], all_token_ids=list(range(8)),
-        num_computed_tokens=4,
+        request_id="resumed", block_hashes=[], all_token_ids=list(range(16)),
+        num_tokens=16, num_computed_tokens=0,
     )
-    blocks = ([10, 11],)
-    scheduler._unfinished_requests = {"resumed": (request, blocks)}
+    old_blocks = ([1, 2, 3, 4], [5, 6, 7, 8])
+    scheduler.update_state_after_alloc(
+        request, SimpleNamespace(get_block_ids=lambda: old_blocks), 0,
+    )
     step = SimpleNamespace(
         finished_req_ids=set(), preempted_req_ids=set(),
-        scheduled_new_reqs=[],
-        scheduled_cached_reqs=SimpleNamespace(
-            req_ids=["resumed"], new_block_ids=[([11],)],
-            num_computed_tokens=[4],
-        ),
-        num_scheduled_tokens={"resumed": 4},
+        scheduled_new_reqs=[SimpleNamespace(
+            req_id="resumed", num_computed_tokens=0, block_ids=old_blocks,
+            prefill_token_ids=None, prompt_token_ids=list(range(8)),
+        )],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        num_scheduled_tokens={"resumed": 8},
     )
+    assert scheduler.build_connector_meta(step).requests == []
+
+    step.preempted_req_ids = {"resumed"}
+    step.scheduled_new_reqs = []
+    step.num_scheduled_tokens = {}
+    if not same_step_preemption:
+        assert scheduler.build_connector_meta(step).requests == []
+        step.preempted_req_ids = set()
+
+    # Lookup and allocation admit a real LOAD; the resumed MRV1 request only
+    # carries this step's delta, not the complete destination block table.
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (4, async_pending)
+    blocks = ([10, 11], [20, 21])
+    scheduler.update_state_after_alloc(
+        request, SimpleNamespace(get_block_ids=lambda: blocks), 4,
+    )
+    request.num_computed_tokens = 4
+    resumed_cached = SimpleNamespace(
+        req_ids=["resumed"], new_block_ids=[([11], [21])],
+        num_computed_tokens=[4],
+    )
+    if not async_pending:
+        step.scheduled_cached_reqs = resumed_cached
+        step.num_scheduled_tokens = {"resumed": 4}
 
     metadata = scheduler.build_connector_meta(step)
-
     assert len(metadata.requests) == 1
     restored = metadata.requests[0]
+    assert restored.req_id == "resumed"
     assert restored.load_spec is not None and restored.load_spec.can_load
+    assert restored.load_spec.vllm_cached_tokens == 0
+    assert restored.load_spec.kvpool_cached_tokens == 4
     assert restored.can_save is False
     assert restored.block_ids == blocks
-    assert "resumed" not in scheduler.load_specs
-    assert "resumed" not in scheduler._preempted_req_ids
+
+    if async_pending:
+        # Waiting another tick must not submit the already issued LOAD again.
+        step.preempted_req_ids = set()
+        assert scheduler.build_connector_meta(step).requests == []
+        # After completion MRV1 can resume without allocating another block.
+        resumed_cached.new_block_ids = [None]
+        step.scheduled_cached_reqs = resumed_cached
+        step.num_scheduled_tokens = {"resumed": 4}
+        assert scheduler.build_connector_meta(step).requests == []
+
+    # Finish re-prefilling prompt + generated history, then decode. Consumers
+    # must neither reload the prefix nor SAVE newly computed chunk/decode KV.
+    for computed, count, delta in (
+        (8, 4, ([12], [22])),
+        (12, 4, ([13], [23])),
+        (16, 1, ([14], [24])),
+        (17, 1, None),
+    ):
+        if computed >= request.num_tokens:
+            request.all_token_ids.append(computed)
+            request.num_tokens += 1
+        request.num_computed_tokens = computed
+        step.preempted_req_ids = set()
+        step.scheduled_cached_reqs = SimpleNamespace(
+            req_ids=["resumed"], new_block_ids=[delta],
+            num_computed_tokens=[computed],
+        )
+        step.num_scheduled_tokens = {"resumed": count}
+        assert scheduler.build_connector_meta(step).requests == []
+
+    step.finished_req_ids = {"resumed"}
+    step.scheduled_cached_reqs = SimpleNamespace(req_ids=[])
+    step.num_scheduled_tokens = {}
+    assert scheduler.build_connector_meta(step).requests == []
 
 
 @pytest.mark.parametrize("cached_resume", [False, True])
