@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### vLLM preemption safety
+
+- Fence cancelled receive work and in-flight SAVE sources through vLLM's
+  pre-forward `handle_preemptions` hook, before recycled blocks can be
+  overwritten. Synchronous LOAD submission remains in `start_load_kv`.
+- Preserve LOAD metadata for consumer-only MRV1 requests resumed through the
+  cached-request path while continuing to suppress SAVE work for that role.
+
 ### vLLM stable hybrid and speculative cache restoration
 
 - Separate stable SAVE masks from LOAD requirements; exclude volatile draft
