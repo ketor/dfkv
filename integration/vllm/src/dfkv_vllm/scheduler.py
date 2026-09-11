@@ -251,90 +251,91 @@ class DfkvStoreScheduler:
             if req_meta is not None:
                 meta.add_request(req_meta)
 
-        # Handle cached (running, or MRV1 resumed-from-preemption) requests
+        # Handle cached (running, or MRV1 resumed-from-preemption) requests.
+        # Consumer-only mode still needs LOAD metadata; skip_save only suppresses
+        # the independent SAVE side of each request.
         cached_reqs = scheduler_output.scheduled_cached_reqs
-        if not force_skip_save:
-            for i, req_id in enumerate(cached_reqs.req_ids):
-                new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids and req_id not in self._preempted_req_ids:
-                    continue
+        for i, req_id in enumerate(cached_reqs.req_ids):
+            new_block_ids = cached_reqs.new_block_ids[i]
+            if not new_block_ids and req_id not in self._preempted_req_ids:
+                continue
 
-                req_meta = None
-                if req_id in self._preempted_req_ids:
-                    # Resumed after preemption
-                    self._preempted_req_ids.discard(req_id)
-                    load_spec = self.load_specs.pop(req_id, None)
-                    request_real, allocated_block_ids = self._unfinished_requests[req_id]
-                    num_tokens_to_compute = (
-                        request_real.num_computed_tokens
-                        + scheduler_output.num_scheduled_tokens[req_id]
-                    )
-                    # On resume, the request re-prefills prompt + previously
-                    # generated tokens (all_token_ids).
-                    prefill_tokens = list(request_real.all_token_ids)
-                    request_tracker = RequestTracker(
-                        req_id=req_id,
-                        token_len=num_tokens_to_compute,
-                        allocated_block_ids=tuple(b.copy() for b in allocated_block_ids),
-                        num_saved_tokens=0,
-                        token_ids=prefill_tokens[:num_tokens_to_compute].copy(),
-                        prefill_end_tokens=len(prefill_tokens),
-                    )
-                    self._request_trackers[req_id] = request_tracker
+            req_meta = None
+            if req_id in self._preempted_req_ids:
+                # Resumed after preemption
+                self._preempted_req_ids.discard(req_id)
+                load_spec = self.load_specs.pop(req_id, None)
+                request_real, allocated_block_ids = self._unfinished_requests[req_id]
+                num_tokens_to_compute = (
+                    request_real.num_computed_tokens
+                    + scheduler_output.num_scheduled_tokens[req_id]
+                )
+                # On resume, the request re-prefills prompt + previously
+                # generated tokens (all_token_ids).
+                prefill_tokens = list(request_real.all_token_ids)
+                request_tracker = RequestTracker(
+                    req_id=req_id,
+                    token_len=num_tokens_to_compute,
+                    allocated_block_ids=tuple(b.copy() for b in allocated_block_ids),
+                    num_saved_tokens=0,
+                    token_ids=prefill_tokens[:num_tokens_to_compute].copy(),
+                    prefill_end_tokens=len(prefill_tokens),
+                )
+                self._request_trackers[req_id] = request_tracker
 
-                    last_chunk_tokens_num = (
-                        len(prefill_tokens) // self._block_size * self._block_size
-                    )
-                    req_meta = ReqMeta.from_request_tracker(
-                        request_tracker,
-                        self._block_size,
-                        load_spec=load_spec,
-                        skip_save=force_skip_save,
-                        block_hashes=request_real.block_hashes,
-                        is_last_chunk=(
-                            request_tracker.token_len >= last_chunk_tokens_num
-                        ),
-                    )
+                last_chunk_tokens_num = (
+                    len(prefill_tokens) // self._block_size * self._block_size
+                )
+                req_meta = ReqMeta.from_request_tracker(
+                    request_tracker,
+                    self._block_size,
+                    load_spec=load_spec,
+                    skip_save=force_skip_save,
+                    block_hashes=request_real.block_hashes,
+                    is_last_chunk=(
+                        request_tracker.token_len >= last_chunk_tokens_num
+                    ),
+                )
+            else:
+                # Decode/chunked request
+                request_tracker = self._request_trackers[req_id]
+                num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                req_tuple = self._unfinished_requests.get(req_id)
+                if req_tuple:
+                    unfinished_req = req_tuple[0]
+                    num_current_tokens = request_tracker.token_len
+                    new_token_ids = unfinished_req.all_token_ids[
+                        num_current_tokens : num_current_tokens + num_new_tokens
+                    ]
+                    request_tracker.token_len += len(new_token_ids)
                 else:
-                    # Decode/chunked request
-                    request_tracker = self._request_trackers[req_id]
-                    num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                    req_tuple = self._unfinished_requests.get(req_id)
-                    if req_tuple:
-                        unfinished_req = req_tuple[0]
-                        num_current_tokens = request_tracker.token_len
-                        new_token_ids = unfinished_req.all_token_ids[
-                            num_current_tokens : num_current_tokens + num_new_tokens
-                        ]
-                        request_tracker.token_len += len(new_token_ids)
-                    else:
-                        raise ValueError(
-                            f"Request {req_id} is not in _unfinished_requests"
-                        )
-                    num_computed_token = cached_reqs.num_computed_tokens[i]
-                    # Use the tracker's snapshot of the prefill range so resumed
-                    # requests keep saving past the original prompt boundary.
-                    prefill_end = request_tracker.prefill_end_tokens
-                    if num_computed_token >= prefill_end:
-                        continue
-                    request_tracker.update(new_block_ids)
-
-                    last_chunk_tokens_num = (
-                        prefill_end // self._block_size * self._block_size
+                    raise ValueError(
+                        f"Request {req_id} is not in _unfinished_requests"
                     )
-                    req_meta = ReqMeta.from_request_tracker(
-                        request_tracker,
-                        self._block_size,
-                        load_spec=None,
-                        skip_save=force_skip_save,
-                        block_hashes=unfinished_req.block_hashes,
-                        is_last_chunk=(
-                            request_tracker.token_len >= last_chunk_tokens_num
-                        ),
-                    )
+                num_computed_token = cached_reqs.num_computed_tokens[i]
+                # Use the tracker's snapshot of the prefill range so resumed
+                # requests keep saving past the original prompt boundary.
+                prefill_end = request_tracker.prefill_end_tokens
+                if num_computed_token >= prefill_end:
+                    continue
+                request_tracker.update(new_block_ids)
 
-                if req_meta is not None:
-                    meta.add_request(req_meta)
+                last_chunk_tokens_num = (
+                    prefill_end // self._block_size * self._block_size
+                )
+                req_meta = ReqMeta.from_request_tracker(
+                    request_tracker,
+                    self._block_size,
+                    load_spec=None,
+                    skip_save=force_skip_save,
+                    block_hashes=unfinished_req.block_hashes,
+                    is_last_chunk=(
+                        request_tracker.token_len >= last_chunk_tokens_num
+                    ),
+                )
+
+            if req_meta is not None:
+                meta.add_request(req_meta)
 
         # Handle requests with pending load specs not yet scheduled
         request_ids = [req.req_id for req in scheduler_output.scheduled_new_reqs]

@@ -618,7 +618,7 @@ def test_same_step_resume_save_releases_finished_blocks(hybrid_workers, monkeypa
         block_ids=([1], [3], [3]), block_hashes=hashes,
     )
     metadata = SimpleNamespace(requests=[request], preempted_req_ids={request.req_id})
-    producer.start_load_kv(metadata)
+    producer.handle_preemptions(metadata)
     producer.get_finished(set(), metadata)
     key = PoolKey(producer.token_dbs[1].metadata, hashes[0].hex()).to_bytes()
     assert objects[producer.client.namespace, key] == bytes([30]) * 16
@@ -667,7 +667,7 @@ def test_cancelled_save_generation_cannot_revive(hybrid_workers, monkeypatch):
         assert entered.wait(5)
         sender.add_stored_request(stale)
         sender.add_request(stale)
-        producer.start_load_kv(
+        producer.handle_preemptions(
             SimpleNamespace(requests=[], preempted_req_ids={stale.req_id}),
         )
         buffers["mla"][1].fill_(99)
