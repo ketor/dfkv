@@ -274,6 +274,17 @@ SAVE queue entries also carry a worker-local generation. Reusing a request ID
 cannot revive an old queued SAVE or let its cancellation decrement the new
 generation's completion counter.
 
+The engine must call `handle_preemptions` before model execution can reuse
+blocks. `start_load_kv` is not a substitute: the engine can defer it until after
+forward when there are no synchronous loads. Consumer-only cached resumes
+still require LOAD metadata even though they never authorize SAVE.
+
+The v2.26.2 lifecycle fix preserves the v2.26.1 object format; it cannot detect
+or repair equal-length KV objects corrupted by an earlier block-reuse race.
+When upgrading a deployment that could have encountered that race, use a fresh
+`model_revision` consistently across writers and readers to isolate old objects.
+Keep the old namespace for normal retention/eviction rather than clearing it.
+
 Different namespace/key bytes are a cold miss. Byte-layout changes not captured
 by the effective cache-spec identity still require a source-controlled layout-ID
 bump and coordinated writer/reader deployment.

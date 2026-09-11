@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### v2.26.3 — vLLM acceptance coverage
+
+- Replace the forwarding-only preemption test with a source-lifetime regression:
+  block reuse must wait for the old SAVE, which must retain the original bytes.
+- Cover consumer MRV1 synchronous/asynchronous recovery, prior-step/same-step
+  preemption, continued prefill, decode and completion without duplicate LOAD
+  or unauthorized SAVE.
+- Clarify that compatible object layouts do not validate old cache contents.
+  This release changes tests and documentation, not connector runtime behavior.
+
 ### vLLM preemption safety
 
 - Fence cancelled receive work and in-flight SAVE sources through vLLM's
