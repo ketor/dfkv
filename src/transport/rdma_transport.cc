@@ -1274,33 +1274,36 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   bool probed = false;
   bool leased_put_supported = false;
   bool dynamic_pull_supported = false;
-  if (options.request_leased_put || dynamic_pull_enabled_) {
-    bool known = false;
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      const auto found = peer_capabilities_.find(node);
-      if (found != peer_capabilities_.end() &&
-          found->second.peer_id == peer_snapshot->peer_id &&
-          found->second.publication == peer_snapshot->publication) {
-        known = true;
-        leased_put_supported = found->second.leased_put;
-        dynamic_pull_supported = found->second.dynamic_pull;
-      }
+  // Peer capabilities are fixed for the lifetime of one peer publication
+  // (peer_id + publication generation), so a confirmed probe is reused by
+  // every connection to that publication instead of one TCP probe per QP.
+  // Only absence/publication-change costs a probe; failures are never cached.
+  bool caps_cached = false;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto found = peer_capabilities_.find(node);
+    if (found != peer_capabilities_.end() &&
+        found->second.peer_id == peer_snapshot->peer_id &&
+        found->second.publication == peer_snapshot->publication) {
+      caps_cached = true;
+      leased_put_supported = found->second.leased_put;
+      dynamic_pull_supported = found->second.dynamic_pull;
     }
-    if (!known) {
-      if (!ProbeV2(node, &leased_put_supported, &dynamic_pull_supported)) {
-        complete_unowned_lease(rdma::RailCompletion::kEndpointFailure);
-        result.failure = AcquireFailure::kEndpoint;
-        return result;
-      }
-      probed = true;
-      std::lock_guard<std::mutex> lock(mu_);
-      if (peer_topologies_->IsCurrent(
-              node, peer_snapshot->peer_id, peer_snapshot->publication)) {
-        peer_capabilities_[node] = {
-            peer_snapshot->peer_id, peer_snapshot->publication,
-            leased_put_supported, dynamic_pull_supported};
-      }
+  }
+  if (!caps_cached &&
+      (options.request_leased_put || dynamic_pull_enabled_)) {
+    if (!ProbeV2(node, &leased_put_supported, &dynamic_pull_supported)) {
+      complete_unowned_lease(rdma::RailCompletion::kEndpointFailure);
+      result.failure = AcquireFailure::kEndpoint;
+      return result;
+    }
+    probed = true;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (peer_topologies_->IsCurrent(
+            node, peer_snapshot->peer_id, peer_snapshot->publication)) {
+      peer_capabilities_[node] = {
+          peer_snapshot->peer_id, peer_snapshot->publication,
+          leased_put_supported, dynamic_pull_supported};
     }
   }
   const bool want_leased_put =
@@ -1453,7 +1456,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   }
 
   const std::string& dev = devs_[ridx];
-  if (!probed &&
+  if (!probed && !caps_cached &&
       !ProbeV2(node, &leased_put_supported, &dynamic_pull_supported)) {
     DFKV_LOG_ERROR(
         "rdma: peer " + node +
