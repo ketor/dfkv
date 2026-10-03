@@ -349,6 +349,17 @@ struct RdmaNode {
           }
           return srv->CacheDirectForKey(key, data, len, cap);
         });
+    if (srv->ram_enabled()) {
+      // Mirror dfkv_server_main: pool-map the arena per connection and enable
+      // the B5-3 pinned zero-copy pull so RAM-tier fixtures exercise the
+      // production GET path instead of always staging.
+      rsrv->RegisterMemory(srv->ram_arena(), srv->ram_arena_bytes());
+      rsrv->set_pinned_ram_handler(
+          [this](const BlockKey& key, uint64_t off, uint64_t len,
+                 RamTier::Hit* out) {
+            return srv->RamPinnedHitForKey(key, off, len, out);
+          });
+    }
     EXPECT_EQ(rsrv->Start(0), Status::kOk);
     addr = "127.0.0.1:" + std::to_string(rsrv->port());
   }
@@ -1764,6 +1775,38 @@ TEST(RdmaLoopback, AdaptivePoolDisabledFallsBackToPoolMax) {
   EXPECT_GE(opened_second - opened_first, kWorkers - 2)
       << "with adaptation off, pool_max=2 must churn burst endpoints";
   EXPECT_EQ(CounterVal(rt.MetricsText(), "dfkv_rdma_client_pool_adaptive"), 0);
+}
+
+// B5-3 zero-copy pull GET: an arena-resident value must answer a dynamic
+// pull straight from the pinned arena — no staged copy through the receive
+// pool (RangeDirectForKey would be invoked) and byte-identical round-trip.
+TEST(RdmaLoopback, DynamicPullServesArenaHitsZeroCopy) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv ram_on("DFKV_RAM_TIER", "1");
+  ScopedEnv ram_bytes("DFKV_RAM_TIER_BYTES", "268435456");
+  RdmaNode node("pull-zerocopy");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  const BlockKey key = ToBlockKey(SelfHdr(), "pullz");
+  const std::string value(kMaxMsg, 'z');
+  ASSERT_TRUE(c.Put("pullz", value.data(), value.size()));
+  ASSERT_GT(node.srv->RamUsedBytes(), 0)
+      << "write-back PUT did not land in the RAM arena";
+  const long before = CounterVal(node.rsrv->MetricsText(),
+                                 "dfkv_rdma_pull_zerocopy_served_total");
+  std::string out(value.size(), '\0');
+  std::vector<uint64_t> value_lens;
+  EXPECT_EQ(rt.RangeInto(node.addr, {key}, {{out.data(), out.size()}},
+                         &value_lens),
+            std::vector<Status>({Status::kOk}));
+  EXPECT_EQ(value_lens, std::vector<uint64_t>({value.size()}));
+  EXPECT_EQ(out, value);
+  const long after = CounterVal(node.rsrv->MetricsText(),
+                                "dfkv_rdma_pull_zerocopy_served_total");
+  EXPECT_GT(after, before)
+      << "dynamic pull staged an arena hit instead of serving it zero-copy";
+  EXPECT_EQ(node.RangeDirectCalls(key), 0)
+      << "zero-copy pull must not enter the staged range handler";
 }
 
 TEST(RdmaLoopback, ConfiguredPoolMaxBoundsIdleControlConnections) {

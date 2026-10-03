@@ -129,6 +129,14 @@ class KvNodeServer {
                            uint64_t length, char* io_buf, size_t io_cap,
                            const char** out_data, size_t* out_len,
                            size_t* value_len = nullptr);
+  // Pinned arena READ for the RDMA pull path (B5-3 zero-copy): on success
+  // `out` holds a send pin plus the arena address; the caller hands that
+  // address to the peer and releases the pin only after the pull completes.
+  // Returns false for misses and for entries not resident in the arena
+  // (dedicated allocations), which keep the staging-copy pull path.
+  // Accounting (cache_hit_/bytes_read_) matches a normal RAM hit.
+  bool RamPinnedHitForKey(const BlockKey& key, uint64_t offset,
+                          uint64_t length, RamTier::Hit* out);
 
   // Prepare one RDMA read against its registered staging destination. The
   // returned move-only transaction owns every disk/RAM/coalescer obligation;

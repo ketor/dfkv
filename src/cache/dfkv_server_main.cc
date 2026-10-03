@@ -389,6 +389,15 @@ int main(int argc, char** argv) {
                char* staging, size_t cap) {
           return srv.PrepareReadForKey(key, off, len, staging, cap);
         });
+    // B5-3: dynamic-pull GETs of arena-resident values serve the pinned arena
+    // address instead of staging a payload-sized copy per pull.
+    if (srv.ram_enabled()) {
+      rsrv->set_pinned_ram_handler(
+          [&srv](const dfkv::BlockKey& key, uint64_t off, uint64_t len,
+                 dfkv::RamTier::Hit* out) {
+            return srv.RamPinnedHitForKey(key, off, len, out);
+          });
+    }
     // RAM arena registration remains transport setup, not per-read ownership.
     // Arena send pins are carried by PreparedRead through SEND completion.
     if (srv.ram_enabled()) {

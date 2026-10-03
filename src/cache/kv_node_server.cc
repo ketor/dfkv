@@ -1082,6 +1082,20 @@ Status KvNodeServer::CacheDirectForKey(const BlockKey& key, char* data,
 }
 
 
+bool KvNodeServer::RamPinnedHitForKey(const BlockKey& key, uint64_t offset,
+                                      uint64_t length, RamTier::Hit* out) {
+  if (!ram_ || out == nullptr) return false;
+  if (!ram_->GetPrep(key, offset, length, out)) return false;
+  if (!out->in_arena || out->len == 0) {
+    // Dedicated (non-arena) entries keep the legacy staging-copy pull path.
+    *out = RamTier::Hit{};
+    return false;
+  }
+  cache_hit_.fetch_add(1, std::memory_order_relaxed);
+  bytes_read_.fetch_add(out->len, std::memory_order_relaxed);
+  return true;
+}
+
 Status KvNodeServer::RangeDirectForKey(
     const BlockKey& key, uint64_t offset, uint64_t length, char* io_buf,
     size_t io_cap, const char** out_data, size_t* out_len, size_t* value_len) {
