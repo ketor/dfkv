@@ -454,11 +454,26 @@ void RamTier::CompletePut(
   completion->cv.notify_all();
 }
 
-Status RamTier::WaitPut(
-    const std::shared_ptr<PutCompletion>& completion) {
+Status RamTier::WaitPut(const std::shared_ptr<PutCompletion>& completion,
+                        uint32_t wait_ms,
+                        std::atomic<uint64_t>* timeouts) {
   if (!completion) return Status::kIOError;
   std::unique_lock<std::mutex> lk(completion->mu);
-  completion->cv.wait(lk, [&completion] { return completion->done; });
+  if (wait_ms == 0) {
+    completion->cv.wait(lk, [&completion] { return completion->done; });
+    return completion->success ? Status::kOk : Status::kIOError;
+  }
+  const bool done = completion->cv.wait_for(
+      lk, std::chrono::milliseconds(wait_ms),
+      [&completion] { return completion->done; });
+  if (!done) {
+    if (timeouts) timeouts->fetch_add(1, std::memory_order_relaxed);
+    // kCacheFull tells the caller the arena did not absorb the value; the
+    // admission itself may still flush and publish later, which is safe for
+    // identical bytes (idempotent write-once) and never blocks the serving
+    // thread — the caller falls back to the direct disk write path.
+    return Status::kCacheFull;
+  }
   return completion->success ? Status::kOk : Status::kIOError;
 }
 
@@ -618,7 +633,7 @@ Status RamTier::PutCommitted(const BlockKey& key, const void* data, size_t len) 
   std::shared_ptr<PutCompletion> completion;
   const Admission admission = Admit(key, data, len, false, &completion);
   if (admission == Admission::kBypass) return Status::kCacheFull;
-  return WaitPut(completion);
+  return WaitPut(completion, opt_.put_wait_ms, &put_wait_timeouts_);
 }
 
 bool RamTier::ReserveDurable(const BlockKey& key, size_t len,
@@ -773,7 +788,7 @@ Status RamTier::PutWriteBack(const BlockKey& key, const void* data, size_t len) 
   if (admission == Admission::kBypass) return Status::kCacheFull;
   if (synchronous) {
     ack_backpressure_.fetch_add(1, std::memory_order_relaxed);
-    return WaitPut(completion);
+    return WaitPut(completion, opt_.put_wait_ms, &put_wait_timeouts_);
   }
   ram_acks_.fetch_add(1, std::memory_order_relaxed);
   return Status::kOk;

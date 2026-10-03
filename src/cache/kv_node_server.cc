@@ -155,6 +155,12 @@ void KvNodeServer::InitRamTier() {
   // Background free-slot reclaimer cadence (ms; 0 disables). Default 10.
   if (const char* r = std::getenv("DFKV_RAM_RECLAIM_MS"))
     o.reclaim_interval_ms = static_cast<uint32_t>(std::strtoul(r, nullptr, 10));
+  if (const char* w = std::getenv("DFKV_RAM_PUT_WAIT_MS")) {
+    const unsigned long ms = std::strtoul(w, nullptr, 10);
+    if (ms <= 600000) o.put_wait_ms = static_cast<uint32_t>(ms);
+  }
+  config_dump::RecordResolved("DFKV_RAM_PUT_WAIT_MS",
+                              std::to_string(o.put_wait_ms));
   const char* ack_env = std::getenv("DFKV_PUT_ACK_MODE");
   const std::string ack = ack_env ? std::string(ack_env) : "";
   if (ack.empty()) {
@@ -652,6 +658,9 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_ram_post_ack_flush_failures_total", "counter",
            "Acknowledged RAM PUTs whose background disk flush later failed",
            ram_->PostAckFlushFailures());
+    metric("dfkv_ram_put_wait_timeouts_total", "counter",
+           "Synchronous RAM PUTs that exceeded DFKV_RAM_PUT_WAIT_MS and fell back to the direct disk write path",
+           ram_->PutWaitTimeouts());
     s += ram_->AckToDurableLatencyMetrics(idlabels);
     metric("dfkv_ram_budget_bytes", "gauge",
            "Hard total RAM-tier budget across arena and dedicated values",

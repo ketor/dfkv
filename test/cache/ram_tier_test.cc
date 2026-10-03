@@ -840,6 +840,63 @@ TEST(RamTier, BatchFlushDrainsQueueAndRetriesPerItem) {
   EXPECT_TRUE(rt.Contains(K(901)));
 }
 
+// Bounded synchronous-put wait (DFKV_RAM_PUT_WAIT_MS contract): when flush
+// cannot drain, PutCommitted/PutWriteBack must return kCacheFull within the
+// deadline so callers fall back to the direct disk path — never park serve
+// threads indefinitely on a full arena. The abandoned admission may still
+// flush later; identical value bytes make that idempotent.
+TEST(RamTier, SyncPutWaitTimesOutToCacheFull) {
+  std::mutex gate_mu;
+  std::condition_variable gate_cv;
+  bool gate_open = false;
+  RamTier::Options o = Opts(256 * 4096);
+  o.flush_threads = 1;
+  o.put_wait_ms = 100;
+  RamTier rt(o, nullptr);
+  rt.set_flush_batch([&](const std::vector<RamTier::FlushItem>& items) {
+    std::unique_lock<std::mutex> lk(gate_mu);
+    gate_cv.wait(lk, [&] { return gate_open; });
+    return std::vector<bool>(items.size(), true);
+  });
+  ASSERT_TRUE(rt.ok());
+  const std::string v(4000, 'w');
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(rt.PutCommitted(K(930), v.data(), v.size()),
+            Status::kCacheFull);
+  const double elapsed_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0)
+          .count();
+  EXPECT_LT(elapsed_ms, 5000) << "put wait exceeded its bound";
+  EXPECT_GE(rt.PutWaitTimeouts(), 1u);
+  // RAM-ack mode with a zero watermark is forced onto the same wait path.
+  RamTier::Options o2 = Opts(256 * 4096);
+  o2.flush_threads = 1;
+  o2.put_wait_ms = 100;
+  o2.ack_high_watermark_pct = 0;
+  RamTier rt2(o2, nullptr);
+  rt2.set_flush_batch([&](const std::vector<RamTier::FlushItem>& items) {
+    std::unique_lock<std::mutex> lk(gate_mu);
+    gate_cv.wait(lk, [&] { return gate_open; });
+    return std::vector<bool>(items.size(), true);
+  });
+  ASSERT_TRUE(rt2.ok());
+  EXPECT_EQ(rt2.PutWriteBack(K(931), v.data(), v.size()),
+            Status::kCacheFull);
+  EXPECT_GE(rt2.PutWaitTimeouts(), 1u);
+  // The suspended admissions still complete once the flush gate opens — no
+  // leak, no hang, and the same bytes stay readable from the arena.
+  {
+    std::lock_guard<std::mutex> lk(gate_mu);
+    gate_open = true;
+  }
+  gate_cv.notify_all();
+  ASSERT_TRUE(WaitFor([&] { return rt.Contains(K(930)) && rt2.Contains(K(931)); }));
+  RamTier::Hit h;
+  ASSERT_TRUE(rt.GetPrep(K(930), 0, v.size(), &h));
+  EXPECT_EQ(std::string(h.ptr, h.len), v);
+}
+
 // Sharded tier: keys route by hash to independent shards; the whole lifecycle
 // (put -> visible -> flush -> durable -> get/pin/release -> remove) must hold
 // with shards > 1 exactly as with the single-lock layout.

@@ -90,6 +90,15 @@ class RamTier {
     // Dirty-byte watermark for RAM-ACK mode. Once reached, new PUTs wait for
     // their flush result instead of acknowledging asynchronously.
     uint32_t ack_high_watermark_pct = 80;
+    // Upper bound (ms) on a synchronous Put's wait for its flush completion
+    // before the caller is told kCacheFull (which falls back to the direct
+    // disk write path). Without a bound, sustained ingest above the drain
+    // rate ("flush threads x ~1.6-3 GB/s") parks every PUT serve thread on a
+    // full arena and freezes the node — observed on an 8x400G host as global
+    // 5 s op timeouts and all-rail client cooldowns. 0 restores the
+    // unbounded wait (not recommended outside diagnostics).
+    // DFKV_RAM_PUT_WAIT_MS overrides.
+    uint32_t put_wait_ms = 250;
   };
 
   // Persists a resident value to disk. `data` is 4 KiB aligned and `cap` is
@@ -248,6 +257,9 @@ class RamTier {
   uint64_t PostAckFlushFailures() const {
     return post_ack_flush_failures_.load(std::memory_order_relaxed);
   }
+  uint64_t PutWaitTimeouts() const {
+    return put_wait_timeouts_.load(std::memory_order_relaxed);
+  }
   std::string AckToDurableLatencyMetrics(const std::string& labels) const {
     return ack_to_durable_latency_.Render(
         "dfkv_ram_ack_to_durable_latency_seconds", labels);
@@ -333,7 +345,9 @@ class RamTier {
                   std::shared_ptr<PutCompletion>* completion);
   static void CompletePut(const std::shared_ptr<PutCompletion>& completion,
                           bool success);
-  static Status WaitPut(const std::shared_ptr<PutCompletion>& completion);
+  static Status WaitPut(const std::shared_ptr<PutCompletion>& completion,
+                        uint32_t wait_ms = 250,
+                        std::atomic<uint64_t>* timeouts = nullptr);
   bool CommitReservation(DurableReservation* reservation) noexcept;
   void AbortReservation(DurableReservation* reservation) noexcept;
   void ReclaimLargeFor(uint64_t bytes);
@@ -388,6 +402,7 @@ class RamTier {
   std::atomic<uint64_t> dirty_bytes_{0}, dirty_objects_{0};
   std::atomic<uint64_t> ram_acks_{0}, ack_backpressure_{0};
   std::atomic<uint64_t> post_ack_flush_failures_{0};
+  std::atomic<uint64_t> put_wait_timeouts_{0};
   std::atomic<uint64_t> shutdown_drain_timeouts_{0};
   LatencyHist ack_to_durable_latency_;
 };
