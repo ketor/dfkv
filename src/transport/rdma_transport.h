@@ -302,6 +302,27 @@ class RdmaTransport : public Transport {
     return batch_op_timeout_ms_ > 0 ? batch_op_timeout_ms_ : op_timeout_ms_;
   }
   size_t pool_max_ = 8;               // idle conns kept per peer/pool
+  // Demand-adaptive data-pool retention (DFKV_RDMA_POOL_ADAPTIVE, default on).
+  // pool_max_ alone starves bursts: a node with N concurrent ops keeps only
+  // eight idle endpoints on release, so the next burst re-creates N-8 QPs
+  // (observed 6-11% cache-miss churn and 30k server-side "rdma conn declared"
+  // lines per 24 min at 64 threads on a single node). The effective cap is
+  // max(pool_max_, min(recent_peak_demand, pool_adaptive_max_)); the peak
+  // re-baselines to current demand after pool_adaptive_decay_us_ silence, so
+  // quiet workloads fall back to pool_max_. Control pool stays at pool_max_.
+  bool pool_adaptive_ = true;
+  size_t pool_adaptive_max_ = 64;
+  int64_t pool_adaptive_decay_us_ = 60 * 1000 * 1000;
+  struct NodeDemand {
+    size_t active = 0;
+    size_t peak = 0;
+    uint64_t peak_us = 0;
+  };
+  mutable std::mutex demand_mu_;
+  std::unordered_map<std::string, NodeDemand> demand_;
+  void NoteDemandAcquire(const std::string& node, Conn* c);
+  void NoteDemandRelease(Conn* c);
+  size_t PoolCapFor(const std::string& node);
   // Enabled by default below the recommended 30 s server reaper interval.
   // Set DFKV_RDMA_KEEPALIVE_MS=0 to disable.
   int keepalive_ms_ = 15000;

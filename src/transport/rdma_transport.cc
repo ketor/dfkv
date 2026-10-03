@@ -402,6 +402,10 @@ struct RdmaTransport::Conn {
   bool active_counted = false;
   bool live_counted = false;
   bool visited = true;  // guarded by RdmaTransport::mu_ while idle
+  // Adaptive-pool demand attribution: set while the conn counts against a
+  // node's concurrent-demand tally (acquire→release window).
+  bool demand_counted = false;
+  std::string demand_node;
 
   rdma::ConnectionLifecycle lifecycle;
   void Encode(char* out, WireOp op, const BlockKey& key, uint64_t offset,
@@ -704,6 +708,22 @@ RdmaTransport::RdmaTransport(size_t max_msg, const std::string& dev_name)
   pool_max_ = static_cast<size_t>(EnvInt("DFKV_RDMA_POOL_MAX", 8));
   config_dump::RecordResolved("DFKV_RDMA_POOL_MAX",
                               std::to_string(pool_max_));
+  if (const char* e = std::getenv("DFKV_RDMA_POOL_ADAPTIVE")) {
+    pool_adaptive_ = !(!*e || std::strcmp(e, "0") == 0 ||
+                       std::strcmp(e, "false") == 0 || std::strcmp(e, "no") == 0);
+  }
+  pool_adaptive_max_ =
+      static_cast<size_t>(EnvBoundedInt("DFKV_RDMA_POOL_ADAPTIVE_MAX", 64, 4096));
+  pool_adaptive_decay_us_ =
+      static_cast<int64_t>(EnvBoundedInt("DFKV_RDMA_POOL_ADAPTIVE_DECAY_MS",
+                                         60000, 600000)) *
+      1000;
+  config_dump::RecordResolved("DFKV_RDMA_POOL_ADAPTIVE",
+                              pool_adaptive_ ? "on" : "off");
+  config_dump::RecordResolved("DFKV_RDMA_POOL_ADAPTIVE_MAX",
+                              std::to_string(pool_adaptive_max_));
+  config_dump::RecordResolved("DFKV_RDMA_POOL_ADAPTIVE_DECAY_MS",
+                              std::to_string(pool_adaptive_decay_us_ / 1000));
   active_lane_rail_ =
       std::make_unique<std::atomic<uint64_t>[]>(3 * devs_.size());
   rail_conns_ = std::make_unique<std::atomic<uint64_t>[]>(devs_.size());
@@ -955,6 +975,51 @@ void RdmaTransport::MarkInactive(Conn* c) {
   }
 }
 
+void RdmaTransport::NoteDemandAcquire(const std::string& node, Conn* c) {
+  if (!c || !pool_adaptive_ || c->lane == Lane::kControl) return;
+  std::lock_guard<std::mutex> lk(demand_mu_);
+  auto& d = demand_[node];
+  c->demand_counted = true;
+  c->demand_node = node;
+  ++d.active;
+  if (d.active > d.peak) {
+    d.peak = d.active;
+    d.peak_us = rdma::RailPolicy::NowMicros();
+  } else if (d.peak_us == 0) {
+    d.peak_us = rdma::RailPolicy::NowMicros();
+  }
+}
+
+void RdmaTransport::NoteDemandRelease(Conn* c) {
+  if (!c || !c->demand_counted) return;
+  std::lock_guard<std::mutex> lk(demand_mu_);
+  c->demand_counted = false;
+  const auto it = demand_.find(c->demand_node);
+  if (it != demand_.end()) {
+    auto& d = it->second;
+    // `d.active` still includes `c`, so it also counts the op that just
+    // finished. A quiet-period rebaseline taken here — before the decrement —
+    // therefore floors the peak at this op's own demand (e.g. 1 for a solo
+    // caller) instead of dropping to zero and erasing the evidence.
+    const uint64_t now = rdma::RailPolicy::NowMicros();
+    if (d.peak_us != 0 &&
+        now > d.peak_us + static_cast<uint64_t>(pool_adaptive_decay_us_)) {
+      d.peak = d.active;
+      d.peak_us = now;
+    }
+    if (d.active != 0) --d.active;
+  }
+  c->demand_node.clear();
+}
+
+size_t RdmaTransport::PoolCapFor(const std::string& node) {
+  if (!pool_adaptive_) return pool_max_;
+  std::lock_guard<std::mutex> lk(demand_mu_);
+  const auto it = demand_.find(node);
+  if (it == demand_.end()) return pool_max_;
+  return std::max(pool_max_, std::min(it->second.peak, pool_adaptive_max_));
+}
+
 void RdmaTransport::MarkLive(Conn* c) {
   if (!c || c->live_counted || c->rail_index >= devs_.size()) return;
   std::lock_guard<std::mutex> lock(peer_connections_mu_);
@@ -975,6 +1040,7 @@ void RdmaTransport::MarkDead(Conn* c) {
 void RdmaTransport::Destroy(Conn* c, rdma::RailCompletion completion) {
   if (!c) return;
   MarkInactive(c);
+  NoteDemandRelease(c);
   MarkDead(c);
 
   c->lifecycle.BeginDrain();
@@ -1003,6 +1069,7 @@ void RdmaTransport::QuarantineAmbiguousGet(
     const char* path, rdma::RailCompletion completion) {
   if (!c || !destination_hold) return;
   MarkInactive(c);
+  NoteDemandRelease(c);
   c->lifecycle.BeginDrain();
   CompleteRemoteLease(c, RemoteRailOutcome::kEndpointFailure);
   if (c->credit_held) {
@@ -1373,6 +1440,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
             pool_candidates[best]->lifecycle.Activate()) {
           pooled = pool_candidates[best];
           MarkActive(pooled, lane);
+          NoteDemandAcquire(node, pooled);
           pool_candidates.erase(pool_candidates.begin() +
                                 static_cast<std::ptrdiff_t>(best));
         }
@@ -1645,6 +1713,7 @@ RdmaTransport::AcquireResult RdmaTransport::Acquire(
   rail_conns_[ridx].fetch_add(1, std::memory_order_relaxed);
   MarkLive(conn);
   MarkActive(conn, lane);
+  NoteDemandAcquire(node, conn);
   result.conn = conn;
   result.failure = AcquireFailure::kNone;
   return result;
@@ -2009,6 +2078,23 @@ std::string RdmaTransport::MetricsText() const {
   s += "dfkv_rdma_endpoint_cache_hits_total " +
        std::to_string(endpoint_cache_hits_.load(std::memory_order_relaxed)) +
        "\n";
+  s += "# HELP dfkv_rdma_client_pool_adaptive Whether demand-adaptive idle-pool retention is enabled\n";
+  s += "# TYPE dfkv_rdma_client_pool_adaptive gauge\n";
+  s += "dfkv_rdma_client_pool_adaptive " +
+       std::to_string(pool_adaptive_ ? 1 : 0) + "\n";
+  s += "# HELP dfkv_rdma_client_pool_demand_active Conn presently checked out per peer (data lane)\n";
+  s += "# TYPE dfkv_rdma_client_pool_demand_active gauge\n";
+  s += "# HELP dfkv_rdma_client_pool_demand_peak Recent peak concurrent demand per peer driving the adaptive pool cap\n";
+  s += "# TYPE dfkv_rdma_client_pool_demand_peak gauge\n";
+  {
+    std::lock_guard<std::mutex> lk(demand_mu_);
+    for (const auto& [node_label, d] : demand_) {
+      s += "dfkv_rdma_client_pool_demand_active{node=\"" + node_label +
+           "\"} " + std::to_string(d.active) + "\n";
+      s += "dfkv_rdma_client_pool_demand_peak{node=\"" + node_label +
+           "\"} " + std::to_string(d.peak) + "\n";
+    }
+  }
   s += "# HELP dfkv_rdma_endpoint_cache_misses_total Endpoint acquisitions requiring a new QP\n";
   s += "# TYPE dfkv_rdma_endpoint_cache_misses_total counter\n";
   s += "dfkv_rdma_endpoint_cache_misses_total " +
@@ -2309,6 +2395,7 @@ std::string RdmaTransport::MetricsText() const {
 void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c,
                             RemoteRailOutcome remote_outcome) {
   MarkInactive(c);
+  NoteDemandRelease(c);
   CompleteRemoteLease(c, remote_outcome);
   bool refresh_ok = false;
   {
@@ -2340,7 +2427,9 @@ void RdmaTransport::Release(const std::string& node, Lane lane, Conn* c,
       auto& idle =
           lane == Lane::kControl ? control_pool_ : pool_;
       auto& v = idle[node];
-      if (v.size() < pool_max_ && c->lifecycle.MakeIdle()) {
+      const size_t pool_cap =
+          lane == Lane::kControl ? pool_max_ : PoolCapFor(node);
+      if (v.size() < pool_cap && c->lifecycle.MakeIdle()) {
         c->lane = lane;
         v.push_back(c);
         reusable = true;

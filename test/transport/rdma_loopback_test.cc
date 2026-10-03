@@ -1658,6 +1658,114 @@ TEST(RdmaLoopback, BatchExistReusesExpandedPool) {
       << "settled BatchExist did not reuse its bounded connection pool";
 }
 
+namespace {
+
+// Drive kWorkers threads of back-to-back Puts for `millis`; each thread stays
+// checked-out for almost the whole window, so the transport observes a true
+// concurrency peak of kWorkers (unlike a one-shot burst, whose RDMA ops may
+// finish before stragglers acquire).
+void DrivePutLoop(KVClient* client, const std::string& key_prefix, int workers,
+                  int millis) {
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<size_t>(workers));
+  for (int i = 0; i < workers; ++i) {
+    threads.emplace_back([&, i] {
+      ready.fetch_add(1, std::memory_order_relaxed);
+      while (!start.load(std::memory_order_acquire))
+        std::this_thread::yield();
+      const std::string v(262144, static_cast<char>('a' + i));
+      for (int n = 0; !stop.load(std::memory_order_relaxed); ++n) {
+        const std::string key =
+            key_prefix + "_" + std::to_string(i) + "_" + std::to_string(n);
+        EXPECT_TRUE(client->Put(key, v.data(), v.size()));
+      }
+    });
+  }
+  while (ready.load(std::memory_order_relaxed) != workers)
+    std::this_thread::yield();
+  start.store(true, std::memory_order_release);
+  std::this_thread::sleep_for(std::chrono::milliseconds(millis));
+  stop.store(true, std::memory_order_relaxed);
+  for (auto& t : threads) t.join();
+}
+
+}  // namespace
+
+// Demand-adaptive data-pool retention: a burst of N concurrent data ops grows
+// the per-node idle cap to the observed peak, so the immediately following
+// burst opens zero new QPs. pool_max=2 alone would reopen them every round.
+TEST(RdmaLoopback, AdaptivePoolRetainsBurstDemand) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv pool_max("DFKV_RDMA_POOL_MAX", "2");
+  ScopedEnv adaptive("DFKV_RDMA_POOL_ADAPTIVE", "1");
+  RdmaNode node("adaptive-pool");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  constexpr int kWorkers = 8;
+  {
+    const std::string v = "warm";
+    ASSERT_TRUE(c.Put("adp_warm", v.data(), v.size()));
+  }
+  DrivePutLoop(&c, "adp_a", kWorkers, 800);
+  const long opened_first =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  DrivePutLoop(&c, "adp_b", kWorkers, 800);
+  const long opened_second =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  EXPECT_EQ(opened_second - opened_first, 0)
+      << "adaptive pool did not retain burst-era endpoints";
+  const std::string metrics = rt.MetricsText();
+  EXPECT_EQ(CounterVal(metrics, "dfkv_rdma_client_pool_adaptive"), 1);
+  EXPECT_EQ(MetricSum(metrics, "dfkv_rdma_client_pool_demand_peak{"),
+            kWorkers);
+  EXPECT_EQ(MetricSum(metrics, "dfkv_rdma_client_pool_demand_active{"), 0);
+}
+
+// The adaptive peak must re-baseline to live demand after a quiet period, else
+// a long-idle node hoards burst-era QPs forever.
+TEST(RdmaLoopback, AdaptivePoolPeakRebaselinesAfterQuiet) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv pool_max("DFKV_RDMA_POOL_MAX", "2");
+  ScopedEnv adaptive("DFKV_RDMA_POOL_ADAPTIVE", "1");
+  ScopedEnv decay("DFKV_RDMA_POOL_ADAPTIVE_DECAY_MS", "200");
+  RdmaNode node("adaptive-pool-decay");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  constexpr int kWorkers = 4;
+  DrivePutLoop(&c, "apq", kWorkers, 800);
+  ASSERT_EQ(MetricSum(rt.MetricsText(), "dfkv_rdma_client_pool_demand_peak{"),
+            kWorkers);
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  const std::string v = "solo";
+  ASSERT_TRUE(c.Put("apq_solo", v.data(), v.size()));
+  // The quiet window's rebaseline runs inside the solo op's release path.
+  EXPECT_EQ(MetricSum(rt.MetricsText(), "dfkv_rdma_client_pool_demand_peak{"),
+            1);
+}
+
+// DFKV_RDMA_POOL_ADAPTIVE=0 restores the pure pool_max retention behavior.
+TEST(RdmaLoopback, AdaptivePoolDisabledFallsBackToPoolMax) {
+  if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
+  ScopedEnv pool_max("DFKV_RDMA_POOL_MAX", "2");
+  ScopedEnv adaptive("DFKV_RDMA_POOL_ADAPTIVE", "0");
+  RdmaNode node("adaptive-off");
+  RdmaTransport rt(kMaxMsg);
+  KVClient c({{"n", node.addr}}, SelfHdr(), &rt);
+  constexpr int kWorkers = 6;
+  DrivePutLoop(&c, "apo_a", kWorkers, 800);
+  const long opened_first =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  DrivePutLoop(&c, "apo_b", kWorkers, 800);
+  const long opened_second =
+      CounterVal(rt.MetricsText(), "dfkv_rdma_client_conns_opened_total");
+  EXPECT_GE(opened_second - opened_first, kWorkers - 2)
+      << "with adaptation off, pool_max=2 must churn burst endpoints";
+  EXPECT_EQ(CounterVal(rt.MetricsText(), "dfkv_rdma_client_pool_adaptive"), 0);
+}
+
 TEST(RdmaLoopback, ConfiguredPoolMaxBoundsIdleControlConnections) {
   if (!HaveRdma()) GTEST_SKIP() << "no RDMA device";
   ScopedEnv pool_max("DFKV_RDMA_POOL_MAX", "4");
