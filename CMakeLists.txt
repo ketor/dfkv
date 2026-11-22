@@ -213,6 +213,9 @@ if(DFKV_BUILD_TESTS)
         ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
     endif()
   endforeach()
+  add_test(NAME WholeProcessReadScheduler COMMAND read_scheduler_test --gtest_shuffle --gtest_repeat=20)
+  add_test(NAME WholeProcessReadSchedulerInOrder COMMAND read_scheduler_test --gtest_repeat=20)
+  set_tests_properties(WholeProcessReadScheduler WholeProcessReadSchedulerInOrder PROPERTIES ENVIRONMENT "${DFKV_UNIT_TEST_ENV}")
   if(DFKV_WITH_RDMA)  # exercised in CI under Soft-RoCE (rdma_rxe); skips if no device
     add_executable(rdma_loopback_test ${CMAKE_CURRENT_SOURCE_DIR}/test/transport/rdma_loopback_test.cc)
     add_executable(rdma_lease_loopback_test
