@@ -3318,7 +3318,9 @@ TEST(SlabAllocator, TmpCrossClassRegressions) {
     rep << RunPhases(lens, {{{1, 1, 1}, 3, "S0.equal"}}, true, bal) << "\n";
     rep << RunPhases(lens, {{{1, 1, 1}, 3, "b.equal"}}, false, bal) << "\n";
     rep << RunPhases(lens, {{{1, 0, 0}, 2, "a1.small"},
-                            {{0, 0, 1}, 1, "a1.large+1"}}, true, bal) << "\n";
+                            {{0, 0, 1}, 1, "a1.large+1"},
+                            {{0, 0, 1}, 1, "a1.large+2"},
+                            {{0, 0, 1}, 1, "a1.large+3"}}, true, bal) << "\n";
     rep << RunPhases(lens, {{{1, 1, 1}, 2, "S4.equal"},
                             {{0.1, 0.1, 0.8}, 3, "S4.80pct+3"}}, true, bal, 2.0)
         << "\n";
