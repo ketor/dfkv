@@ -263,6 +263,36 @@ class RetainKeysMatchWrites(unittest.TestCase):
         self.assertRetainMatchesWrites(b, device=True)
 
 
+class DraftRetention(unittest.TestCase):
+    """The EAGLE draft KV is written with the write's TTL; a touch must renew
+    it too. It renewed only the target's objects, so the draft expired
+    first."""
+
+    def _draft_backend(self, writer, draft_sub, tp_rank=0):
+        b = _backend(writer=writer, tp_rank=tp_rank, kda=False, indexer=False,
+                     device=True, width=2, layers=5)
+        b.mem_pool_device_draft = _DevicePool(3, draft_sub)
+        b.batch_set_v1_device_draft(PAGES, list(range(len(PAGES))))
+        return b
+
+    def test_writer_renews_what_it_wrote_including_the_draft(self):
+        b = self._draft_backend(writer=True, draft_sub=1)
+        b._kv_device_set(PAGES, list(range(len(PAGES))))
+        draft = {sk for k in PAGES for sk in b._draft_keys(k, 1)}
+        self.assertTrue(any(sk.startswith(d) for sk in b.written for d in draft))
+        self.assertEqual(set(b._retain_object_keys(PAGES)), set(b.written))
+
+    def test_follower_renews_a_sharded_draft_only(self):
+        replicated = self._draft_backend(writer=False, draft_sub=1, tp_rank=3)
+        self.assertEqual(replicated.written, [])
+        self.assertEqual(replicated._retain_object_keys(PAGES), [])
+        sharded = self._draft_backend(writer=False, draft_sub=2, tp_rank=3)
+        self.assertTrue(sharded.written)
+        self.assertEqual(set(sharded._retain_object_keys(PAGES)),
+                         set(sharded.written))
+        self.assertTrue(sharded.retain_owns_objects())
+
+
 class RetainPrecheck(unittest.TestCase):
     def setUp(self):
         self.b = _backend()

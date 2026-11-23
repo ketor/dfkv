@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- SGLang HiCache connector, EAGLE draft KV (L2-bypass): `batch_touch` and
+  `retain_precheck` cover the draft's objects too. A draft page is written
+  with the write's retention TTL, but a touch renewed only the target
+  model's KV and side pools, so the draft's protection ran out first while
+  the target's was renewed, and loaded pages then ran without their draft
+  KV. The draft objects this rank writes (all ranks for a draft split over
+  TP, the replica writer for a replicated one) are now renewed with the rest
+  of the prefix, once this process has moved a draft page and so knows its
+  layout.
+
 - vLLM connector, namespace: each cache group's object size
   (`logical_bytes_per_block`) is not in the namespace. It is not added now:
   that changes every key and so waits for the next layout-ID bump, which
