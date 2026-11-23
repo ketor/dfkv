@@ -3018,8 +3018,22 @@ void FillTwoClasses(SlabAllocator& a) {
   SlotRef r;
   for (int i = 0; i < 64; ++i)
     ASSERT_TRUE(a.Put(Key("a" + std::to_string(i)), 4096, &r, &ev));
-  for (int i = 0; i < 64; ++i)
+  std::ostringstream trace;
+  auto show = [&](const char* when) {
+    trace << when << ": steals=" << a.Steals() << " cold=" << a.ColdSteals()
+          << " evictions=" << a.Evictions();
+    for (const auto& c : a.Classes())
+      trace << " [" << c.slot_size << " ext=" << c.extents
+            << " res=" << c.resident << " tail=" << c.tail_age << "]";
+    trace << "\n";
+  };
+  show("after A");
+  for (int i = 0; i < 64; ++i) {
     ASSERT_TRUE(a.Put(Key("b" + std::to_string(i)), 8192, &r, &ev));
+    if (i == 31 || i == 32 || i == 40) show(("b" + std::to_string(i)).c_str());
+  }
+  show("after B");
+  if (a.Classes()[0].extents != 4) ADD_FAILURE() << trace.str();
 }
 }  // namespace
 
