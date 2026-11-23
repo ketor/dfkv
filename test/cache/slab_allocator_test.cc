@@ -3299,8 +3299,8 @@ TEST(SlabAllocator, TmpCrossClassPhases) {
                               {{0.1, 0.1, 0.8}, 1, "a2.80pct+1"},
                               {{0.1, 0.1, 0.8}, 2, "a2.80pct+3"}};
   std::ostringstream rep;
-  for (const uint32_t r : {125u, 150u, 200u})
-    for (const size_t m : {size_t{1}, size_t{2}, size_t{4}})
+  for (const uint32_t r : {110u, 125u})
+    for (const size_t m : {size_t{1}, size_t{2}, size_t{3}})
       rep << RunPhases(lens, a2, true, {r, m}) << "\n";
   ADD_FAILURE() << rep.str();
 }
