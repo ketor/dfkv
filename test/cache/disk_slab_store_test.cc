@@ -4064,3 +4064,90 @@ TEST_F(DiskSlabTest, ANewDirectoryThatIsNeverActivatedIsACleanEmptyStore) {
   EXPECT_EQ(next.Count(), 0u);
   ASSERT_TRUE(PutFilled(next, 1, 'a'));
 }
+
+// ---- TMP STO-35 harness B: the disk store, with and without the balancer ----
+TEST_F(DiskSlabTest, TmpBalanceHarnessB) {
+  const auto sp = fs::space(fs::temp_directory_path());
+  if (sp.available < 50ull * 1000000000) {
+    ADD_FAILURE() << "refusing: under 50 GB free";
+    return;
+  }
+  const std::vector<size_t> lens{6000, 90000, 300000};
+  constexpr uint64_t kCap = 32ull << 20;
+  struct Phase { std::vector<double> share; double caps; const char* name; };
+  const std::vector<std::vector<Phase>> scenarios{
+      {{{1, 1, 1}, 1.5, "a2.equal"}, {{0.1, 0.1, 0.8}, 2, "a2.80pct+2"}},
+      {{{1, 0, 0}, 1.5, "a1.small"}, {{0, 0, 1}, 1, "a1.large+1"}}};
+  std::ostringstream rep;
+  for (const bool balance : {false, true}) {
+    for (const auto& phases : scenarios) {
+      fs::remove_all(dir_);
+      auto o = Opts(kCap, 1 << 20, 4096);
+      o.reclaim_interval_ms = 0;  // ticked below, every 2 MiB written
+      o.balance = balance;
+      o.balance_ratio_pct = 110;
+      o.balance_moves_per_tick = 1;
+      bool ok = false;
+      DiskSlabStore s(o, &ok);
+      ASSERT_TRUE(ok) << s.StartupError();
+      const std::string value(300000, 'v');
+      std::vector<uint64_t> count(3, 0);
+      struct Op { uint32_t cls; uint64_t id; };
+      std::vector<Op> ops;
+      std::vector<double> us;
+      uint64_t since_tick = 0;
+      rep << "TMP balance=" << balance;
+      for (const auto& ph : phases) {
+        std::vector<uint64_t> written(3, 0);
+        uint64_t total = 0;
+        while (total < static_cast<uint64_t>(ph.caps * kCap)) {
+          size_t c = 3;
+          double worst = 1e300;
+          for (size_t k = 0; k < 3; ++k) {
+            if (ph.share[k] <= 0) continue;
+            const double norm = written[k] / ph.share[k];
+            if (norm < worst) { worst = norm; c = k; }
+          }
+          const uint64_t id = c * 100000000ull + count[c]++;
+          const auto t = std::chrono::steady_clock::now();
+          s.Cache(K(id), value.data(), lens[c]);
+          us.push_back(std::chrono::duration<double, std::micro>(
+                           std::chrono::steady_clock::now() - t).count());
+          ops.push_back({static_cast<uint32_t>(c), id});
+          written[c] += lens[c];
+          total += lens[c];
+          since_tick += lens[c];
+          if (since_tick >= (2u << 20)) {
+            since_tick = 0;
+            dfkv::DiskSlabStoreTestPeer::ReclaimNow(&s, {});
+          }
+        }
+        std::vector<uint64_t> recent(3, 0), held(3, 0);
+        uint64_t window = 0;
+        for (size_t i = ops.size(); i-- > 0 && window < kCap;) {
+          const size_t c = ops[i].cls;
+          window += lens[c];
+          recent[c] += lens[c];
+          if (s.IsCached(K(ops[i].id))) held[c] += lens[c];
+        }
+        auto sorted = us;
+        std::sort(sorted.begin(), sorted.end());
+        const auto st = s.GetStats();
+        rep << "\nTMP " << ph.name << ": moves=" << st.balance_moves
+            << " hold_max_us=" << st.balance_max_hold_us << " steals=" << st.steals
+            << " put_busy=" << st.put_busy << " wm_tick_max_us="
+            << st.watermark_max_tick_us << " p50=" << sorted[sorted.size() / 2]
+            << " p99=" << sorted[sorted.size() * 99 / 100];
+        rep << "\nTMP   held=";
+        for (size_t k = 0; k < 3; ++k)
+          rep << (k ? "/" : "") << (recent[k] ? 100.0 * held[k] / recent[k] : -1.0);
+        rep << " ext=";
+        bool first = true;
+        for (const auto& c : s.ClassStats())
+          if (c.extents) { rep << (first ? "" : "/") << c.slot_size << ":" << c.extents; first = false; }
+      }
+      rep << "\n";
+    }
+  }
+  ADD_FAILURE() << rep.str();
+}
