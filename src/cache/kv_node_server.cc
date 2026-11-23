@@ -2030,6 +2030,8 @@ void KvNodeServer::FinishDiskRead(
   if (ok) {
     server->cache_hit_.fetch_add(1, std::memory_order_relaxed);
     server->bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
+  } else if (result == Status::kNotFound) {  // failed its check: a miss
+    server->cache_miss_.fetch_add(1, std::memory_order_relaxed);
   } else {
     server->get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
@@ -2069,6 +2071,8 @@ void KvNodeServer::FinishPromotedDiskRead(
     (void)promoted->reservation.Commit();
     server->cache_hit_.fetch_add(1, std::memory_order_relaxed);
     server->bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
+  } else if (result == Status::kNotFound) {  // failed its check: a miss
+    server->cache_miss_.fetch_add(1, std::memory_order_relaxed);
   } else {
     server->get_io_err_.fetch_add(1, std::memory_order_relaxed);
   }
