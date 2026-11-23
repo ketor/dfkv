@@ -3116,3 +3116,212 @@ TEST(SlabAllocator, AMovedExtentDoesNotMoveStraightBack) {
   EXPECT_EQ(a.Classes()[cb].extents, before - moves);
   EXPECT_GE(a.Classes()[ca].extents, 3u);
 }
+// ---- TMP STO-35 harness A: cross-class shares at a realistic extent count ----
+// Allocator only, no I/O. The disk store's reclaim tick (growth, free-slot
+// reclaim, watermark) is replayed every kTickBytes of writes, as the store
+// runs it every 50 ms. Phases change each class's share of the bytes.
+namespace {
+struct Phase {
+  std::vector<double> share;  // of the bytes written, per class
+  double capacities;
+  const char* name;
+};
+
+struct Balance {
+  uint32_t ratio_pct = 0;  // 0: off
+  size_t moves = 1;
+};
+
+std::string RunPhases(const std::vector<size_t>& lens,
+                      const std::vector<Phase>& phases, bool watermark,
+                      Balance bal = {}, double hot_reads = 0) {
+  using dfkv::SlabAllocator;
+  constexpr uint64_t kExtent = 64ull << 20;
+  constexpr uint32_t kExtents = 1024;
+  constexpr uint64_t kCap = kExtent * kExtents;
+  constexpr uint64_t kTickBytes = 64ull << 20;
+  SlabAllocator::Options o;
+  o.extent_bytes = kExtent;
+  o.num_extents = kExtents;
+  o.align = 64 << 10;
+  SlabAllocator a(o);
+  const size_t n = lens.size();
+  std::vector<uint64_t> count(n, 0);
+  struct Op { uint32_t cls; uint64_t id; };
+  std::vector<Op> ops;
+  uint64_t since_tick = 0;
+  std::vector<uint64_t> last_puts;
+  bool wm_active = false;
+  uint64_t wm_evictions = 0, grown = 0, failed = 0;
+  const uint64_t high = kCap * 92 / 100, low = kCap * 88 / 100;
+  uint64_t moves = 0;
+  double max_hold_us = 0;
+  auto tick = [&] {
+    if (bal.ratio_pct) {
+      std::vector<dfkv::BlockKey> ev;
+      const auto t = std::chrono::steady_clock::now();
+      const size_t m = a.BalanceTailAges(bal.ratio_pct, bal.moves, &ev);
+      if (m) {
+        moves += m;
+        max_hold_us = std::max(max_hold_us,
+            std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t).count());
+      }
+    }
+    if (watermark && a.UsedBytes() > high) wm_active = true;
+    if (wm_active) {
+      std::vector<dfkv::BlockKey> ev;
+      wm_evictions += a.EvictColdToTarget(low, 256, &ev);
+      if (a.UsedBytes() <= low) wm_active = false;
+    }
+    const auto classes = a.Classes();
+    if (last_puts.size() < classes.size()) last_puts.resize(classes.size(), 0);
+    std::vector<uint64_t> delta(classes.size());
+    std::vector<uint32_t> extents(classes.size());
+    for (size_t i = 0; i < classes.size(); ++i) {
+      delta[i] = classes[i].puts - last_puts[i];
+      last_puts[i] = classes[i].puts;
+      extents[i] = classes[i].extents;
+    }
+    for (size_t i = 0; i < classes.size(); ++i) {
+      if (delta[i] == 0) continue;
+      const auto& c = classes[i];
+      size_t free_now = c.free_slots;
+      const size_t want = SlabAllocator::FreeSlotTarget(
+          delta[i], c.slot_size, std::numeric_limits<size_t>::max());
+      if (free_now < want && c.slots_per_extent > 0 && a.PoolExtents() == 0) {
+        size_t need = std::min<size_t>(
+            (want - free_now + c.slots_per_extent - 1) / c.slots_per_extent, 2);
+        while (need > 0) {
+          const size_t donor = SlabAllocator::ColdestGrowDonor(
+              classes, delta, extents, i, a.StripeWays());
+          if (donor == classes.size()) break;
+          std::vector<dfkv::BlockKey> ev;
+          if (!a.StealFrom(donor, i, &ev)) { extents[donor] = 0; continue; }
+          extents[donor]--;
+          ++grown;
+          free_now += c.slots_per_extent;
+          --need;
+        }
+      }
+      const size_t target = SlabAllocator::FreeSlotTarget(
+          delta[i], c.slot_size, c.resident + free_now);
+      if (free_now >= target) continue;
+      size_t budget = 4096;
+      for (;;) {
+        std::vector<dfkv::BlockKey> ev;
+        const size_t batch = std::min<size_t>(128, budget);
+        const size_t got = a.ReclaimClass(i, target, batch, &ev);
+        budget -= std::min(budget, got);
+        if (got < batch || budget == 0) break;
+      }
+    }
+  };
+  std::ostringstream os;
+  os << "TMP watermark=" << (watermark ? "on" : "off") << " R="
+     << bal.ratio_pct << " moves/tick=" << bal.moves;
+  std::vector<uint64_t> hot;
+  uint64_t hot_hits = 0, hot_reads_done = 0;
+  double read_credit = 0;
+  for (const Phase& ph : phases) {
+    std::vector<uint64_t> written(n, 0);
+    uint64_t total = 0;
+    while (total < static_cast<uint64_t>(ph.capacities * kCap)) {
+      size_t c = n;
+      double worst = 1e300;
+      for (size_t k = 0; k < n; ++k) {
+        if (ph.share[k] <= 0) continue;
+        const double norm = written[k] / ph.share[k];
+        if (norm < worst) { worst = norm; c = k; }
+      }
+      const dfkv::BlockKey key{c * 100000000ull + count[c]++, 0};
+      dfkv::SlabAllocator::SlotRef ref;
+      std::vector<dfkv::BlockKey> ev;
+      if (!a.Put(key, lens[c], &ref, &ev)) ++failed;
+      ops.push_back({static_cast<uint32_t>(c), key.digest_hi});
+      if (hot_reads > 0) {
+        if (c == 0 && hot.size() < 20000) hot.push_back(key.digest_hi);
+        read_credit += hot_reads;
+        while (read_credit >= 1 && !hot.empty()) {
+          read_credit -= 1;
+          const uint64_t id = hot[hot_reads_done++ % hot.size()];
+          if (a.Get(dfkv::BlockKey{id, 0}, &ref)) ++hot_hits;
+        }
+      }
+      written[c] += lens[c];
+      total += lens[c];
+      since_tick += lens[c];
+      if (since_tick >= kTickBytes) { since_tick = 0; tick(); }
+    }
+    // Of the most recent capacity's worth of writes, the share still held.
+    std::vector<uint64_t> recent(n, 0), held(n, 0);
+    uint64_t window = 0;
+    for (size_t i = ops.size(); i-- > 0 && window < kCap;) {
+      const size_t c = ops[i].cls;
+      window += lens[c];
+      recent[c] += lens[c];
+      if (a.Contains(dfkv::BlockKey{ops[i].id, 0})) held[c] += lens[c];
+    }
+    uint64_t payload = 0;
+    os << "\nTMP " << ph.name << ": moves=" << moves
+       << " hold_max_us=" << max_hold_us;
+    if (hot_reads > 0)
+      os << " hot_hit=" << 100.0 * hot_hits / std::max<uint64_t>(hot_reads_done, 1);
+    os << " steals=" << a.Steals()
+       << " cold=" << a.ColdSteals() << " grown=" << grown
+       << " wm_ev=" << wm_evictions << " failed=" << failed
+       << " used=" << 100.0 * a.UsedBytes() / kCap;
+    std::vector<uint32_t> ext(n, 0);
+    for (const auto& c : a.Classes()) payload += c.useful_bytes;
+    const auto classes = a.Classes();
+    for (size_t k = 0; k < n; ++k) {
+      // The class of lens[k]: the first with a slot that fits.
+      for (const auto& c : classes)
+        if (c.slot_size >= lens[k] && (c.extents || c.resident)) {
+          ext[k] = c.extents;
+          break;
+        }
+    }
+    os << "\nTMP   payload=" << 100.0 * payload / kCap << " ext=";
+    for (size_t k = 0; k < n; ++k) os << (k ? "/" : "") << ext[k];
+    os << " recent_held=";
+    for (size_t k = 0; k < n; ++k)
+      os << (k ? "/" : "")
+         << (recent[k] ? 100.0 * held[k] / recent[k] : -1.0);
+  }
+  return os.str();
+}
+}  // namespace
+
+TEST(SlabAllocator, TmpCrossClassPhases) {
+  const std::vector<size_t> lens{60000, 900000, 3000000};
+  const std::vector<Phase> a2{{{1, 1, 1}, 2, "a2.equal"},
+                              {{0.1, 0.1, 0.8}, 1, "a2.80pct+1"},
+                              {{0.1, 0.1, 0.8}, 2, "a2.80pct+3"}};
+  std::ostringstream rep;
+  for (const uint32_t r : {125u, 150u, 200u})
+    for (const size_t m : {size_t{1}, size_t{2}, size_t{4}})
+      rep << RunPhases(lens, a2, true, {r, m}) << "\n";
+  ADD_FAILURE() << rep.str();
+}
+
+TEST(SlabAllocator, TmpCrossClassRegressions) {
+  const std::vector<size_t> lens{60000, 900000, 3000000};
+  const char* rs = std::getenv("TMP_R");
+  const char* ms = std::getenv("TMP_M");
+  const uint32_t r = static_cast<uint32_t>(std::strtoul(rs ? rs : "150", nullptr, 10));
+  const size_t m = std::strtoul(ms ? ms : "1", nullptr, 10);
+  std::ostringstream rep;
+  for (const Balance bal : {Balance{0, 1}, Balance{r, m}}) {
+    rep << RunPhases(lens, {{{1, 1, 1}, 2, "a2off.equal"},
+                            {{0.1, 0.1, 0.8}, 3, "a2off.80pct+3"}}, false, bal) << "\n";
+    rep << RunPhases(lens, {{{1, 1, 1}, 3, "S0.equal"}}, true, bal) << "\n";
+    rep << RunPhases(lens, {{{1, 1, 1}, 3, "b.equal"}}, false, bal) << "\n";
+    rep << RunPhases(lens, {{{1, 0, 0}, 2, "a1.small"},
+                            {{0, 0, 1}, 1, "a1.large+1"}}, true, bal) << "\n";
+    rep << RunPhases(lens, {{{1, 1, 1}, 2, "S4.equal"},
+                            {{0.1, 0.1, 0.8}, 3, "S4.80pct+3"}}, true, bal, 2.0)
+        << "\n";
+  }
+  ADD_FAILURE() << rep.str();
+}
