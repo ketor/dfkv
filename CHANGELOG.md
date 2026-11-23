@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- SGLang HiCache connector, `batch_exists_v2`: all side pools are probed in
+  one existence round trip. It made one round trip for the KV prefix and
+  then one per side pool, one after the other: a model with five side pools
+  paid six round trips per lookup. The side-pool keys are known once the KV
+  prefix is, so they now go in one call: two round trips per lookup whatever
+  the number of side pools. Results are unchanged.
+
 - SGLang HiCache connector, EAGLE draft KV (L2-bypass): `batch_touch` and
   `retain_precheck` cover the draft's objects too. A draft page is written
   with the write's retention TTL, but a touch renewed only the target

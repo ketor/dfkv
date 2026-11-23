@@ -3262,19 +3262,25 @@ class DfkvHiCache(HiCacheStorage):
             # is not enough: the minimum can be a length at which a trailing
             # window is incomplete, so the load of that length would miss.
             restorable = set(range(1, kv_pages + 1))
-            for tr in (pool_transfers or []):
-                if not restorable:
-                    break
+            # One existence round trip for every side pool, not one per pool:
+            # the keys are all known once the KV prefix is.
+            probes = []
+            sks = []
+            for tr in (pool_transfers or []) if kv_pages else ():
                 name = str(tr.name)
                 sub = self._pool_sub(name)
                 # Device-direct sidecars store explicit scatter-group keys, so
                 # probe group 0 just as batch_exists does for the main KV. A
                 # host sidecar stores the bare pool key.
                 dev_side = name in getattr(self, "_sidecar_device_pools", {})
-                sks = [self._sg_group_key(sk, 0) if dev_side else sk
-                       for k in keys[:kv_pages]
-                       for sk in self._pool_keys(name, k, dev_side)]
-                present = self._fold(self._batch_exist_flat(sks), kv_pages, sub)
+                start = len(sks)
+                sks.extend(self._sg_group_key(sk, 0) if dev_side else sk
+                           for k in keys[:kv_pages]
+                           for sk in self._pool_keys(name, k, dev_side))
+                probes.append((tr, name, sub, start, len(sks)))
+            found = self._batch_exist_flat(sks) if sks else []
+            for tr, name, sub, start, end in probes:
+                present = self._fold(found[start:end], kv_pages, sub)
                 if tr.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                     # Only the *last* `trailing` pages of a candidate prefix need
                     # this pool, as in SGLang's reference batch_exists_v2.

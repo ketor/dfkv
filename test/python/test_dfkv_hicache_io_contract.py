@@ -533,6 +533,17 @@ class ExistsV2Window(unittest.TestCase):
         self.assertEqual(
             st.batch_exists_v2(self.PAGES, self._transfers()).kv_hit_pages, 0)
 
+    def test_side_pools_are_probed_in_one_round_trip(self):
+        # One native existence call for the KV prefix and one for all side
+        # pools; there was one call per side pool.
+        st = self._plugin(self._present(dsa_missing=set(), swa_pages={9}))
+        calls = []
+        probe = st._batch_exist_flat
+        st._batch_exist_flat = lambda sks: calls.append(len(sks)) or probe(sks)
+        res = st.batch_exists_v2(self.PAGES, self._transfers())
+        self.assertEqual(res.kv_hit_pages, 10)
+        self.assertEqual(calls, [10, 20])
+
     def test_restorable_lengths_are_reported_when_sglang_has_the_field(self):
         import dataclasses
 
