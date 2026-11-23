@@ -1418,6 +1418,54 @@ TEST_F(DiskSlabTest, AKillAfterAnUnsyncedBindWipeLeavesNoStaleKeys) {
   }
 }
 
+// STO-35: a balancer move is a steal. Its bind wipe goes to the table before
+// any resident is forgotten, so a process killed right after the wipe, or
+// after the whole move, comes back by warm restart without the moved
+// extent's old values and with every other value intact.
+TEST_F(DiskSlabTest, AKillDuringABalancerMoveLeavesNoStaleValues) {
+  for (const bool after_move : {false, true}) {
+    SCOPED_TRACE(after_move ? "killed after the move" : "killed after the wipe");
+    fs::remove_all(dir_);
+    fs::remove_all(dir_.string() + "_tokens");
+    // 8 extents of 64 KiB. Class A (4 KiB slots) is written first and left
+    // alone; class B (8 KiB) takes the other extents and evicts its own.
+    auto options = WithIdentity(Opts(8 * 64 * 1024, 64 * 1024, 4096),
+                                WarmRestart::kAuto, 1, 7);
+    options.balance = true;
+    const std::string a(4000, 'A'), b(8000, 'B');
+    ASSERT_TRUE(CrashAfter(options, [&](DiskSlabStore& store) {
+      for (int i = 0; i < 64; ++i)
+        if (store.Cache(K(1000 + i), a.data(), a.size()) != Status::kOk) return false;
+      for (int i = 0; i < 64; ++i)
+        if (store.Cache(K(2000 + i), b.data(), b.size()) != Status::kOk) return false;
+      if (!after_move)
+        dfkv::DiskSlabStoreTestPeer::SetBindHook(&store, [](uint32_t) { ::_exit(0); });
+      dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
+      if (store.GetStats().balance_moves != 1) return false;
+      ::_exit(0);  // killed: no table sync since the wipe (table_sync_ms = 0)
+    }));
+    bool ok = false;
+    DiskSlabStore recovered(options, &ok);
+    ASSERT_TRUE(ok) << recovered.StartupError();
+    EXPECT_EQ(recovered.GetStats().warm_restarts, 1u) << "the table was kept";
+    std::string out;
+    int a_present = 0, b_present = 0;
+    for (int i = 0; i < 64; ++i) {
+      if (recovered.Range(K(1000 + i), 0, 0, &out) == Status::kOk) {
+        ++a_present;
+        EXPECT_EQ(out, a) << i;
+      }
+      if (recovered.Range(K(2000 + i), 0, 0, &out) == Status::kOk) {
+        ++b_present;
+        EXPECT_EQ(out, b) << i;
+      }
+    }
+    EXPECT_EQ(a_present, 48) << "the moved extent's values came back, or others were lost";
+    EXPECT_EQ(b_present, 32);
+    EXPECT_EQ(recovered.Count(), 80u);
+  }
+}
+
 TEST_F(DiskSlabTest, WarmRecoveryThatDiesHalfWayForcesAReset) {
   const auto base = Opts(1 << 20, 1 << 20, 4096);
   const auto options = WithIdentity(base, WarmRestart::kAuto, 1, 7);
