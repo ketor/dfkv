@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- SGLang HiCache connector, device-direct (L2-bypass): the host read
+  `batch_get_v1` reports every page missing when primary KV is stored
+  device-direct, and leaves the host buffer as it was. It cannot load those
+  objects (layer-major scatter-gather groups) into a host buffer, yet it
+  reported a stored page as present: a caller that then read the host buffer
+  would have used whatever the buffer held as KV. The SGLang builds with the
+  bypass never call it for device-direct KV (prefetch only records the
+  request, discovery uses `batch_exists`, loads go through the device
+  entries), so for them nothing changes; whether a page is stored is
+  `batch_exists`'s answer. A WARNING is logged once if it is called.
+
 - SGLang HiCache connector: object keys are built from affixes packed once,
   and a batch's keys share one native buffer. Every key was validated and
   packed in full (pool, coordinates, component), and every key got a buffer
