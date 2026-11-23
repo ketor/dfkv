@@ -92,7 +92,8 @@ std::string RemoveLeftovers(const std::string& root) {
   for (const auto& e : fs::directory_iterator(root, ec)) {
     const std::string name = e.path().filename().string();
     bool ours = name.size() > 6 && name.compare(name.size() - 6, 6, ".count") == 0;
-    for (const char* prefix : {"slab-", "slabwarm-", "log-", "zipf-", "markers-"})
+    for (const char* prefix :
+         {"slab-", "slabwarm-", "slab97-", "slab99-", "log-", "zipf-", "markers-"})
       ours = ours || name.rfind(prefix, 0) == 0;
     if (!ours) continue;
     std::error_code ec2;
@@ -191,6 +192,14 @@ class Bench {
     // "slabwarm": slab as deployed, keeping its table after an unclean exit.
     if (engine_ == "slabwarm") ::setenv("DFKV_SLAB_WARM_RESTART", "auto", 1);
     else ::unsetenv("DFKV_SLAB_WARM_RESTART");
+    // "slab97", "slab99": slab with the watermarks at 97/96 or 99/98 (STO-13).
+    if (engine_ == "slab97" || engine_ == "slab99") {
+      ::setenv("DFKV_SLAB_EVICT_HIGH_PCT", engine_ == "slab97" ? "97" : "99", 1);
+      ::setenv("DFKV_SLAB_EVICT_LOW_PCT", engine_ == "slab97" ? "96" : "98", 1);
+    } else {
+      ::unsetenv("DFKV_SLAB_EVICT_HIGH_PCT");
+      ::unsetenv("DFKV_SLAB_EVICT_LOW_PCT");
+    }
     rep_.tag = "engine=" + engine_ + " size=" + std::to_string(len_);
   }
   ~Bench() {
@@ -203,7 +212,7 @@ class Bench {
     DiskCacheGroup::Options o;
     o.cache_dirs = {dir_};
     o.capacity_bytes = capacity_;
-    o.engine = engine_ == "slabwarm" ? "slab" : engine_;
+    o.engine = engine_.rfind("slab", 0) == 0 ? "slab" : engine_;
     const auto t0 = Clock::now();
     group_ = std::make_unique<DiskCacheGroup>(o);
     open_secs_ = Seconds(t0, Clock::now());
@@ -416,6 +425,7 @@ TEST_P(LseBench, CapacityThroughputRemoveRestart) {
                           "dfkv_lse_cleaner_waits_total",
                           "dfkv_lse_cleaner_wait_microseconds_total"};
   uint64_t waits_before[6];
+  const auto slab_before = b.G().SlabStats();
   for (int i = 0; i < 6; ++i) waits_before[i] = EngineMetric(b.G(), kWaits[i]);
   auto waits = [&] {
     static const char* kShort[] = {"inline_reclaims", "inline_reclaim_us", "sealer_waits",
@@ -435,7 +445,19 @@ TEST_P(LseBench, CapacityThroughputRemoveRestart) {
     r.Line("steady_state", "kcachefull_pct=" +
                                Fmt("%.4f", 100.0 * w.full / std::max<uint64_t>(w.puts, 1)) +
                                " evictions=" + std::to_string(b.G().Evictions()) +
-                               waits());
+                               waits() + [&] {
+                                 if (c.engine[0] != 's') return std::string();
+                                 const auto st = b.G().SlabStats();
+                                 return " slab_steals=" +
+                                        std::to_string(st.steals - slab_before.steals) +
+                                        " slab_watermark_evictions=" +
+                                        std::to_string(st.watermark_evictions -
+                                                       slab_before.watermark_evictions) +
+                                        " slab_watermark_max_tick_us=" +
+                                        std::to_string(st.watermark_max_tick_us) +
+                                        " slab_put_busy=" +
+                                        std::to_string(st.put_busy - slab_before.put_busy);
+                               }());
   }
   {
     Lat lat;
@@ -615,6 +637,8 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(Case{"slab", 1069548}, Case{"log", 1069548},     // 1.02 MiB
                       Case{"slab", 2873098}, Case{"log", 2873098},     // 2.74 MiB
                       Case{"slabwarm", 2873098},  // slab as deployed (warm restart)
+                      Case{"slab97", 1069548}, Case{"slab99", 1069548},    // STO-13
+                      Case{"slab97", 27158118}, Case{"slab99", 27158118},
                       Case{"slab", 27158118}, Case{"log", 27158118}),  // 25.9 MiB
     [](const ::testing::TestParamInfo<Case>& info) {
       return std::string(info.param.engine) + "_" + std::to_string(info.param.len);
