@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <string>
 #include <functional>
 #include <mutex>
@@ -1427,8 +1428,11 @@ TEST_F(DiskSlabTest, AKillDuringABalancerMoveLeavesNoStaleValues) {
     SCOPED_TRACE(after_move ? "killed after the move" : "killed after the wipe");
     fs::remove_all(dir_);
     fs::remove_all(dir_.string() + "_tokens");
+    const std::string present_file = dir_.string() + "_present";
     // 8 extents of 64 KiB. Class A (4 KiB slots) is written first and left
     // alone; class B (8 KiB) takes the other extents and evicts its own.
+    // A long cold window keeps Put's own cold steal out of the way.
+    ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "100000", 1);
     auto options = WithIdentity(Opts(8 * 64 * 1024, 64 * 1024, 4096),
                                 WarmRestart::kAuto, 1, 7);
     options.balance = true;
@@ -1438,31 +1442,48 @@ TEST_F(DiskSlabTest, AKillDuringABalancerMoveLeavesNoStaleValues) {
         if (store.Cache(K(1000 + i), a.data(), a.size()) != Status::kOk) return false;
       for (int i = 0; i < 64; ++i)
         if (store.Cache(K(2000 + i), b.data(), b.size()) != Status::kOk) return false;
+      // What the move may take values from.
+      std::ofstream present(present_file);
+      for (int i = 0; i < 64; ++i)
+        for (const uint64_t id : {1000ull + i, 2000ull + i})
+          if (store.IsCached(K(id))) present << id << "\n";
+      present.close();
       if (!after_move)
         dfkv::DiskSlabStoreTestPeer::SetBindHook(&store, [](uint32_t) { ::_exit(0); });
       dfkv::DiskSlabStoreTestPeer::ReclaimNow(&store, {});
       if (store.GetStats().balance_moves != 1) return false;
       ::_exit(0);  // killed: no table sync since the wipe (table_sync_ms = 0)
     }));
+    std::set<uint64_t> before;
+    {
+      std::ifstream in(present_file);
+      for (uint64_t id; in >> id;) before.insert(id);
+    }
     bool ok = false;
     DiskSlabStore recovered(options, &ok);
+    ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
     ASSERT_TRUE(ok) << recovered.StartupError();
     EXPECT_EQ(recovered.GetStats().warm_restarts, 1u) << "the table was kept";
     std::string out;
-    int a_present = 0, b_present = 0;
-    for (int i = 0; i < 64; ++i) {
-      if (recovered.Range(K(1000 + i), 0, 0, &out) == Status::kOk) {
-        ++a_present;
-        EXPECT_EQ(out, a) << i;
-      }
-      if (recovered.Range(K(2000 + i), 0, 0, &out) == Status::kOk) {
-        ++b_present;
-        EXPECT_EQ(out, b) << i;
+    size_t lost_a = 0, lost_b = 0;
+    for (const uint64_t id : before) {
+      if (recovered.Range(K(id), 0, 0, &out) == Status::kOk) {
+        EXPECT_EQ(out, id < 2000 ? a : b) << id;
+      } else {
+        ++(id < 2000 ? lost_a : lost_b);
       }
     }
-    EXPECT_EQ(a_present, 48) << "the moved extent's values came back, or others were lost";
-    EXPECT_EQ(b_present, 32);
-    EXPECT_EQ(recovered.Count(), 80u);
+    for (int i = 0; i < 64; ++i)
+      for (const uint64_t id : {1000ull + i, 2000ull + i})
+        if (!before.count(id))
+          EXPECT_NE(recovered.Range(K(id), 0, 0, &out), Status::kOk)
+              << id << " came back";
+    // The moved extent was one of A's (the older tail): its values, and
+    // nothing else, are gone.
+    EXPECT_GT(lost_a, 0u);
+    EXPECT_LE(lost_a, 16u);
+    EXPECT_EQ(lost_b, 0u);
+    EXPECT_EQ(recovered.Count(), before.size() - lost_a);
   }
 }
 

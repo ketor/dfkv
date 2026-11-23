@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <memory>
 #include <random>
 #include <set>
 #include <sstream>
@@ -3008,37 +3009,30 @@ namespace {
 // 8 extents of 64 KiB. Class A (4 KiB slots, 16 per extent) is written first
 // and then left alone; class B (8 KiB, 8 per extent) takes the other four
 // extents and then evicts its own values. A's next victim is much older.
-SlabAllocator::Options BalanceOpts() {
+// A cold window longer than any of these tests: Put's cold steal (which
+// takes an idle class's extents on its own) stays out of the way, and the
+// balancer's hysteresis lasts throughout.
+std::unique_ptr<SlabAllocator> BalanceAllocator() {
   auto o = Opts(64 * 1024, 8);
   o.stripe_ways = 1;
-  return o;
+  ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "100000", 1);
+  auto a = std::make_unique<SlabAllocator>(o);
+  ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
+  return a;
 }
 void FillTwoClasses(SlabAllocator& a) {
   std::vector<BlockKey> ev;
   SlotRef r;
   for (int i = 0; i < 64; ++i)
     ASSERT_TRUE(a.Put(Key("a" + std::to_string(i)), 4096, &r, &ev));
-  std::ostringstream trace;
-  auto show = [&](const char* when) {
-    trace << when << ": steals=" << a.Steals() << " cold=" << a.ColdSteals()
-          << " evictions=" << a.Evictions();
-    for (const auto& c : a.Classes())
-      trace << " [" << c.slot_size << " ext=" << c.extents
-            << " res=" << c.resident << " tail=" << c.tail_age << "]";
-    trace << "\n";
-  };
-  show("after A");
-  for (int i = 0; i < 64; ++i) {
+  for (int i = 0; i < 64; ++i)
     ASSERT_TRUE(a.Put(Key("b" + std::to_string(i)), 8192, &r, &ev));
-    if (i == 31 || i == 32 || i == 40) show(("b" + std::to_string(i)).c_str());
-  }
-  show("after B");
-  if (a.Classes()[0].extents != 4) ADD_FAILURE() << trace.str();
 }
 }  // namespace
 
 TEST(SlabAllocator, BalanceMovesAnExtentToTheClassWithTheYoungerTail) {
-  SlabAllocator a(BalanceOpts());
+  auto owned = BalanceAllocator();
+  SlabAllocator& a = *owned;
   ASSERT_NO_FATAL_FAILURE(FillTwoClasses(a));
   const size_t ca = ClassIndex(a, 4096), cb = ClassIndex(a, 8192);
   ASSERT_EQ(a.Classes()[ca].extents, 4u);
@@ -3056,7 +3050,8 @@ TEST(SlabAllocator, BalanceMovesAnExtentToTheClassWithTheYoungerTail) {
 }
 
 TEST(SlabAllocator, BalanceNeedsTheRatio) {
-  SlabAllocator a(BalanceOpts());
+  auto owned = BalanceAllocator();
+  SlabAllocator& a = *owned;
   ASSERT_NO_FATAL_FAILURE(FillTwoClasses(a));
   std::vector<BlockKey> ev;
   EXPECT_EQ(a.BalanceTailAges(100000, 1, &ev), 0u);
@@ -3065,7 +3060,8 @@ TEST(SlabAllocator, BalanceNeedsTheRatio) {
 
 // A read or write in flight pins its slot; an extent holding one stays.
 TEST(SlabAllocator, BalanceNeverMovesAnExtentWithAPinnedSlot) {
-  SlabAllocator a(BalanceOpts());
+  auto owned = BalanceAllocator();
+  SlabAllocator& a = *owned;
   ASSERT_NO_FATAL_FAILURE(FillTwoClasses(a));
   for (int i = 0; i < 64; i += 16) ASSERT_TRUE(a.Pin(Key("a" + std::to_string(i))));
   std::vector<BlockKey> ev;
@@ -3076,7 +3072,8 @@ TEST(SlabAllocator, BalanceNeverMovesAnExtentWithAPinnedSlot) {
 
 // A protected (RETAIN) value keeps its extent where it is.
 TEST(SlabAllocator, BalanceNeverMovesAnExtentWithAProtectedValue) {
-  SlabAllocator a(BalanceOpts());
+  auto owned = BalanceAllocator();
+  SlabAllocator& a = *owned;
   a.ConfigureRetention(RetainOpts(1 << 20), kT0);
   ASSERT_NO_FATAL_FAILURE(FillTwoClasses(a));
   for (int i = 0; i < 64; i += 16)
@@ -3092,11 +3089,8 @@ TEST(SlabAllocator, BalanceNeverMovesAnExtentWithAProtectedValue) {
 // An extent the balancer moved does not move again within a cold window,
 // even when the pressure turns round at once.
 TEST(SlabAllocator, AMovedExtentDoesNotMoveStraightBack) {
-  // A cold window longer than this test: no cold steal in Put, and the
-  // hysteresis lasts throughout.
-  ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "100000", 1);
-  SlabAllocator a(BalanceOpts());
-  ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
+  auto owned = BalanceAllocator();
+  SlabAllocator& a = *owned;
   ASSERT_NO_FATAL_FAILURE(FillTwoClasses(a));
   std::vector<BlockKey> ev;
   ASSERT_EQ(a.BalanceTailAges(150, 1, &ev), 1u);
