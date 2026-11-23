@@ -3309,7 +3309,7 @@ TEST(SlabAllocator, TmpCrossClassRegressions) {
   const std::vector<size_t> lens{60000, 900000, 3000000};
   const char* rs = std::getenv("TMP_R");
   const char* ms = std::getenv("TMP_M");
-  const uint32_t r = static_cast<uint32_t>(std::strtoul(rs ? rs : "150", nullptr, 10));
+  const uint32_t r = static_cast<uint32_t>(std::strtoul(rs ? rs : "110", nullptr, 10));
   const size_t m = std::strtoul(ms ? ms : "1", nullptr, 10);
   std::ostringstream rep;
   for (const Balance bal : {Balance{0, 1}, Balance{r, m}}) {
@@ -3322,6 +3322,37 @@ TEST(SlabAllocator, TmpCrossClassRegressions) {
     rep << RunPhases(lens, {{{1, 1, 1}, 2, "S4.equal"},
                             {{0.1, 0.1, 0.8}, 3, "S4.80pct+3"}}, true, bal, 2.0)
         << "\n";
+  }
+  ADD_FAILURE() << rep.str();
+}
+
+// TMP: the lock hold of one move of a 1 GiB extent of 128 KiB slots (8,192
+// residents), the largest extent and smallest slot a deployment uses.
+TEST(SlabAllocator, TmpBalanceHoldOfALargeExtent) {
+  SlabAllocator::Options o;
+  o.extent_bytes = 1ull << 30;
+  o.num_extents = 32;
+  o.align = 128 << 10;
+  ::setenv("DFKV_SLAB_COLD_STEAL_WINDOW", "100000000", 1);
+  SlabAllocator a(o);
+  ::unsetenv("DFKV_SLAB_COLD_STEAL_WINDOW");
+  std::vector<dfkv::BlockKey> ev;
+  dfkv::SlabAllocator::SlotRef r;
+  uint64_t id = 1;
+  // 16 extents of small values (120 KB in 128 KiB slots), left alone; then
+  // 3 MB values take the other 16 and evict their own.
+  for (uint64_t i = 0; i < 16ull * 8192; ++i) ASSERT_TRUE(a.Put({id++, 1}, 120000, &r, &ev));
+  for (uint64_t i = 0; i < 16ull * 340 + 2000; ++i) ASSERT_TRUE(a.Put({id++, 2}, 3000000, &r, &ev));
+  std::ostringstream rep;
+  for (int k = 0; k < 3; ++k) {
+    ev.clear();
+    for (int j = 0; j < 400; ++j) ASSERT_TRUE(a.Put({id++, 2}, 3000000, &r, &ev));
+    ev.clear();
+    const auto t = std::chrono::steady_clock::now();
+    const size_t moved = a.BalanceTailAges(110, 1, &ev);
+    rep << "TMP hold moved=" << moved << " evicted=" << ev.size() << " us="
+        << std::chrono::duration<double, std::micro>(
+               std::chrono::steady_clock::now() - t).count() << "\n";
   }
   ADD_FAILURE() << rep.str();
 }
