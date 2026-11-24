@@ -980,6 +980,7 @@ void RunOp(LogStore& s, ImageOp* op, RecordingIo& io,
   }
   op->end = io.Size();
   tl_op = nullptr;
+  std::this_thread::sleep_for(std::chrono::milliseconds(3));  // tmp: a slow build
 }
 
 // What an image may serve (design §8.1): only bytes some PUT stored (I1);
@@ -1236,6 +1237,8 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
     EXPECT_GT(stats.protected_power, 0)
         << "the I4 check saw protected values in power-loss images";
   ::testing::Test::RecordProperty("rounds", round);
+  fprintf(stderr, "MEASURE images=%d rounds=%d holes=%d strict=%d power_served=%d protected_power=%d\n", images, round, stats.holes, stats.strict_keys, stats.power_served, stats.protected_power);
+  if (check.check_minimums) ADD_FAILURE() << "MEASURE end";
   ::testing::Test::RecordProperty("images", stats.images);
   ::testing::Test::RecordProperty("strict_keys", stats.strict_keys);
   ::testing::Test::RecordProperty("holes", stats.holes);
@@ -1247,6 +1250,7 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
 }
 }  // namespace
 
+static const int kSlowRepeat = [] { setenv("GTEST_REPEAT", "10", 0); return 0; }();
 // One writer: PUTs and REMOVEs, the I/O recorded; then many crash points.
 TEST(LogStore, CrashImagesServeOnlyRightValues) {
   const fs::path dir = TestDir("images");
