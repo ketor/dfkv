@@ -980,6 +980,7 @@ void RunOp(LogStore& s, ImageOp* op, RecordingIo& io,
   }
   op->end = io.Size();
   tl_op = nullptr;
+  std::this_thread::sleep_for(std::chrono::milliseconds(3));  // tmp: a slow build
 }
 
 // What an image may serve (design §8.1): only bytes some PUT stored (I1);
@@ -1234,6 +1235,7 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
 }
 }  // namespace
 
+static const int kSlowRepeat = [] { setenv("GTEST_REPEAT", "10", 0); return 0; }();
 // One writer: PUTs and REMOVEs, the I/O recorded; then many crash points.
 TEST(LogStore, CrashImagesServeOnlyRightValues) {
   const fs::path dir = TestDir("images");
