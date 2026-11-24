@@ -1729,6 +1729,7 @@ std::string ImageValue(uint64_t id, uint32_t version) {
   return v;
 }
 
+static const int kMeasureRepeat = [] { setenv("GTEST_REPEAT", "10", 0); return 0; }();
 // A small store written several times past what it holds, with reads (the
 // cleaner's second chance) and RETAINs: segments are sealed, reclaimed (relocating
 // what was read, evicting the rest, and reclaiming inline), and the
@@ -1811,9 +1812,14 @@ TEST(LogStore, CrashImagesThroughSealingReclaimAndCompaction) {
            total.protected_power > 0;
   };
   int seeds = 0;
-  for (uint64_t seed = 11; seed < 31 && !covered(); ++seed, ++seeds) {
+  (void)covered;
+  fprintf(stderr, "MEASURE recording ops=%zu sealed=%llu reclaimed=%llu\n", io->Ops().size(),
+          (unsigned long long)stats.segments_sealed, (unsigned long long)stats.segments_reclaimed);
+  for (uint64_t seed = 11; seed < 31; ++seed, ++seeds) {
     const ImageStats st =
         CheckImages(io->Ops(), ops, kKeys, dir, image, 80, seed, check);
+    fprintf(stderr, "MEASURE seed=%llu images=%d strict=%d holes=%d power_served=%d protected_power=%d\n",
+            (unsigned long long)seed, st.images, st.strict_keys, st.holes, st.power_served, st.protected_power);
     total.strict_keys += st.strict_keys;
     total.holes += st.holes;
     total.power_served += st.power_served;
