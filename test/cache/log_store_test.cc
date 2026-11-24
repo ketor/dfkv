@@ -1007,7 +1007,7 @@ struct ImageCheck {
     return Opts(p, 64ull << 20);
   };
   // false: a caller whose coverage depends on thread timing sums the counts
-  // over several seeds and checks the minimums itself.
+  // over several seeds and checks the minimums itself (protected_power too).
   bool check_minimums = true;
   // I4: a value a RETAIN protected (the workload had no protected eviction)
   // is served by every image once a sync covered its record.
@@ -1219,10 +1219,10 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
     EXPECT_GT(stats.strict_keys, 0);
     EXPECT_GT(stats.holes, 0);
     EXPECT_GT(stats.power_served, 0) << "the power images' I2/I3 checks saw values";
+    if (check.retains != nullptr)
+      EXPECT_GT(stats.protected_power, 0)
+          << "the I4 check saw protected values in power-loss images";
   }
-  if (check.retains != nullptr)
-    EXPECT_GT(stats.protected_power, 0)
-        << "the I4 check saw protected values in power-loss images";
   ::testing::Test::RecordProperty("images", stats.images);
   ::testing::Test::RecordProperty("strict_keys", stats.strict_keys);
   ::testing::Test::RecordProperty("holes", stats.holes);
@@ -1800,7 +1800,32 @@ TEST(LogStore, CrashImagesThroughSealingReclaimAndCompaction) {
     return o;
   };
   check.retains = &retains;
-  CheckImages(io->Ops(), ops, kKeys, dir, image, 80, 11, check);
+  // What the images cover depends on when the asynchronous sealer and the
+  // pre-open wrote (under ASan, 80 crash points of one recording once had no
+  // hole): more crash points of the same recording until each branch has
+  // been taken. Every image of every seed is checked in full.
+  check.check_minimums = false;
+  ImageStats total;
+  auto covered = [&] {
+    return total.strict_keys > 0 && total.holes > 0 && total.power_served > 0 &&
+           total.protected_power > 0;
+  };
+  int seeds = 0;
+  for (uint64_t seed = 11; seed < 31 && !covered(); ++seed, ++seeds) {
+    const ImageStats st =
+        CheckImages(io->Ops(), ops, kKeys, dir, image, 80, seed, check);
+    total.strict_keys += st.strict_keys;
+    total.holes += st.holes;
+    total.power_served += st.power_served;
+    total.protected_power += st.protected_power;
+    if (HasFailure()) break;
+  }
+  RecordProperty("seeds", seeds);
+  EXPECT_GT(total.strict_keys, 0) << "no kill image held a key at rest";
+  EXPECT_GT(total.holes, 0) << "no image recovered past a rejected record";
+  EXPECT_GT(total.power_served, 0) << "the power images' I2/I3 checks saw no values";
+  EXPECT_GT(total.protected_power, 0)
+      << "the I4 check saw no protected values in power-loss images";
   fs::remove_all(dir);
   fs::remove_all(image);
 }
