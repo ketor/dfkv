@@ -1192,12 +1192,13 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
   // more were tried; the first rounds are those of a run that needs none.
   const int rounds = images + static_cast<int>(check.power_prefixes.size());
   const int limit = check.check_minimums ? rounds + 4 * images : rounds;
+  const bool all_rounds = std::getenv("STO38_ALL") != nullptr || images == 150;
   auto covered = [&] {
     return stats.strict_keys > 0 && stats.holes > 0 && stats.power_served > 0 &&
            (check.retains == nullptr || stats.protected_power > 0);
   };
   int round = 0;
-  for (; round < rounds || (round < limit && !covered()); ++round) {
+  for (; round < rounds || (round < limit && (all_rounds || !covered())); ++round) {
     const bool chosen = round >= images && round < rounds;
     const size_t prefix = chosen ? check.power_prefixes[round - images]
                                  : 1 + rng() % recorded.size();
@@ -1220,7 +1221,7 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
       continue;
     }
     ++stats.images;
-    if (s.GetRecoveryStats().records_rejected > 0) ++stats.holes;
+    if (s.GetRecoveryStats().records_rejected > 0) { ++stats.holes; fprintf(stderr, "MEASURE hole round=%d crash=%d prefix=%zu\n", round, static_cast<int>(crash), prefix); }
     CheckImage(s, ops, keys, prefix, crash, &stats, check, protected_values);
     if (::testing::Test::HasFatalFailure()) return stats;
   }
@@ -1250,7 +1251,7 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
 }
 }  // namespace
 
-static const int kSlowRepeat = [] { setenv("GTEST_REPEAT", "10", 0); return 0; }();
+static const int kSlowRepeat = [] { setenv("GTEST_REPEAT", "1", 0); return 0; }();
 // One writer: PUTs and REMOVEs, the I/O recorded; then many crash points.
 TEST(LogStore, CrashImagesServeOnlyRightValues) {
   const fs::path dir = TestDir("images");
@@ -1271,7 +1272,9 @@ TEST(LogStore, CrashImagesServeOnlyRightValues) {
       RunOp(s, &op, *io);
     }
   }
-  CheckImages(io->Ops(), ops, kKeys, dir, image, 150, 5);
+  { size_t syncs = 0, writes = 0; for (const auto& op : io->Ops()) { syncs += op.kind == RecordingIo::Op::kSync; writes += op.kind == RecordingIo::Op::kWrite; }
+    fprintf(stderr, "MEASURE syncs=%zu writes=%zu\n", syncs, writes); }
+  for (uint64_t seed = 5; seed < 15; ++seed) CheckImages(io->Ops(), ops, kKeys, dir, image, 150, seed);
   fs::remove_all(dir);
   fs::remove_all(image);
 }
