@@ -34,6 +34,11 @@ endif()
 # _FORTIFY_SOURCE=2 only where the compiler does not set a level itself
 # (Ubuntu's GCC sets 2, or 3 from 24.04, when optimizing) and not in Debug
 # builds, which do not optimize. Sanitizer builds turn it off.
+set(DFKV_HARDENING OFF CACHE BOOL "" FORCE)  # tmp: ASan measurement
+set(CMAKE_CXX_FLAGS_RELEASE "-O1 -g" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address,undefined")
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address,undefined")
 option(DFKV_HARDENING "Build with -fstack-protector-strong, -D_FORTIFY_SOURCE=2 and -z relro -z now" ON)
 if(DFKV_HARDENING)
   include(CheckCXXSourceCompiles)

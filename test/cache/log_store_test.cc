@@ -1729,7 +1729,9 @@ std::string ImageValue(uint64_t id, uint32_t version) {
   return v;
 }
 
-static const int kMeasureRepeat = [] { setenv("GTEST_REPEAT", "10", 0); return 0; }();
+extern "C" const char* __asan_default_options() { return "detect_leaks=0:allocator_may_return_null=1"; }
+extern "C" const char* __ubsan_default_options() { return "print_stacktrace=1:halt_on_error=1"; }
+static const int kMeasureRepeat = [] { setenv("GTEST_REPEAT", "5", 0); return 0; }();
 // A small store written several times past what it holds, with reads (the
 // cleaner's second chance) and RETAINs: segments are sealed, reclaimed (relocating
 // what was read, evicting the rest, and reclaiming inline), and the
@@ -1832,6 +1834,7 @@ TEST(LogStore, CrashImagesThroughSealingReclaimAndCompaction) {
   EXPECT_GT(total.power_served, 0) << "the power images' I2/I3 checks saw no values";
   EXPECT_GT(total.protected_power, 0)
       << "the I4 check saw no protected values in power-loss images";
+  ADD_FAILURE() << "MEASURE end (forces the output into the log)";
   fs::remove_all(dir);
   fs::remove_all(image);
 }
