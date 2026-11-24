@@ -120,6 +120,9 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_server_ring_eligible` | gauge | 本节点在心跳里自报的 placement eligibility：没有终态故障的 disk store，且（有 RDMA listener 时）至少一条健康 rail。disk store 终态故障后恒为 0 直到进程重启；TCP-only 节点也输出 |
 | `dfkv_cache_put_total` / `dfkv_cache_hit_total` / `dfkv_cache_miss_total` | counter | PUT / GET 命中 / GET 未命中 |
 | `dfkv_exist_hit_total` / `dfkv_exist_miss_total` | counter | Exist 命中 / 未命中 |
+| `dfkv_remove_memory_entries` / `dfkv_remove_memory_covered_seconds` | gauge | 近期删除记忆（`DFKV_REMOVE_MEMORY_MS`，DEPLOY §4c-4，只在打开时输出）：记着的 key 数 / 往回多久内的删除节点都知道（启动以来，或丢掉的最新一条之后，至多保留时长） |
+| `dfkv_remove_memory_dropped_total` | counter | 记忆满了丢掉的记录（之后节点知道的时间段变短） |
+| `dfkv_removed_within_queries_total{result}` | counter | `kRemovedWithin` 问到的 key，按回答：`removed`、`not_removed`、`unknown` |
 | `dfkv_remove_ok_total` / `dfkv_remove_miss_total` | counter | Remove 删掉了块 / 目标本就不存在（partial save 清理等路径的诊断分型） |
 | `dfkv_bytes_written_total` / `dfkv_bytes_read_total` | counter | 读写字节 |
 | `dfkv_accepts_total` | counter | 累计 TCP accept |
