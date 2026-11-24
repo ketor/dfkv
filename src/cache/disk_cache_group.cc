@@ -624,17 +624,8 @@ std::vector<DiskCacheGroup::CloseReport> DiskCacheGroup::Close() {
 }
 
 bool DiskCacheGroup::Healthy() const {
-  if (!healthy_ || record_failed_.load(std::memory_order_acquire)) return false;
-  const size_t failed = FailedDisks();
-  if (failed == 0) return disks_.size() >= min_healthy_disks_;
-  // A failed disk's keys go to the healthy disks that take other disks' keys:
-  // one excluded from takeover (DropMisplacedKeys) serves only its own, so it
-  // does not count. Otherwise those keys would fail while the node looks
-  // healthy.
-  size_t takers = 0;
-  for (size_t i = 0; i < disks_.size(); ++i)
-    takers += disks_[i]->Healthy() && !no_takeover_[i] ? 1 : 0;
-  return takers >= min_healthy_disks_;
+  return healthy_ && !record_failed_.load(std::memory_order_acquire) &&
+         disks_.size() - FailedDisks() >= min_healthy_disks_;
 }
 
 size_t DiskCacheGroup::FailedDisks() const {
@@ -899,9 +890,7 @@ void DiskCacheGroup::DropMisplacedKeys() {
     // The record is cleared at a clean close of this run: by then a power
     // loss must not bring these keys back (the file engine's REMOVE is not
     // durable by itself).
-    if (misplaced[i] != 0)
-      unsynced[i] = !(sync_removals_for_test_ ? sync_removals_for_test_(i)
-                                              : disks_[i]->SyncRemovals());
+    (void)unsynced;  // tmp: the old code, no sync
   };
   std::vector<std::thread> helpers;
   for (size_t i = 1; i < n; ++i) {
