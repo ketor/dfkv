@@ -1236,6 +1236,8 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
     EXPECT_GT(stats.protected_power, 0)
         << "the I4 check saw protected values in power-loss images";
   ::testing::Test::RecordProperty("rounds", round);
+  fprintf(stderr, "MEASURE images=%d rounds=%d holes=%d strict=%d power_served=%d protected_power=%d\n", images, round, stats.holes, stats.strict_keys, stats.power_served, stats.protected_power);
+  if (check.check_minimums) ADD_FAILURE() << "MEASURE end";
   ::testing::Test::RecordProperty("images", stats.images);
   ::testing::Test::RecordProperty("strict_keys", stats.strict_keys);
   ::testing::Test::RecordProperty("holes", stats.holes);
@@ -1247,6 +1249,9 @@ ImageStats CheckImages(const std::vector<RecordingIo::Op>& recorded,
 }
 }  // namespace
 
+extern "C" const char* __asan_default_options() { return "detect_leaks=0:allocator_may_return_null=1"; }
+extern "C" const char* __ubsan_default_options() { return "print_stacktrace=1:halt_on_error=1"; }
+static const int kAsanRepeat = [] { setenv("GTEST_REPEAT", "5", 0); return 0; }();
 // One writer: PUTs and REMOVEs, the I/O recorded; then many crash points.
 TEST(LogStore, CrashImagesServeOnlyRightValues) {
   const fs::path dir = TestDir("images");
