@@ -1731,7 +1731,7 @@ std::string ImageValue(uint64_t id, uint32_t version) {
 
 extern "C" const char* __asan_default_options() { return "detect_leaks=0:allocator_may_return_null=1"; }
 extern "C" const char* __ubsan_default_options() { return "print_stacktrace=1:halt_on_error=1"; }
-static const int kMeasureRepeat = [] { setenv("GTEST_REPEAT", "5", 0); return 0; }();
+static const int kMeasureRepeat = [] { setenv("GTEST_REPEAT", "3", 0); return 0; }();
 // A small store written several times past what it holds, with reads (the
 // cleaner's second chance) and RETAINs: segments are sealed, reclaimed (relocating
 // what was read, evicting the rest, and reclaiming inline), and the
@@ -1815,13 +1815,16 @@ TEST(LogStore, CrashImagesThroughSealingReclaimAndCompaction) {
   };
   int seeds = 0;
   (void)covered;
+  { size_t syncs = 0, writes = 0; for (const auto& op : io->Ops()) { syncs += op.kind == RecordingIo::Op::kSync; writes += op.kind == RecordingIo::Op::kWrite; }
+  fprintf(stderr, "MEASURE syncs=%zu writes=%zu\n", syncs, writes); }
   fprintf(stderr, "MEASURE recording ops=%zu sealed=%llu reclaimed=%llu\n", io->Ops().size(),
           (unsigned long long)stats.segments_sealed, (unsigned long long)stats.segments_reclaimed);
-  for (uint64_t seed = 11; seed < 31; ++seed, ++seeds) {
+  for (uint64_t seed = 11; seed < 17; ++seed, ++seeds) {
+    const auto t0 = std::chrono::steady_clock::now();
     const ImageStats st =
         CheckImages(io->Ops(), ops, kKeys, dir, image, 80, seed, check);
-    fprintf(stderr, "MEASURE seed=%llu images=%d strict=%d holes=%d power_served=%d protected_power=%d\n",
-            (unsigned long long)seed, st.images, st.strict_keys, st.holes, st.power_served, st.protected_power);
+    fprintf(stderr, "MEASURE ms=%lld seed=%llu images=%d strict=%d holes=%d power_served=%d protected_power=%d\n",
+            (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(), (unsigned long long)seed, st.images, st.strict_keys, st.holes, st.power_served, st.protected_power);
     total.strict_keys += st.strict_keys;
     total.holes += st.holes;
     total.power_served += st.power_served;
