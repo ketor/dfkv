@@ -127,6 +127,7 @@ dfkvctl stat <ip:port>                        # 单节点原始 /metrics 文本�
 | `dfkv_exist_hit_total` / `dfkv_exist_miss_total` | counter | Exist 命中 / 未命中 |
 | `dfkv_remove_memory_entries` / `dfkv_remove_memory_covered_seconds` | gauge | 近期删除记忆（`DFKV_REMOVE_MEMORY_MS`，DEPLOY §4c-4，只在打开时输出）：记着的 key 数 / 往回多久内的删除节点都知道（启动以来，或丢掉的最新一条之后，至多保留时长） |
 | `dfkv_remove_memory_dropped_total` | counter | 记忆满了丢掉的记录（之后节点知道的时间段变短） |
+| `dfkv_removed_within_ages_requests_total` | counter | 回答过的 `kRemovedWithinAges`（op 26，DEPLOY §4c-6）请求数；客户端没开 `DFKV_RING_READBACK_REWRITE` 时保持 0 |
 | `dfkv_write_memory_entries` | gauge | 最近 PUT 记忆（DEPLOY §4c-6，`DFKV_WRITE_MEMORY_ENTRIES`）里的 key 数 |
 | `dfkv_write_memory_dropped_total` | counter | 最近 PUT 记忆满了丢掉的记录（只是少回读） |
 | `dfkv_write_memory_cleared_total{reason}` | counter | 窗口内 `CLOCK_REALTIME`（`realtime`）或 `CLOCK_BOOTTIME`（`boottime`）相对 `CLOCK_MONOTONIC_RAW` 漂移超过 1 秒而清空最近 PUT 记忆的次数（可能停过机；chrony 大幅调整也会触发） |

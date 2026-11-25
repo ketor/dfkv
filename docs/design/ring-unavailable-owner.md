@@ -692,7 +692,8 @@ every REMOVE an asked node reports.
   read-backs, never more). CPU: one W record per acknowledged PUT (about
   0.3 µs, CLI-33's measurement of M, under a shard lock), one W lookup per
   key asked. Reply: 8 B a key instead of 1. Nothing on GET, EXIST or REMOVE.
-- **Metrics.** Server: `dfkv_write_memory_entries`,
+- **Metrics.** Server: `dfkv_removed_within_ages_requests_total` (op 26
+  answered), `dfkv_write_memory_entries`,
   `dfkv_write_memory_dropped_total`, `dfkv_write_memory_cleared_total{reason}`
   (realtime, boottime: a clock jump above G). Client:
   `dfkv_client_readback_reads_total{result}` gains `hit_rewritten` (read
@@ -814,8 +815,8 @@ and the rewrite switch on every client):
   rewrite well after the REMOVE: read back;
 - mixed releases: one asked node without op 26 (an older server), and P
   with W off: the results equal A+M+B (fail closed), 0 violations;
-- with the client switch off, no op 26 is sent (the servers' query
-  counter by op stays 0) and the results equal A+M+B;
+- with the client switch off, no op 26 is sent (the servers'
+  `dfkv_removed_within_ages_requests_total` stays 0) and the results equal A+M+B;
 - unit tests with a scripted transport for the comparison itself: ages at
   the edge of the margin both ways, request spreads, P's exact same-clock
   case including a tie (refused), `0xFFFFFFFE` and `kInvalid` answers, and

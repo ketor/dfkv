@@ -376,6 +376,7 @@ class KvNodeServer {
   std::unique_ptr<RemoveMemory> remove_memory_;
   // Recent-PUT memory (DFKV_WRITE_MEMORY_ENTRIES, needs M; null = off).
   std::unique_ptr<WriteMemory> write_memory_;
+  std::atomic<uint64_t> removed_within_ages_requests_{0};  // op 26 answered
   std::atomic<size_t> bytes_written_{0}, bytes_read_{0};
   // Read-side convoy collapse (env DFKV_READ_COALESCE=1; see read_coalescer.h).
   ReadCoalescer read_coalescer_;

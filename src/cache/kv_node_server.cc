@@ -799,6 +799,9 @@ std::string KvNodeServer::MetricsText() const {
     metric("dfkv_remove_memory_dropped_total", "counter",
            "Records dropped for room (what the node knows then starts later)",
            remove_memory_->Dropped());
+    metric("dfkv_removed_within_ages_requests_total", "counter",
+           "kRemovedWithinAges (op 26) requests answered",
+           removed_within_ages_requests_.load(std::memory_order_relaxed));
     if (write_memory_) {
       metric("dfkv_write_memory_entries", "gauge",
              "Keys the recent-PUT memory holds (DFKV_WRITE_MEMORY_ENTRIES)",
@@ -1796,6 +1799,7 @@ Status KvNodeServer::ProcessRemovedWithinAges(const BlockKey& prefix_key,
       payload_len != kRemovedWithinHeaderBytes + count * 16 ||
       net::GetU32(payload) != count)
     return Status::kInvalid;
+  removed_within_ages_requests_.fetch_add(1, std::memory_order_relaxed);
   const uint64_t age_ms = net::GetU32(payload + 4);
   const char* digests = payload + kRemovedWithinHeaderBytes;
   const size_t n = static_cast<size_t>(count);
