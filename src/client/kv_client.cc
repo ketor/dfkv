@@ -2321,7 +2321,7 @@ std::string KVClient::MetricsSnapshot() const {
       std::lock_guard<std::mutex> lk(reroute_mu_);
       episode_pending = episode_pending_;
     }
-    s += "# HELP dfkv_client_readback_reads_total Previous-owner read-backs (DFKV_RING_READBACK_MS): hit, miss, and the candidates refused (removed or unknown in some asked node's M, a counted length mismatch, the registry gate closed, the previous owner cooling)\n";
+    s += "# HELP dfkv_client_readback_reads_total Previous-owner read-backs (DFKV_RING_READBACK_MS): hit, miss, and the candidates refused (removed or unknown in some asked node's M, a counted length mismatch, the registry gate closed, the previous owner cooling); hit_rewritten: read back because the previous owner's write followed every reported REMOVE (DFKV_RING_READBACK_REWRITE; counted in addition to hit or miss)\n";
     s += "# TYPE dfkv_client_readback_reads_total counter\n";
     s += "dfkv_client_readback_reads_total{result=\"hit\"} " + load(readback_hit_) + "\n";
     s += "dfkv_client_readback_reads_total{result=\"miss\"} " + load(readback_miss_) + "\n";
