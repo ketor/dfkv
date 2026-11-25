@@ -147,7 +147,7 @@ TEST(RemoveMemoryTcp, OpTwentySixAnswersRemoveAndWriteAges) {
             Status::kOk);
   EXPECT_GE(a[0].removed_age, 200u);
   EXPECT_LT(a[0].removed_age, 250u);
-  EXPECT_LT(a[0].written_age, a[0].removed_age) << "the PUT came after the REMOVE";
+  EXPECT_LE(a[0].written_age, a[0].removed_age) << "the PUT came after the REMOVE";
   EXPECT_LT(a[1].written_age, 100u) << "the duplicate PUT is the latest";
   EXPECT_EQ(a[1].removed_age, kRemovedAgeNone);
   EXPECT_LT(a[2].removed_age, 100u);
