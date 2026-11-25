@@ -439,6 +439,15 @@ TEST(RamTier, PositiveWatermarkRejectsNewKeysButPreservesExistingOwners) {
   EXPECT_FALSE(rt.Contains(K(106)));
   EXPECT_EQ(rt.DirtyBytes(), 4096u);
   EXPECT_EQ(rt.PutBypass(), 0u);
+  // A refused PUT is counted once by PutWriteBack (after any wait at the
+  // watermark), not by each admission attempt. Wait for the admitted copy's
+  // first flush: waiting at a watermark retries Admit after each flush, so
+  // probing this counter before the flush completes races a now-invisible
+  // transition under TSan.
+  ASSERT_TRUE(RamTierTestPeer::AwaitDone(leader));
+  EXPECT_EQ(rt.AckBackpressure(), 0u);
+  EXPECT_EQ(rt.PutWriteBack(K(106), different.data(), different.size()).status,
+            Status::kCacheFull);
   EXPECT_EQ(rt.AckBackpressure(), 1u);
 
   // Tombstones also resolve before the watermark and retain their error.
