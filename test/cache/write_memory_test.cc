@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "common/config_dump.h"
 #include "utils/net_util.h"
 
 using namespace dfkv;  // NOLINT
@@ -162,6 +163,64 @@ TEST(WriteMemory, EveryPutChecksThePauseBeforePublishing) {
   EXPECT_EQ(ages[0], kNone) << "old record must not outlive the epoch check";
   EXPECT_EQ(ages[1], 50u);
   EXPECT_EQ(w->Cleared(WriteMemory::kRealtime), 1u);
+}
+
+TEST(WriteMemory, ANewerCheckCannotReageAWriteWhoseCallerReadAnOlderClock) {
+  FakeClocks clocks;
+  auto w = Make(&clocks);
+  // The two callers read RAW 99 / 100; the PUT entered the serial domain
+  // first. Raw time 100 covers up to its new sample but this PUT has not
+  // been acknowledged: age zero must remain "no completed PUT".
+  w->Record(kA, 99);
+  w->Check(100);
+  EXPECT_EQ(Ages(*w, {kA}, /*age=*/0, /*now=*/100),
+            (std::vector<uint32_t>{kNone}));
+  EXPECT_EQ(Ages(*w, {kA}, /*age=*/1, /*now=*/100),
+            (std::vector<uint32_t>{0}));
+}
+
+TEST(WriteMemory, ALaterPauseClearCoversAWriteWithTheOlderCallerTime) {
+  FakeClocks clocks;
+  auto w = Make(&clocks);
+  w->Record(kA, /*now=*/99);
+  clocks.off.realtime = 1500;
+  w->Check(/*now=*/100);
+  EXPECT_EQ(w->Entries(), 0u);
+  EXPECT_EQ(Ages(*w, {kA}, /*age=*/1, /*now=*/101),
+            (std::vector<uint32_t>{kNone}));
+  w->Record(kB, 101);
+  EXPECT_EQ(Ages(*w, {kB}, /*age=*/0, /*now=*/101),
+            (std::vector<uint32_t>{0}));
+}
+
+TEST(WriteMemory, EffectiveConfigReportsTheResolvedCapacity) {
+  struct ClearEnv {
+    ~ClearEnv() {
+      ::unsetenv("DFKV_WRITE_MEMORY_ENTRIES");
+      config_dump::ResetForTest();
+    }
+  } clear;
+  for (const auto& [entries, window, expected] :
+       {std::tuple<const char*, uint64_t, const char*>{"4096", 600000u, "4096"},
+        {"1", 600000u, "1024"},
+        {"67108865", 600000u, "67108864"},
+        {"4096", 0u, "0"}}) {
+    config_dump::ResetForTest();
+    testing::internal::CaptureStderr();
+    ::setenv("DFKV_WRITE_MEMORY_ENTRIES", entries, 1);
+    auto w = WriteMemory::FromEnv(window, 0);
+    config_dump::Emit("test");
+    const auto log = testing::internal::GetCapturedStderr();
+    if (window == 0)
+      EXPECT_EQ(w, nullptr);
+    else
+      EXPECT_NE(w, nullptr);
+    EXPECT_NE(log.find("DFKV_WRITE_MEMORY_ENTRIES = " +
+                       std::string(expected) + "  ("),
+              std::string::npos)
+        << log;
+  }
+  ::unsetenv("DFKV_WRITE_MEMORY_ENTRIES");
 }
 
 TEST(WriteMemory, OffUnlessConfigured) {
