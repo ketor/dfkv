@@ -85,6 +85,9 @@ class WriteMemory {
 
   const uint64_t window_ms_;
   const OffsetsFn offsets_;
+  // Under check_mu_: nondecreasing W domain time, independent of the request
+  // times a caller sampled before waiting for this lock.
+  uint64_t last_now_ms_ = 0;
   std::vector<std::unique_ptr<RemoveMemory>> shards_;
   std::mutex check_mu_;
   // Samples of the window (one older one kept as its start), at most one

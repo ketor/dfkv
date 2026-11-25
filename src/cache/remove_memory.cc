@@ -45,6 +45,8 @@ std::unique_ptr<RemoveMemory> RemoveMemory::FromEnv(uint64_t now_ms) {
                   std::to_string(kMaxEntries) + "; using " +
                   std::to_string(clamped));
     entries = clamped;
+    config_dump::RecordResolved("DFKV_REMOVE_MEMORY_ENTRIES",
+                                std::to_string(entries));
   }
   DFKV_LOG_INFO("remove memory: on (" + std::to_string(window) + " ms, " +
                 std::to_string(entries) + " entries)");

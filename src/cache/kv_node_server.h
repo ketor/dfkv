@@ -193,8 +193,6 @@ class KvNodeServer {
   Status CacheDirectForKey(
       const BlockKey& key, char* data, size_t len, size_t cap,
       std::chrono::steady_clock::time_point batch_arrival = {});
-  std::vector<Status> CacheDirectBatchForKeys(
-      const std::vector<StoreEngine::CacheBatchItem>& items);
 
   // RDMA direct GET: read an O_DIRECT-aligned superset into `io_buf`; *out_data
   // points inside that same buffer at the exact requested range so the RDMA layer

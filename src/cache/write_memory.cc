@@ -28,7 +28,8 @@ WriteMemory::Offsets WriteMemory::SystemOffsets() {
 
 WriteMemory::WriteMemory(uint64_t window_ms, size_t capacity, uint64_t now_ms,
                          OffsetsFn offsets, uint64_t tick_ms)
-    : window_ms_(window_ms), offsets_(std::move(offsets)) {
+    : window_ms_(window_ms), offsets_(std::move(offsets)),
+      last_now_ms_(now_ms) {
   const size_t per_shard = std::max<size_t>(1, (capacity + kShards - 1) / kShards);
   for (size_t i = 0; i < kShards; ++i)
     shards_.push_back(std::make_unique<RemoveMemory>(
@@ -52,8 +53,10 @@ WriteMemory::~WriteMemory() {
 std::unique_ptr<WriteMemory> WriteMemory::FromEnv(uint64_t window_ms,
                                                   uint64_t now_ms) {
   uint64_t entries = config_dump::EnvU64("DFKV_WRITE_MEMORY_ENTRIES", 0);
-  if (entries == 0) return nullptr;
-  if (window_ms == 0) {
+  if (entries == 0 || window_ms == 0) {
+    if (entries != 0)
+      config_dump::RecordResolved("DFKV_WRITE_MEMORY_ENTRIES", "0");
+    entries = 0;
     DFKV_LOG_WARN("DFKV_WRITE_MEMORY_ENTRIES needs DFKV_REMOVE_MEMORY_MS (its "
                   "window); the recent-PUT memory stays off");
     return nullptr;
@@ -65,6 +68,8 @@ std::unique_ptr<WriteMemory> WriteMemory::FromEnv(uint64_t window_ms,
                   std::to_string(kMaxEntries) + "; using " +
                   std::to_string(clamped));
     entries = clamped;
+    config_dump::RecordResolved("DFKV_WRITE_MEMORY_ENTRIES",
+                                std::to_string(entries));
   }
   DFKV_LOG_INFO("write memory: on (" + std::to_string(window_ms) + " ms, " +
                 std::to_string(entries) + " entries)");
@@ -92,6 +97,13 @@ void WriteMemory::RestartLocked(uint64_t now_ms, const Offsets& cur) {
 }
 
 void WriteMemory::CheckLocked(uint64_t now_ms) {
+  // Callers sample RAW before waiting for this lock. Serialize that domain
+  // time once, then advance every shard's known-completed-write boundary:
+  // a later Check may establish that a previously recorded PUT is no longer
+  // recent, instead of only knowing up to that PUT's older caller timestamp.
+  now_ms = std::max(last_now_ms_, now_ms);
+  last_now_ms_ = now_ms;
+  for (auto& shard : shards_) shard->AdvanceTo(now_ms);
   const Offsets cur = offsets_();
   // The window's samples, and the newest one before it as its start.
   bool popped = false;
@@ -127,10 +139,9 @@ void WriteMemory::CheckLocked(uint64_t now_ms) {
     return;
   }
   if (Entries() == 0) {
-    // Empty: the samples start again, so that the raw oscillator's drift
-    // against the disciplined clocks never adds up. Every shard's time
-    // first moves to now_ms, so that a PUT recorded after the count below
-    // is stamped at or after the new start.
+    // Reset the sample epoch only after every shard has advanced to this
+    // Check. A first PUT after here must be recorded before an overlapping
+    // op-26 answer; the publication lock supplies that ordering.
     for (auto& shard : shards_) shard->AdvanceTo(now_ms);
     if (Entries() == 0) {
       RestartLocked(now_ms, cur);

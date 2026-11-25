@@ -12,6 +12,7 @@
 #include <tuple>
 #include <vector>
 
+#include "common/config_dump.h"
 #include "utils/net_util.h"
 
 using namespace dfkv;  // NOLINT
@@ -146,6 +147,36 @@ TEST(RemoveMemory, OverflowingByOneMakesTheDroppedTimeUnknown) {
             RemoveMemory::kUnknown);
   EXPECT_EQ(Ask(m, {BlockKey{2, 2, 7}}, now - 2, now)[0],
             RemoveMemory::kRemoved);
+}
+
+TEST(RemoveMemory, EffectiveConfigReportsClampedCapacity) {
+  struct ClearEnv {
+    ~ClearEnv() {
+      ::unsetenv("DFKV_REMOVE_MEMORY_ENTRIES");
+      ::unsetenv("DFKV_REMOVE_MEMORY_MS");
+      config_dump::ResetForTest();
+    }
+  } clear;
+  ::setenv("DFKV_REMOVE_MEMORY_MS", "600000", 1);
+  for (const auto& [input, expected] :
+       {std::pair<const char*, const char*>{"1", "1024"},
+        {"67108865", "67108864"},
+        {"4096", "4096"},
+        {"", "1048576"}}) {
+    config_dump::ResetForTest();
+    testing::internal::CaptureStderr();
+    ::setenv("DFKV_REMOVE_MEMORY_ENTRIES", input, 1);
+    auto m = RemoveMemory::FromEnv(0);
+    config_dump::Emit("test");
+    const auto log = testing::internal::GetCapturedStderr();
+    EXPECT_NE(m, nullptr);
+    EXPECT_NE(log.find("DFKV_REMOVE_MEMORY_ENTRIES = " +
+                       std::string(expected) + "  ("),
+              std::string::npos)
+        << log;
+  }
+  ::unsetenv("DFKV_REMOVE_MEMORY_ENTRIES");
+  ::unsetenv("DFKV_REMOVE_MEMORY_MS");
 }
 
 TEST(RemoveMemory, OffUnlessConfigured) {

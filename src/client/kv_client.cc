@@ -320,6 +320,8 @@ KVClient::KVClient(std::vector<std::pair<std::string, std::string>> members,
                     "(DFKV_RING_READBACK_MS); it stays off");
       rewrite_on_ = false;
     }
+    config_dump::RecordResolved("DFKV_RING_READBACK_REWRITE",
+                                rewrite_on_ ? "1" : "0");
     fanout_on_ = reroute_on_ || readback_on_;
     if (fanout_on_) {
       recent_keep_ms_.store(33000, std::memory_order_relaxed);  // 11 polls of 3 s
