@@ -164,6 +164,14 @@ class KVClient {
                            const std::vector<std::string>& keys,
                            uint32_t age_ms, std::vector<MemoryAnswer>* answers,
                            uint32_t* covered_ms = nullptr);
+  // The rewrite check (§3.5) over one candidate's answers, by node, P being
+  // `prev`: no asked node reports a REMOVE; P's write follows every
+  // reported one; some REMOVE is not shown followed; or some node could not
+  // say. Pure (public for its tests).
+  enum class Rewrite { kNoRemove, kAfterEvery, kRemoved, kUnknown };
+  static Rewrite RewriteVerdict(
+      const std::string& prev,
+      const std::vector<std::pair<std::string, MemoryAnswer>>& heard);
   void BatchRetain(const std::vector<std::string>& keys,
                    const RetainRequest& req, uint8_t* out);
   // Ring-wide limits: *supported 1 = every member answered kRetain, 0 = some
@@ -584,13 +592,7 @@ class KVClient {
   // owner, without O) and refuses on any 1 or 2; counts the refusals.
   void AskRemoved(const std::vector<std::string>& keys, uint64_t now,
                   std::vector<RbCand>* cands);
-  // The rewrite check (CLI-35, §3.5) over one candidate's answers, by node:
-  // no asked node reports a REMOVE; P's write follows every reported one;
-  // some REMOVE is not shown followed; or some node could not say.
-  enum class Rewrite { kNoRemove, kAfterEvery, kRemoved, kUnknown };
-  static Rewrite RewriteVerdict(
-      const std::string& prev,
-      const std::vector<std::pair<std::string, MemoryAnswer>>& heard);
+
   // Revision 11: a substitute read of a key outside this client's current
   // episode is a read-back: asks M (ask set without the owner) and blanks
   // subs[k] (a miss) unless every answer is 0.

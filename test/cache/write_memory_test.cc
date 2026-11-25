@@ -1,0 +1,162 @@
+// Recent-PUT memory W (CLI-35; docs/design/ring-unavailable-owner.md §3.5):
+// ages of each key's latest PUT, expiry before answering, and the node-wide
+// clear when CLOCK_REALTIME or CLOCK_BOOTTIME moves against the raw clock by
+// more than G within the window, however the movement is spread.
+#include "cache/write_memory.h"
+
+#include <gtest/gtest.h>
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "utils/net_util.h"
+
+using namespace dfkv;  // NOLINT
+
+namespace {
+
+// Offsets the test moves by hand; `bump_on_call` adds to them from that
+// call on (a stop in the middle of an answer).
+struct FakeClocks {
+  WriteMemory::Offsets off;
+  int calls = 0, bump_on_call = -1;
+  int64_t bump = 0;
+};
+
+std::unique_ptr<WriteMemory> Make(FakeClocks* clocks, uint64_t window = 10000,
+                                  size_t capacity = 100000) {
+  return std::make_unique<WriteMemory>(
+      window, capacity, 0,
+      [clocks] {
+        if (clocks->calls++ == clocks->bump_on_call)
+          clocks->off.realtime += clocks->bump;
+        return clocks->off;
+      },
+      /*tick_ms=*/0);
+}
+
+std::vector<uint32_t> Ages(WriteMemory& w, const std::vector<BlockKey>& keys,
+                           uint64_t age, uint64_t now) {
+  std::string d(keys.size() * 16, '\0');
+  for (size_t i = 0; i < keys.size(); ++i) {
+    net::PutU64(&d[i * 16], keys[i].digest_hi);
+    net::PutU64(&d[i * 16 + 8], keys[i].digest_lo);
+  }
+  std::vector<uint32_t> out(keys.size(), 7);
+  w.Ages(9, d.data(), keys.size(), age, now, out.data());
+  return out;
+}
+
+constexpr uint32_t kNone = RemoveMemory::kAgeNone;
+const BlockKey kA{1, 2, 9}, kB{3, 4, 9};
+
+}  // namespace
+
+TEST(WriteMemory, AnswersTheAgeOfTheLatestPutAndExpiresFirst) {
+  FakeClocks clocks;
+  auto w = Make(&clocks, /*window=*/1000);
+  w->Record(kA, 100);
+  w->Record(kA, 300);  // written again: the latest counts
+  EXPECT_EQ(Ages(*w, {kA, kB}, 1000, 350), (std::vector<uint32_t>{50, kNone}));
+  EXPECT_EQ(Ages(*w, {kA}, 40, 350), (std::vector<uint32_t>{kNone}))
+      << "older than the age asked about";
+  // Past the window: expired before the answer, not reported.
+  EXPECT_EQ(Ages(*w, {kA}, 5000, 1400), (std::vector<uint32_t>{kNone}));
+  EXPECT_EQ(w->Entries(), 0u);
+}
+
+TEST(WriteMemory, AJumpAboveGClearsEveryShardAndOneBelowDoesNot) {
+  for (const bool boot : {false, true}) {
+    FakeClocks clocks;
+    auto w = Make(&clocks);
+    std::vector<BlockKey> keys;
+    for (uint64_t i = 0; i < 200; ++i) keys.push_back({i * 977, i, 9});
+    for (const auto& k : keys) w->Record(k, 100);  // spread over the shards
+    (boot ? clocks.off.boottime : clocks.off.realtime) += 900;
+    w->Check(1100);
+    EXPECT_EQ(w->Entries(), 200u) << "below G";
+    (boot ? clocks.off.boottime : clocks.off.realtime) += 200;  // 1100 > G
+    const auto ages = Ages(*w, keys, 5000, 2100);
+    for (uint32_t a : ages) EXPECT_EQ(a, kNone);
+    EXPECT_EQ(w->Entries(), 0u);
+    EXPECT_EQ(w->Cleared(boot ? WriteMemory::kBoottime : WriteMemory::kRealtime), 1u);
+    EXPECT_EQ(w->Cleared(boot ? WriteMemory::kRealtime : WriteMemory::kBoottime), 0u);
+    // After the clear, a new PUT is remembered again.
+    w->Record(kA, 2200);
+    EXPECT_EQ(Ages(*w, {kA}, 5000, 2300), (std::vector<uint32_t>{100}));
+  }
+}
+
+// Short stops add up: 0.9 s at every tick never trips a tick-to-tick check,
+// but the spread over the window passes G at the second one.
+TEST(WriteMemory, RepeatedStopsBelowGClearOnceTheirSumExceedsG) {
+  FakeClocks clocks;
+  auto w = Make(&clocks);
+  w->Record(kA, 100);
+  clocks.off.realtime += 900;
+  w->Check(1100);
+  EXPECT_EQ(w->Entries(), 1u);
+  clocks.off.realtime += 900;  // 900 since the last sample, 1800 in all
+  w->Check(2100);
+  EXPECT_EQ(w->Entries(), 0u) << "the sum of short stops went unseen";
+  EXPECT_EQ(w->Cleared(WriteMemory::kRealtime), 1u);
+}
+
+// While the table is empty the samples start again, so that slow drift
+// before the first PUT does not add to what follows.
+TEST(WriteMemory, TheSamplesStartAgainWhileTheTableIsEmpty) {
+  FakeClocks clocks;
+  auto w = Make(&clocks);
+  clocks.off.realtime += 600;
+  w->Check(1100);  // empty: starts again here
+  w->Record(kA, 1200);
+  clocks.off.realtime += 600;
+  w->Check(2200);
+  EXPECT_EQ(w->Entries(), 1u) << "drift from before the PUT was counted";
+  // Not empty: the same drift again does add up.
+  clocks.off.realtime += 600;
+  w->Check(3200);
+  EXPECT_EQ(w->Entries(), 0u);
+}
+
+// The samples cover the window: a movement older than it no longer counts.
+TEST(WriteMemory, MovementOlderThanTheWindowIsForgotten) {
+  FakeClocks clocks;
+  auto w = Make(&clocks, /*window=*/3000);
+  w->Record(kA, 0);
+  for (uint64_t t = 1000; t <= 3000; t += 1000) {
+    w->Record(kB, t);  // keeps the table busy
+    w->Check(t);
+  }
+  clocks.off.realtime += 700;
+  w->Check(4000);
+  for (uint64_t t = 5000; t <= 8000; t += 1000) {
+    w->Record(kB, t);
+    w->Check(t);
+  }
+  clocks.off.realtime += 700;  // 1400 in all, but 700 within the window
+  w->Check(9000);
+  EXPECT_GT(w->Entries(), 0u);
+  EXPECT_EQ(w->Cleared(WriteMemory::kRealtime), 0u);
+}
+
+// A stop between the reading of the ages and the second check voids them.
+TEST(WriteMemory, AStopWhileAnsweringVoidsTheAnswer) {
+  FakeClocks clocks;
+  auto w = Make(&clocks);
+  w->Record(kA, 100);
+  clocks.bump_on_call = clocks.calls + 1;  // the check after the reading
+  clocks.bump = 1500;
+  EXPECT_EQ(Ages(*w, {kA}, 5000, 200), (std::vector<uint32_t>{kNone}));
+  EXPECT_EQ(w->Cleared(WriteMemory::kRealtime), 1u);
+}
+
+TEST(WriteMemory, OffUnlessConfigured) {
+  ::unsetenv("DFKV_WRITE_MEMORY_ENTRIES");
+  EXPECT_EQ(WriteMemory::FromEnv(600000, 0), nullptr);
+  ::setenv("DFKV_WRITE_MEMORY_ENTRIES", "4096", 1);
+  EXPECT_EQ(WriteMemory::FromEnv(0, 0), nullptr) << "needs M's window";
+  EXPECT_NE(WriteMemory::FromEnv(600000, 0), nullptr);
+  ::unsetenv("DFKV_WRITE_MEMORY_ENTRIES");
+}

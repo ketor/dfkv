@@ -122,7 +122,7 @@ void WriteMemory::CheckLocked(uint64_t now_ms) {
     RestartLocked(now_ms, cur);
     return;
   }
-  if (samples_.size() > 1 && Entries() == 0) {
+  if (Entries() == 0) {
     // Empty: the samples start again, so that the raw oscillator's drift
     // against the disciplined clocks never adds up. Every shard's time
     // first moves to now_ms, so that a PUT recorded after the count below
