@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cctype>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -3923,9 +3924,14 @@ Status RdmaTransport::RemovedWithinAges(const std::string& node,
                                         std::string* out) {
   if (out == nullptr || count == 0 || count > kRemovedWithinMaxKeys)
     return Status::kInvalid;
-  return RoundTrip(node, WireOp::kRemovedWithinAges,
+  std::fprintf(stderr, "cli35trace transport begin %llu\n", count);
+  if (out == nullptr || count == 0 || count > kRemovedWithinMaxKeys)
+    return Status::kInvalid;
+  const Status st = RoundTrip(node, WireOp::kRemovedWithinAges,
                    BlockKey{0, 0, tenant_hash}, 0, count, payload.data(),
                    payload.size(), out);
+  std::fprintf(stderr, "cli35trace transport end %d\n", static_cast<int>(st));
+  return st;
 }
 
 Status RdmaTransport::Remove(const std::string& node, const BlockKey& key) {

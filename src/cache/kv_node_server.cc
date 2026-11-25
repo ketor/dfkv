@@ -1818,6 +1818,7 @@ Status KvNodeServer::ProcessRemovedWithinAges(const BlockKey& prefix_key,
   const char* digests = payload + kRemovedWithinHeaderBytes;
   const size_t n = static_cast<size_t>(count);
   std::vector<uint32_t> removed(n, kRemovedAgeNone), written(n, kRemovedAgeNone);
+  std::fprintf(stderr, "cli35trace start %zu\n", n);
   uint64_t covered = 0;
   {
     // With W, reject an unfinished REMOVE as well as an in-flight PUT of the
@@ -1830,19 +1831,32 @@ Status KvNodeServer::ProcessRemovedWithinAges(const BlockKey& prefix_key,
       keys.push_back({net::GetU64(d), net::GetU64(d + 8),
                      prefix_key.tenant_hash});
     }
-    std::sort(keys.begin(), keys.end(), [](const BlockKey& a, const BlockKey& b) {
-      return std::tie(a.digest_hi, a.digest_lo, a.tenant_hash) <
-             std::tie(b.digest_hi, b.digest_lo, b.tenant_hash);
+    std::sort(keys.begin(), keys.end(), [this](const BlockKey& a, const BlockKey& b) {
+      return BlockKeyMixHash{}(a) % memory_key_locks_.size() <
+             BlockKeyMixHash{}(b) % memory_key_locks_.size();
     });
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end(),
+                           [this](const BlockKey& a, const BlockKey& b) {
+                             return BlockKeyMixHash{}(a) %
+                                        memory_key_locks_.size() ==
+                                    BlockKeyMixHash{}(b) %
+                                        memory_key_locks_.size();
+                           }), keys.end());
     std::vector<std::unique_lock<std::mutex>> held;
+    std::fprintf(stderr, "cli35trace sorted %zu\n", keys.size());
+    size_t lock_number = 0;
     held.reserve(keys.size());
-    for (const BlockKey& key : keys)
-      if (write_memory_) held.push_back(MemoryKey(key));
+    for (const BlockKey& key : keys) {
+      if (write_memory_) {
+        std::fprintf(stderr, "cli35trace lock %zu\n", lock_number++);
+        held.push_back(MemoryKey(key));
+      }
+    }
+    std::fprintf(stderr, "cli35trace locked\n");
     const uint64_t now = RawMs();
     covered = remove_memory_->QueryAges(prefix_key.tenant_hash, digests, n,
                                         age_ms, now, removed.data());
-    AfterRemovedAgesForTest();
+    std::fprintf(stderr, "cli35trace M done %llu\n", covered);
     if (write_memory_)
       write_memory_->Ages(prefix_key.tenant_hash, digests, n, age_ms, now,
                           written.data());
