@@ -1790,6 +1790,13 @@ Status KvNodeServer::ProcessRemovedWithin(const BlockKey& prefix_key,
 // reading; the W publication barrier preserves their record ordering. The
 // write ages run W's pause check and expiry first; without W every key has
 // no recent write.
+void KvNodeServer::AfterRemovedAgesForTest() {
+  if (!pause_ages_for_test_.load(std::memory_order_relaxed)) return;
+  std::unique_lock<std::mutex> lk(ages_test_mu_);
+  ++ages_test_state_;
+  ages_test_cv_.notify_all();
+  ages_test_cv_.wait(lk, [this] { return ages_test_state_ % 2 == 0; });
+}
 Status KvNodeServer::ProcessRemovedWithinAges(const BlockKey& prefix_key,
                                               uint64_t count,
                                               const char* payload,
@@ -1815,6 +1822,7 @@ Status KvNodeServer::ProcessRemovedWithinAges(const BlockKey& prefix_key,
     if (write_memory_) cut = std::unique_lock(write_memory_->order_mu());
     covered = remove_memory_->QueryAges(prefix_key.tenant_hash, digests, n,
                                         age_ms, now, removed.data());
+    AfterRemovedAgesForTest();
   }
   if (write_memory_)
     write_memory_->Ages(prefix_key.tenant_hash, digests, n, age_ms, now,

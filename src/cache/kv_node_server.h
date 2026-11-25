@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -372,7 +373,11 @@ class KvNodeServer {
   std::unique_ptr<RecentReads> recent_reads_;
   std::atomic<size_t> promote_deferred_{0};
   std::atomic<size_t> remove_ok_{0}, remove_miss_{0};
-  // Recent-REMOVE memory (DFKV_REMOVE_MEMORY_MS; null = off).
+  std::atomic<bool> pause_ages_for_test_{false};
+  std::mutex ages_test_mu_;
+  std::condition_variable ages_test_cv_;
+  int ages_test_state_ = 0;
+  void AfterRemovedAgesForTest();
   std::unique_ptr<RemoveMemory> remove_memory_;
   // Recent-PUT memory (DFKV_WRITE_MEMORY_ENTRIES, needs M; null = off).
   std::unique_ptr<WriteMemory> write_memory_;

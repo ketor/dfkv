@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+#include <future>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -57,6 +58,28 @@ uint64_t Counter(const std::string& text, const std::string& series) {
 }
 
 }  // namespace
+
+namespace dfkv {
+class KvNodeServerTestPeer {
+ public:
+  static void Pause(KvNodeServer& s, int count = 0) {
+    std::lock_guard<std::mutex> lk(s.ages_test_mu_);
+    s.pause_ages_for_test_.store(true, std::memory_order_relaxed);
+    s.ages_test_state_ = count;
+  }
+  static void WaitQuery(KvNodeServer& s) {
+    std::unique_lock<std::mutex> lk(s.ages_test_mu_);
+    s.ages_test_cv_.wait(lk, [&] { return s.ages_test_state_ == 1; });
+  }
+  static void Release(KvNodeServer& s) {
+    std::lock_guard<std::mutex> lk(s.ages_test_mu_);
+    s.pause_ages_for_test_.store(false, std::memory_order_relaxed);
+    s.ages_test_state_++;
+    s.ages_test_cv_.notify_all();
+  }
+};
+}  // namespace dfkv
+
 TEST(RemoveMemoryTcp, ANodeRemembersItsRemoves) {
   Node node("on", "600000");
   // The node knows the REMOVEs since its start: let 300 ms pass, so that
@@ -182,4 +205,51 @@ TEST(RemoveMemoryTcp, OpTwentySixWithoutTheWriteMemoryOrWithoutM) {
     EXPECT_EQ(c.RemovedWithinAges(node.addr, {"k"}, 200, &a), Status::kInvalid);
     EXPECT_EQ(a[0].removed_age, kRemovedAgeUnknown);
   }
+}
+
+// Q1 read M before the rewrite. Before it reads W, a PUT and another REMOVE
+// complete and the millisecond tables are separated. The original read could
+// mistake that history for a PUT after the later REMOVE.
+TEST(RemoveMemoryTcp, OpTwentySixDoesNotReverseAConcurrentRewrite) {
+  Node node("ages-race", "600000", "65536");
+  KVClient c({{"n", node.addr}}, "rmem/ages-race");
+  KVClient c_query({{"n", node.addr}}, "rmem/ages-race");
+  KVClient c_put({{"n", node.addr}}, "rmem/ages-race");
+  KVClient c_remove({{"n", node.addr}}, "rmem/ages-race");
+  const std::string v(64, 'v');
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  // Start with no prior PUT: the only write that may appear is the one racing
+  // the first query below, which must not leak into its older snapshot.
+  ASSERT_TRUE(c.Remove("race"));
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  ASSERT_TRUE(c.Remove("advance"));  // M's table time is ahead of W's.
+  KvNodeServerTestPeer::Pause(*node.srv);
+  std::vector<KVClient::MemoryAnswer> before, after;
+  auto first = std::async(std::launch::async, [&] {
+    return c_query.RemovedWithinAges(node.addr, {"race"}, 200, &before);
+  });
+  KvNodeServerTestPeer::WaitQuery(*node.srv);
+  auto put = std::async(std::launch::async, [&] {
+    EXPECT_TRUE(c_put.Put("race", v.data(), v.size()));
+  });
+  auto remove = std::async(std::launch::async, [&] {
+    EXPECT_TRUE(c_remove.Remove("race"));
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  // More recent M activity makes the original separate-table age inversion
+  // deterministic, even if a W shard shares the writer's millisecond.
+  std::vector<uint8_t> m_answer;
+  ASSERT_EQ(c.RemovedWithin(node.addr, {"race"}, 200, &m_answer),
+            Status::kOk);
+  KvNodeServerTestPeer::Release(*node.srv);
+  ASSERT_EQ(first.get(), Status::kOk);
+  ASSERT_TRUE(before[0].removed_age <= 1000u)
+      << "covered REMOVE, or no REMOVE, must be known for this race check";
+  put.get();
+  remove.get();
+  ASSERT_EQ(c.RemovedWithinAges(node.addr, {"race"}, 200, &after),
+            Status::kOk);
+  EXPECT_EQ(before[0].written_age, kRemovedAgeNone)
+      << "the query must not mix a subsequent write with its older REMOVE: "
+      << before[0].removed_age << ", " << before[0].written_age;
 }
