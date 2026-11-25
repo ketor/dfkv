@@ -103,7 +103,23 @@ TEST(RemoveMemory, AFullMemoryDropsTheOldestAndKnowsLess) {
   EXPECT_EQ(m.QueriedKeys(RemoveMemory::kRemoved), 1u);
 }
 
-// Two threads read the clock before the lock: the one with the older time
+TEST(RemoveMemory, OpTwentyFiveCountsEachKeyOnce) {
+  RemoveMemory m(600000, 1024, 0);
+  m.Record(kA, 50);
+  std::vector<uint8_t> out(2);
+  const std::string digests = Digests({kA, kB});
+  EXPECT_EQ(m.Query(kA.tenant_hash, digests.data(), 2, 100, 100,
+                    out.data()), 100u);
+  EXPECT_EQ(m.QueriedKeys(RemoveMemory::kRemoved), 1u);
+  EXPECT_EQ(m.QueriedKeys(RemoveMemory::kNotRemoved), 1u);
+  EXPECT_EQ(m.QueriedKeys(RemoveMemory::kUnknown), 0u);
+  std::vector<uint32_t> ages(2);
+  m.QueryAges(kA.tenant_hash, digests.data(), 2, 100, 100,
+              ages.data());
+  EXPECT_EQ(m.QueriedKeys(RemoveMemory::kRemoved), 1u)
+      << "op-26 requests have a separate server counter, not one per key";
+}
+
 // can take the lock second. Its expiry must not take the newer record (an
 // underflow of now - at), and the answer must stay "removed".
 TEST(RemoveMemory, AnOlderClockReadingDoesNotExpireANewerRecord) {
