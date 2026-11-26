@@ -58,6 +58,7 @@ MEMORY_MS = 120000
 READBACK_MS = 110000
 MEMORY_COVERAGE_S = MEMORY_MS // 1000
 SCHEDULE_TOLERANCE_NS = 250_000_000
+REWRITE_LATENESS_TOLERANCE_NS = SCHEDULE_TOLERANCE_NS
 WRITE_ENTRIES = 65536
 REMOVE_CANDIDATES = 32
 REMOVES_PER_SECOND = 8
@@ -350,6 +351,10 @@ class NativeClient:
         self.client_id = client_id
         self.role = role
         self.operations = operations
+        # Remover handles are confined to one thread; these expose the exact
+        # public-call start used in operations.jsonl for churn timing checks.
+        self.last_put_start_ns = 0
+        self.last_flat_start_ns = 0
         options = make_client_options_v2(
             NAMESPACE, mds_endpoints=mds, mds_group=group,
             mds_poll_ms=POLL_MS, register_client=True, client_id=client_id,
@@ -465,6 +470,7 @@ class NativeClient:
         statuses = (ctypes.c_uint8 * n)()
         attempt = self.operations.attempt()
         started = time.monotonic_ns()
+        self.last_put_start_ns = started
         self.operations.starts(attempt, "PUT", keys, client=self.client_id,
                                phase=phase, second=second, prefix=prefix,
                                start_ns=started)
@@ -521,6 +527,7 @@ class NativeClient:
         out = (ctypes.c_int * len(keys))()
         attempt = self.operations.attempt()
         started = time.monotonic_ns()
+        self.last_flat_start_ns = started
         self.operations.starts(attempt, op, keys, client=self.client_id,
                                phase=phase, second=second, prefix=None,
                                start_ns=started)
@@ -879,42 +886,160 @@ class Remover:
         self.pending_rewrite: list[dict[str, int]] = []
         self.removed = 0
         self.rewritten = 0
+        self.operation_timing: list[dict] = []
+        self.remove_keys_by_actual_second: dict[int, int] = {}
+        self.timing_violations: list[dict] = []
+        self.rewrite_lateness_ns: list[int] = []
 
     def start(self) -> None:
         self.thread.start()
 
     def _loop(self) -> None:
         try:
-            cutoff_ns = self.run.origin_ns + self.run.timing["end_s"] * 1_000_000_000
-            for second in range(self.start_second, self.run.timing["end_s"]):
-                _wait_until(self.run.origin_ns, second)
+            origin_ns = self.run.origin_ns
+            cutoff_ns = origin_ns + self.run.timing["end_s"] * 1_000_000_000
+            second = self.start_second
+
+            def violation(record: dict) -> None:
+                event = {"event": "churn_timing_violation", "remover": self.number,
+                         **record}
+                self.timing_violations.append(event)
+                self.run.sinks["churn"].write(event)
+
+            while not self.stop_event.is_set():
                 now_ns = time.monotonic_ns()
-                if self.stop_event.is_set() or now_ns >= cutoff_ns:
+                if now_ns >= cutoff_ns:
                     break
+                planned_start_ns = (origin_ns + second * 1_000_000_000
+                                    if second < self.run.timing["end_s"] else cutoff_ns)
+                earliest_due_ns = min(
+                    (entry["due_ns"] for entry in self.pending_rewrite),
+                    default=cutoff_ns)
+                wake_ns = min(planned_start_ns, earliest_due_ns, cutoff_ns)
+                if now_ns < wake_ns:
+                    self.stop_event.wait((wake_ns - now_ns) / 1_000_000_000)
+                    continue
+                now_ns = time.monotonic_ns()
+                if now_ns >= cutoff_ns:
+                    break
+
+                # Due writes wake at their absolute deadlines, independently of
+                # integer-second REMOVE scheduling.  Every late write is explicit
+                # evidence and fails the variant rather than hiding in a rate.
                 due = [entry for entry in self.pending_rewrite
                        if entry["due_ns"] <= now_ns]
-                self.pending_rewrite = [entry for entry in self.pending_rewrite
-                                        if entry["due_ns"] > now_ns]
                 if due:
+                    self.pending_rewrite = [entry for entry in self.pending_rewrite
+                                            if entry["due_ns"] > now_ns]
                     rewrite = [entry["flat"] for entry in due]
-                    self.client.flat_put(rewrite, second=second)
+                    self.client.flat_put(rewrite, second=min(
+                        second, self.run.timing["end_s"] - 1))
+                    rewrite_start_ns = self.client.last_put_start_ns
+                    observed = []
+                    for entry in due:
+                        lateness_ns = max(0, rewrite_start_ns - entry["due_ns"])
+                        self.rewrite_lateness_ns.append(lateness_ns)
+                        late = lateness_ns > REWRITE_LATENESS_TOLERANCE_NS
+                        observed.append({**entry, "actual_put_start_ns": rewrite_start_ns,
+                                         "lateness_ns": lateness_ns,
+                                         "within_lateness_tolerance": not late})
+                        if late:
+                            violation({
+                                "type": "rewrite_deadline_exceeded", "flat": entry["flat"],
+                                "due_ns": entry["due_ns"],
+                                "actual_put_start_ns": rewrite_start_ns,
+                                "lateness_ns": lateness_ns,
+                                "tolerance_ns": REWRITE_LATENESS_TOLERANCE_NS,
+                            })
                     self.rewritten += len(rewrite)
                     self.run.sinks["churn"].write({
                         "event": "absolute_deadline_rewrite", "second": second,
                         "remover": self.number, "actual_now_ns": now_ns,
-                        "entries": due,
+                        "entries": observed,
+                        "lateness_tolerance_ns": REWRITE_LATENESS_TOLERANCE_NS,
                     })
+                    continue
+
+                if second >= self.run.timing["end_s"]:
+                    break
+                planned_end_ns = planned_start_ns + 1_000_000_000
+                if now_ns >= planned_end_ns:
+                    # Never issue catch-up EXIST/REMOVE traffic for an old logical
+                    # second.  The missed second itself is a hard timing failure.
+                    violation({"type": "late_planned_churn_second_skipped",
+                               "second": second, "planned_start_ns": planned_start_ns,
+                               "planned_end_ns": planned_end_ns, "actual_now_ns": now_ns})
+                    second += 1
+                    continue
+
                 candidates = Workload.indices(
                     f"remover-{self.number}", second, REMOVE_CANDIDATES,
                     PREFIXES * BLOCKS)
                 present_flags = self.client.exist(candidates, second=second)
+                exist_start_ns = self.client.last_flat_start_ns
+                exist_valid = planned_start_ns <= exist_start_ns < planned_end_ns
+                exist_timing = {
+                    "op": "GET_EXIST", "second": second,
+                    "planned_start_ns": planned_start_ns,
+                    "planned_end_ns": planned_end_ns,
+                    "actual_start_ns": exist_start_ns,
+                    "actual_start_valid": exist_valid,
+                    "candidate_keys": len(candidates),
+                }
+                self.operation_timing.append(exist_timing)
+                if not exist_valid:
+                    violation({"type": "exist_start_outside_planned_second",
+                               **exist_timing})
                 present = [key for key, exists in zip(candidates, present_flags) if exists]
                 present = present[:REMOVES_PER_SECOND]
                 if not present:
+                    self.run.sinks["churn"].write({
+                        "event": "planned_churn_completed", "second": second,
+                        "remover": self.number, "exist": exist_timing,
+                        "present_removed": [],
+                    })
+                    second += 1
                     continue
+                if time.monotonic_ns() >= planned_end_ns:
+                    violation({"type": "remove_skipped_after_exist_crossed_second",
+                               "second": second, "planned_end_ns": planned_end_ns,
+                               "exist": exist_timing})
+                    second += 1
+                    continue
+                if self.remove_keys_by_actual_second.get(second, 0) + len(present) > REMOVES_PER_SECOND:
+                    violation({"type": "actual_second_remove_cap_would_be_exceeded",
+                               "second": second, "candidate_remove_keys": len(present),
+                               "already_removed": self.remove_keys_by_actual_second.get(second, 0),
+                               "cap": REMOVES_PER_SECOND})
+                    second += 1
+                    continue
+
                 _, remove_end_ns = self.client.remove(present, second=second)
+                remove_start_ns = self.client.last_flat_start_ns
                 if remove_end_ns is None:
                     raise RuntimeError("non-empty REMOVE returned no completion timestamp")
+                remove_valid = planned_start_ns <= remove_start_ns < planned_end_ns
+                actual_second = (remove_start_ns - origin_ns) // 1_000_000_000
+                actual_count = self.remove_keys_by_actual_second.get(actual_second, 0) + len(present)
+                self.remove_keys_by_actual_second[actual_second] = actual_count
+                remove_timing = {
+                    "op": "REMOVE", "second": second,
+                    "planned_start_ns": planned_start_ns,
+                    "planned_end_ns": planned_end_ns,
+                    "actual_start_ns": remove_start_ns,
+                    "actual_end_ns": remove_end_ns,
+                    "actual_second": actual_second,
+                    "actual_start_valid": remove_valid and actual_second == second,
+                    "removed_keys": len(present),
+                    "remove_keys_in_actual_second": actual_count,
+                    "cap": REMOVES_PER_SECOND,
+                }
+                self.operation_timing.append(remove_timing)
+                if not remove_timing["actual_start_valid"]:
+                    violation({"type": "remove_start_outside_planned_second",
+                               **remove_timing})
+                if actual_count > REMOVES_PER_SECOND:
+                    violation({"type": "actual_second_remove_cap_exceeded", **remove_timing})
                 self.removed += len(present)
                 rewrite_keys = [key for key in present if (key + self.number) % 2 == 0]
                 due_ns = remove_end_ns + REWRITE_DELAY_S * 1_000_000_000
@@ -926,11 +1051,13 @@ class Remover:
                     "event": "remove_completed", "second": second,
                     "remover": self.number, "client": self.client.client_id,
                     "candidates": candidates, "present_removed": present,
+                    "exist": exist_timing, "remove": remove_timing,
                     "actual_remove_end_ns": remove_end_ns,
                     "rewrite_due_ns": due_ns, "workload_cutoff_ns": cutoff_ns,
                     "rewrite_keys": rewrite_keys,
                     "rewrite_scheduled": due_ns < cutoff_ns,
                 })
+                second += 1
         except BaseException as exc:
             self.run.errors.put(f"remover-{self.number}: {type(exc).__name__}: {exc}")
 
@@ -1526,12 +1653,29 @@ class VariantRun:
             "chain_valid": membership_chain,
         }
         self.result["churn"] = {
+            "remove_keys_per_actual_second_cap": REMOVES_PER_SECOND,
+            "rewrite_lateness_tolerance_ns": REWRITE_LATENESS_TOLERANCE_NS,
             "removers": [{"client": remover.client.client_id,
                           "start_second": remover.start_second,
                           "removed": remover.removed,
                           "rewritten": remover.rewritten,
                           "pending_rewrite_not_run_after_end": len(remover.pending_rewrite),
-                          "pending_rewrite_deadlines": remover.pending_rewrite}
+                          "pending_rewrite_deadlines": remover.pending_rewrite,
+                          "operation_timing": remover.operation_timing,
+                          "remove_keys_by_actual_second": remover.remove_keys_by_actual_second,
+                          "timing_violations": remover.timing_violations,
+                          "max_rewrite_lateness_ns": max(
+                              remover.rewrite_lateness_ns, default=0),
+                          "rewrite_lateness_tolerance_ns": REWRITE_LATENESS_TOLERANCE_NS,
+                          "actual_churn_timing_valid": (
+                              bool(remover.operation_timing)
+                              and not remover.timing_violations
+                              and all(row["actual_start_valid"]
+                                      for row in remover.operation_timing)
+                              and all(count <= REMOVES_PER_SECOND
+                                      for count in remover.remove_keys_by_actual_second.values())
+                              and max(remover.rewrite_lateness_ns, default=0)
+                              <= REWRITE_LATENESS_TOLERANCE_NS)}
                          for remover in self.removers]
         }
         assert self.metrics is not None
@@ -1794,6 +1938,26 @@ def selected_checks(result: dict, smoke: bool) -> None:
                         for window in coverage_windows)
     add_check(result, "complete_per_second_workload", full_coverage,
               result.get("core", {}))
+    churn = result.get("churn", {})
+    removers = churn.get("removers", [])
+    add_check(result, "actual_churn_starts_caps_and_rewrite_deadlines",
+              len(removers) == 2
+              and churn.get("remove_keys_per_actual_second_cap") == REMOVES_PER_SECOND
+              and churn.get("rewrite_lateness_tolerance_ns")
+              == REWRITE_LATENESS_TOLERANCE_NS
+              and all(remover.get("actual_churn_timing_valid") is True
+                      for remover in removers), {
+                  "remove_cap": REMOVES_PER_SECOND,
+                  "rewrite_lateness_tolerance_ns": REWRITE_LATENESS_TOLERANCE_NS,
+                  "removers": [{
+                      "client": remover.get("client"),
+                      "valid": remover.get("actual_churn_timing_valid"),
+                      "max_rewrite_lateness_ns": remover.get("max_rewrite_lateness_ns"),
+                      "remove_keys_by_actual_second": remover.get(
+                          "remove_keys_by_actual_second"),
+                      "timing_violations": remover.get("timing_violations", [])[:5],
+                  } for remover in removers],
+              })
     restart = result.get("restart_evidence", {})
     kill = result.get("kill_evidence", {})
     add_check(result, "only_n3_killed_and_empty_fresh_return",
