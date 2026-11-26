@@ -499,15 +499,10 @@ class NativeClient:
             answer.append(ok)
         self.operations.ends(attempt, "PUT", keys, results, end_ns=ended)
         del key_owners, storage
+        # Per-key outage statuses are evidence; a batch-level infrastructure
+        # failure is not a successful issued workload attempt and is a hard error.
         if call_rc != 0:
             raise RuntimeError(f"dfkv_batch_put_st rc={call_rc}")
-        failed = [index for index, ok in enumerate(answer) if not ok]
-        if failed:
-            detail = [{"index": index, "key": keys[index].decode(),
-                       "status": int(statuses[index]),
-                       "status_name": STATUS_NAMES.get(int(statuses[index]), "UNKNOWN"),
-                       "call_rc": call_rc} for index in failed]
-            raise RuntimeError(f"required PUT was not confirmed: {detail}")
         return answer
 
     def prefix_put(self, prefix: int, first: int, *, phase: str,
@@ -1064,20 +1059,13 @@ class Remover:
                     "actual_start_valid": remove_valid and actual_second == second,
                     "removed_keys": len(present),
                     "remove_keys_in_actual_second": actual_count,
-                    "per_key_confirmations": [
-                        {"flat": flat, "ok": ok} for flat, ok in zip(present, remove_oks)],
+                    "per_key_results": [
+                        {"flat": flat, "ok": ok,
+                         "evidence_class": "confirmed_tombstone" if ok else "possible_tombstone_unconfirmed"}
+                        for flat, ok in zip(present, remove_oks)],
                     "cap": REMOVES_PER_SECOND,
                 }
                 self.operation_timing.append(remove_timing)
-                if not all(remove_oks):
-                    failures = [{"flat": flat, "ok": ok}
-                                for flat, ok in zip(present, remove_oks) if not ok]
-                    self.run.sinks["churn"].write({
-                        "event": "required_remove_unconfirmed", "second": second,
-                        "remover": self.number, "remove": remove_timing,
-                        "failures": failures,
-                    })
-                    raise RuntimeError(f"required REMOVE was not confirmed: {failures}")
                 if not remove_timing["actual_start_valid"]:
                     violation({"type": "remove_start_outside_planned_second",
                                **remove_timing})
@@ -1943,9 +1931,15 @@ def check_operations(path: Path) -> dict:
             elif record["ok"] is True and record["status"] == 0:
                 record["outcome"] = "confirmed_success"
                 record["witness_eligible"] = True
-            elif record["ok"] is False and record["status"] in {1, 2, 3, 5, 8, 9, 10, 11}:
-                record["outcome"] = "explicit_failure"
-            elif record["ok"] is False and record["status"] in {4, 6, 7}:
+            elif record["ok"] is False and record["status"] in {1, 2, 3, 5, 6, 7, 9, 10}:
+                record["outcome"] = "explicit_non_store"
+            elif record["ok"] is False and record["status"] == 11:
+                evidence_errors.append({"type": "invalid_api_usage",
+                                        "attempt": attempt, "key": key.decode()})
+            elif record["ok"] is False and record["status"] == 8:
+                evidence_errors.append({"type": "unexpected_put_length_mismatch",
+                                        "attempt": attempt, "key": key.decode()})
+            elif record["ok"] is False and record["status"] == 4:
                 record["outcome"] = "uncertain_transport"
                 record["witness_eligible"] = True
             else:
@@ -1955,7 +1949,7 @@ def check_operations(path: Path) -> dict:
                                         "call_rc": record["call_rc"]})
             if record["outcome"] == "uncertain_transport":
                 uncertain_puts.append({"key": key.decode(), **record})
-            elif record["outcome"] == "explicit_failure":
+            elif record["outcome"] == "explicit_non_store":
                 explicit_failed_puts.append({"key": key.decode(), **record})
             item[op].append(record)
         elif op == "REMOVE":
@@ -1967,16 +1961,22 @@ def check_operations(path: Path) -> dict:
                                             "outcome": "missing_evidence", **record})
             elif record["ok"] is True and record["call_rc"] == 0:
                 record["outcome"] = "confirmed_tombstone"
+                record["tombstone_evidence"] = "definite"
                 item[op].append(record)
             else:
-                record["outcome"] = ("unconfirmed_result" if record["ok"] is False
-                                     else "inconsistent_result")
+                record["outcome"] = ("possible_tombstone_unconfirmed"
+                                     if record["ok"] is False else "inconsistent_result")
                 if record["outcome"] == "inconsistent_result":
                     evidence_errors.append({"type": "inconsistent_remove_outcome",
                                             "attempt": attempt, "key": key.decode(),
                                             "ok": record["ok"],
                                             "call_rc": record["call_rc"]})
+                record["tombstone_evidence"] = "possible_not_healthy_confirmation"
                 unconfirmed_removes.append({"key": key.decode(), **record})
+                # A returned-but-unconfirmed REMOVE is not proof of deletion,
+                # but it must count against a later stale-looking hit.  This
+                # preserves conservative violation detection without claiming ok.
+                item[op].append(record)
         else:
             item[op].append(record)
     incomplete = [{"attempt": attempt, "op": op, "key": key.decode(), "phase": phase}
@@ -2025,7 +2025,15 @@ def check_operations(path: Path) -> dict:
         "unconfirmed_remove_count": len(unconfirmed_removes),
         "pairing_identity": "(attempt,key); duplicate starts and orphan ends are errors",
         "incomplete_attempts": incomplete, "incomplete_attempt_count": len(incomplete),
-        "rule": "only confirmed tombstones trigger the REMOVE rule; violation needs no confirmed or conservatively uncertain workload PUT with end>REMOVE.start and start<read.end; explicit PUT failures never witness",
+        "outcome_classes": {
+            "confirmed_success_PUT": "call_rc=0,ok=true,status=OK: definite write; may witness",
+            "explicit_non_store_PUT": "NOT_FOUND,CACHE_FULL,QUOTA_EXCEEDED,INVALID,RESOURCE_EXHAUSTED,NO_COMPATIBLE_RAIL,LENGTH_MISMATCH,PEER_COOLING,NO_ROUTE,BAD_ARGUMENT: definite non-store; never witnesses and only lowers hit rate",
+            "uncertain_transport_PUT": "nonzero call_rc or DFKV_ST_IO_ERROR: may have landed; conservative witness per §7, recorded as ambiguous",
+            "confirmed_tombstone_REMOVE": "call_rc=0,ok=true: definite completed removal",
+            "possible_tombstone_unconfirmed_REMOVE": "ok=false or nonzero call_rc: not a healthy confirmation; still included conservatively against later stale-looking reads",
+            "missing_outcome": "hard evidence error; never silently inferred",
+        },
+        "rule": "confirmed and possible tombstones participate by start/end; violation needs no confirmed or conservatively uncertain workload PUT with end>REMOVE.start and start<read.end; definite non-store PUTs never witness",
         "initial_and_cleanup_excluded": True,
         "evaluated_after_all_workers_joined": True,
     }
@@ -2058,17 +2066,6 @@ def selected_checks(result: dict, smoke: bool) -> None:
               correctness.get("evidence_error_count") == 0,
               {"count": correctness.get("evidence_error_count"),
                "first": correctness.get("evidence_errors", [])[:3]})
-    add_check(result, "all_required_puts_and_removes_confirmed",
-              correctness.get("uncertain_put_count") == 0
-              and correctness.get("explicit_failed_put_count") == 0
-              and correctness.get("unconfirmed_remove_count") == 0, {
-                  "uncertain_put_count": correctness.get("uncertain_put_count"),
-                  "explicit_failed_put_count": correctness.get("explicit_failed_put_count"),
-                  "unconfirmed_remove_count": correctness.get("unconfirmed_remove_count"),
-                  "first_uncertain_put": correctness.get("uncertain_puts", [])[:3],
-                  "first_failed_put": correctness.get("explicit_failed_puts", [])[:3],
-                  "first_unconfirmed_remove": correctness.get("unconfirmed_removes", [])[:3],
-              })
     coverage_windows = [result.get("core", {}).get("whole_run", {})] if smoke else list(
         result.get("core", {}).values())
     full_coverage = all(window.get("complete") and not window.get("errors")
