@@ -952,7 +952,7 @@ class VariantRun:
 
     def open_client(self, role: str, number: int) -> NativeClient:
         client_id = f"{self.variant}-{role}-{number}-{os.getpid()}"
-        client = NativeClient(self.args.lib, client_id, role, self.mds_endpoint,
+        client = NativeClient(self.args.lib_handle, client_id, role, self.mds_endpoint,
                               self.group, self.operations)
         with self.clients_lock:
             self.clients[client_id] = client

@@ -3132,7 +3132,9 @@ TEST(RamTierWiring, PublicationDiskBarrierWaitBenchmark) {
         if (remove_operation) {
           EXPECT_NE(removed_age, kRemovedAgeNone);
           EXPECT_NE(removed_age, kRemovedAgeUnknown);
-          EXPECT_EQ(written_age, kRemovedAgeNone);
+          // The small seed PUT before the gated REMOVE is a real W record.
+          EXPECT_NE(written_age, kRemovedAgeNone);
+          EXPECT_NE(written_age, kRemovedAgeUnknown);
         } else {
           EXPECT_TRUE(removed_age == kRemovedAgeNone ||
                       removed_age == kRemovedAgeUnknown);
