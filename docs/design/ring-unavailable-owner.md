@@ -585,7 +585,11 @@ every REMOVE an asked node reports.
     buckets (collisions only serialize unrelated keys unnecessarily);
     a batch is locked in bucket order, once per bucket. That outer lock covers
     REMOVE's storage operations as well as publication and remains held when
-    the RAM tier releases the inner lock for a flush.
+    the RAM tier releases the inner lock for a flush. Op 26 then holds M's
+    table lock and W's epoch lock in that order and evaluates both at the
+    maximum of its sampled RAW, M's watermark and W's watermark. An unrelated
+    key can advance either table only before or after that joint evaluation;
+    it cannot make one response use different effective times for M and W.
     Window: the node's `DFKV_REMOVE_MEMORY_MS`; capacity
     `DFKV_WRITE_MEMORY_ENTRIES` (0 = off; 1024-67108864), full: the oldest
     is dropped. W needs no coverage: a key not in W has *no recent write*,
