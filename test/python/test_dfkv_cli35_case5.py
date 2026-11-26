@@ -54,8 +54,11 @@ BLOCK_BYTES = 4096
 READS_PER_SECOND = 16
 NAMESPACE = b"dfkv/cli35/case5/native-v1"
 POLL_MS = 1000
-MEMORY_MS = 120000
-READBACK_MS = 110000
+# With real 30s lease expiry, n3 normally leaves the view near t=90.  A 50s
+# read-back hold expires near t=140, leaving an explicit cushion before the
+# t=150 return so that view is a fresh window, not a chained second change.
+MEMORY_MS = 60000
+READBACK_MS = 50000
 MEMORY_COVERAGE_S = MEMORY_MS // 1000
 SCHEDULE_TOLERANCE_NS = 250_000_000
 REWRITE_LATENESS_TOLERANCE_NS = SCHEDULE_TOLERANCE_NS
@@ -722,6 +725,9 @@ def _client_core(text: str) -> dict[str, float | None]:
     for label in READBACK_RESULTS:
         result[f"readback_{label}"] = _metric(
             text, "dfkv_client_readback_reads_total", result=label)
+    for reason in ("held", "chained"):
+        result[f"readback_changes_refused_{reason}"] = _metric(
+            text, "dfkv_client_readback_changes_refused_total", reason=reason)
     return result
 
 
@@ -1759,6 +1765,12 @@ class VariantRun:
                 row["removed_within_ages_requests"] or 0 for row in server_metrics),
             "server_removed_within_queries": sum(
                 row["removed_within_queries"] or 0 for row in server_metrics),
+            "readback_changes_refused_held": sum(
+                metrics.get("readback_changes_refused_held") or 0
+                for metrics in client_metrics.values()),
+            "readback_changes_refused_chained": sum(
+                metrics.get("readback_changes_refused_chained") or 0
+                for metrics in client_metrics.values()),
         }
         self.result["evidence"] = {
             "operations": "operations.jsonl", "per_second": "per_second.jsonl",
@@ -2111,6 +2123,14 @@ def selected_checks(result: dict, smoke: bool) -> None:
     member = result.get("membership_evidence", {})
     add_check(result, "ordered_absence_replacement_port_and_final_membership",
               member.get("chain_valid") is True, member)
+    if variant != "base":
+        comparison = result.get("metrics", {}).get("metrics_comparison", {})
+        held = comparison.get("readback_changes_refused_held") or 0
+        chained = comparison.get("readback_changes_refused_chained") or 0
+        add_check(result, "return_opens_a_fresh_readback_window",
+                  held == 0 and chained == 0,
+                  {"held": held, "chained": chained,
+                   "reason": "n3 return must not be lost as a second change in the old window"})
     coverage = result.get("memory_coverage", {})
     if variant != "base":
         if smoke:
