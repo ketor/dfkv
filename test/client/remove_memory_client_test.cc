@@ -77,6 +77,31 @@ class KvNodeServerTestPeer {
     s.ages_test_state_++;
     s.ages_test_cv_.notify_all();
   }
+  // Re-stamp only the two records of a real TCP PUT→REMOVE pair at one legal
+  // RAW tick. The pair and subsequent op-26 request stay end to end, while
+  // the same-tick precondition does not depend on scheduler luck.
+  static bool MakeSameMillisecond(KvNodeServer& s, const BlockKey& key) {
+    if (!s.remove_memory_ || !s.write_memory_) return false;
+    auto publication = s.MemoryKey(key);
+    const uint64_t now = RawMs();
+    s.remove_memory_->Record(key, now);
+    s.write_memory_->Record(key, now);
+    return true;
+  }
+  static void MakePutBeforeRemoveWithNewerM(KvNodeServer& s,
+                                            const BlockKey& key,
+                                            const BlockKey& other) {
+    const uint64_t now = RawMs();
+    {
+      auto publication = s.MemoryKey(key);
+      s.write_memory_->Record(key, now - 20);   // completed PUT first
+      s.remove_memory_->Record(key, now - 15);  // completed REMOVE second
+    }
+    // Models another bucket's caller having sampled a later RAW before this
+    // op-26 request acquires M: M's effective watermark is ahead of W's.
+    auto publication = s.MemoryKey(other);
+    s.remove_memory_->Record(other, now + 30);
+  }
 };
 }  // namespace dfkv
 
@@ -158,6 +183,9 @@ TEST(RemoveMemoryTcp, OpTwentySixAnswersRemoveAndWriteAges) {
   KVClient c({{"n", node.addr}}, "rmem/ages");
   const std::string v(64, 'v');
   ASSERT_TRUE(c.Remove("rewritten"));
+  // This legal REMOVE→PUT rewrite must have a strictly older REMOVE. A tie
+  // deliberately has the conservative verdict exercised separately below.
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
   ASSERT_TRUE(c.Put("rewritten", v.data(), v.size()));
   ASSERT_TRUE(c.Put("old", v.data(), v.size()));
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -167,9 +195,15 @@ TEST(RemoveMemoryTcp, OpTwentySixAnswersRemoveAndWriteAges) {
   ASSERT_EQ(c.RemovedWithinAges(node.addr, {"rewritten", "old", "gone", "never"},
                                 250, &a),
             Status::kOk);
+  ASSERT_EQ(a.size(), 4u);
   EXPECT_GE(a[0].removed_age, 200u);
   EXPECT_LT(a[0].removed_age, 250u);
-  EXPECT_LE(a[0].written_age, a[0].removed_age) << "the PUT came after the REMOVE";
+  EXPECT_LT(a[0].written_age, a[0].removed_age)
+      << "the PUT came strictly after the REMOVE";
+  EXPECT_EQ(KVClient::RewriteVerdict(node.addr, {{node.addr, a[0]}}),
+            KVClient::Rewrite::kAfterEvery);
+  std::string served(v.size(), '\0');
+  EXPECT_TRUE(c.Get("rewritten", &served[0], served.size()));
   EXPECT_LT(a[1].written_age, 100u) << "the duplicate PUT is the latest";
   EXPECT_EQ(a[1].removed_age, kRemovedAgeNone);
   EXPECT_LT(a[2].removed_age, 100u);
@@ -177,14 +211,51 @@ TEST(RemoveMemoryTcp, OpTwentySixAnswersRemoveAndWriteAges) {
   EXPECT_EQ(a[3].removed_age, kRemovedAgeNone);
   EXPECT_EQ(a[3].written_age, kRemovedAgeNone);
   EXPECT_LE(a[0].sent_ms, a[0].answered_ms);
+
+  // Exercise real TCP PUT→REMOVE, then pin both records at one legal RAW tick
+  // so the required same-ms input is deterministic. A separate result vector
+  // preserves the original four-key response and its checks above.
+  const std::string tie_key = "same-ms-tie";
+  ASSERT_TRUE(c.Put(tie_key, v.data(), v.size()));
+  ASSERT_TRUE(c.Remove(tie_key));
+  ASSERT_TRUE(KvNodeServerTestPeer::MakeSameMillisecond(
+      *node.srv, ToBlockKey("rmem/ages", tie_key)));
+  std::vector<KVClient::MemoryAnswer> tie;
+  ASSERT_EQ(c.RemovedWithinAges(node.addr, {tie_key}, 250, &tie), Status::kOk);
+  ASSERT_EQ(tie.size(), 1u);
+  ASSERT_EQ(tie[0].removed_age, tie[0].written_age)
+      << "the fixture must actually produce a same-tick M/W sample";
+  EXPECT_EQ(KVClient::RewriteVerdict(node.addr, {{node.addr, tie[0]}}),
+            KVClient::Rewrite::kRemoved)
+      << "PUT→REMOVE at equal ages must not be misread as a rewrite";
+
   EXPECT_EQ(Counter(node.srv->MetricsText(),
-                    "dfkv_removed_within_ages_requests_total"), 1u);
+                    "dfkv_removed_within_ages_requests_total"),
+            2u);
   EXPECT_NE(node.srv->MetricsText().find("dfkv_write_memory_entries"),
             std::string::npos);
   // Beyond what the node knows: unknown.
   ASSERT_EQ(c.RemovedWithinAges(node.addr, {"gone"}, 3600000, &a), Status::kOk);
   EXPECT_EQ(a[0].removed_age, kRemovedAgeUnknown);
 }
+TEST(RemoveMemoryTcp, OpTwentySixUsesOneEffectiveSnapshotTime) {
+  Node node("ages-watermark", "600000", "65536");
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  KVClient c({{"n", node.addr}}, "rmem/watermark");
+  KvNodeServerTestPeer::MakePutBeforeRemoveWithNewerM(
+      *node.srv, ToBlockKey("rmem/watermark", "before-remove"),
+      ToBlockKey("rmem/watermark", "unrelated-remove"));
+  std::vector<KVClient::MemoryAnswer> a;
+  ASSERT_EQ(c.RemovedWithinAges(node.addr, {"before-remove"}, 250, &a),
+            Status::kOk);
+  ASSERT_EQ(a.size(), 1u);
+  EXPECT_GT(a[0].written_age, a[0].removed_age)
+      << "the older PUT must stay older even when M had a newer watermark";
+  EXPECT_EQ(KVClient::RewriteVerdict(node.addr, {{node.addr, a[0]}}),
+            KVClient::Rewrite::kRemoved)
+        << "PUT before REMOVE must not be admitted as a later rewrite";
+}
+
 TEST(RemoveMemoryTcp, OpTwentySixWithoutTheWriteMemoryOrWithoutM) {
   {
     Node node("ages-now", "600000");
@@ -220,7 +291,7 @@ TEST(RemoveMemoryTcp, OpTwentySixAcquiresEachSharedLockOnlyOnce) {
   EXPECT_EQ(a.size(), keys.size());
 }
 
-// Q1 read M before the rewrite. Before it reads W, a PUT and another REMOVE
+// Q1 pauses before its joint M/W snapshot. A PUT and another REMOVE then
 // complete and the millisecond tables are separated. The original read could
 // mistake that history for a PUT after the later REMOVE.
 TEST(RemoveMemoryTcp, OpTwentySixDoesNotReverseAConcurrentRewrite) {
