@@ -1419,7 +1419,7 @@ def check_operations(path: Path) -> dict:
     conservatively treated as ending at +infinity.  Such incomplete evidence
     is separately reported and prevents acceptance.
     """
-    opens: dict[int, tuple[str, bytes, str, int, int | None]] = {}
+    opens: dict[int, list[tuple[str, bytes, str, int, int | None]]] = {}
     history: dict[bytes, dict[str, list]] = {}
     events = 0
     for raw in path.open(encoding="utf-8"):
@@ -1431,12 +1431,14 @@ def check_operations(path: Path) -> dict:
         attempt = int(event["attempt"])
         op = event["op"]
         if event["event"] == "start":
-            opens[attempt] = (op, key, event["phase"], int(event["start_ns"]),
-                              event.get("second"))
+            opens.setdefault(attempt, []).append(
+                (op, key, event["phase"], int(event["start_ns"]), event.get("second")))
             continue
         if event["event"] != "end" or attempt not in opens:
             continue
-        start_op, start_key, phase, start_ns, second = opens.pop(attempt)
+        start_op, start_key, phase, start_ns, second = opens[attempt].pop(0)
+        if not opens[attempt]:
+            del opens[attempt]
         if start_op != op or start_key != key:
             raise RuntimeError(f"operation {attempt} start/end identity mismatch")
         item = history.setdefault(key, {"GET": [], "PUT": [], "REMOVE": []})
@@ -1448,13 +1450,15 @@ def check_operations(path: Path) -> dict:
                 "payload_correct": event.get("payload_correct"),
             })
     incomplete = [{"attempt": attempt, "op": op, "key": key.decode(), "phase": phase}
-                  for attempt, (op, key, phase, _, _) in opens.items()]
-    for attempt, (op, key, phase, start_ns, second) in opens.items():
-        if op == "PUT" and phase == "workload":
-            history.setdefault(key, {"GET": [], "PUT": [], "REMOVE": []})["PUT"].append({
-                "attempt": attempt, "start_ns": start_ns, "end_ns": None,
-                "second": second, "unknown_end_conservative": True,
-            })
+                  for attempt, entries in opens.items()
+                  for op, key, phase, _, _ in entries]
+    for attempt, entries in opens.items():
+        for op, key, phase, start_ns, second in entries:
+            if op == "PUT" and phase == "workload":
+                history.setdefault(key, {"GET": [], "PUT": [], "REMOVE": []})["PUT"].append({
+                    "attempt": attempt, "start_ns": start_ns, "end_ns": None,
+                    "second": second, "unknown_end_conservative": True,
+                })
     violations = []
     checked_hits = 0
     for key, item in history.items():
