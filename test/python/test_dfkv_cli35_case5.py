@@ -501,6 +501,13 @@ class NativeClient:
         del key_owners, storage
         if call_rc != 0:
             raise RuntimeError(f"dfkv_batch_put_st rc={call_rc}")
+        failed = [index for index, ok in enumerate(answer) if not ok]
+        if failed:
+            detail = [{"index": index, "key": keys[index].decode(),
+                       "status": int(statuses[index]),
+                       "status_name": STATUS_NAMES.get(int(statuses[index]), "UNKNOWN"),
+                       "call_rc": call_rc} for index in failed]
+            raise RuntimeError(f"required PUT was not confirmed: {detail}")
         return answer
 
     def prefix_put(self, prefix: int, first: int, *, phase: str,
@@ -692,9 +699,20 @@ def _metric(text: str, name: str, **labels: str) -> float | None:
     return _metrics(text).get((name, wanted))
 
 
-def _metric_sum(text: str, name: str) -> float:
-    return sum(value for (metric_name, _), value in _metrics(text).items()
-               if metric_name == name)
+def _metric_sum(text: str, name: str) -> float | None:
+    values = [value for (metric_name, _), value in _metrics(text).items()
+              if metric_name == name]
+    return sum(values) if values else None
+
+
+def _singleton_metric(text: str, name: str) -> float | None:
+    """One server series regardless of its node/group labels.
+
+    Missing or unexpectedly multi-series evidence is None, never numeric zero.
+    """
+    values = [value for (metric_name, _), value in _metrics(text).items()
+              if metric_name == name]
+    return values[0] if len(values) == 1 else None
 
 
 def _client_core(text: str) -> dict[str, float | None]:
@@ -714,16 +732,16 @@ def _client_core(text: str) -> dict[str, float | None]:
 
 def _server_core(text: str) -> dict[str, float | None]:
     return {
-        "removed_within_ages_requests": _metric(
+        "removed_within_ages_requests": _singleton_metric(
             text, "dfkv_removed_within_ages_requests_total"),
         "removed_within_queries": _metric_sum(text, "dfkv_removed_within_queries_total"),
-        "remove_memory_entries": _metric(text, "dfkv_remove_memory_entries"),
-        "remove_memory_covered_seconds": _metric(
+        "remove_memory_entries": _singleton_metric(text, "dfkv_remove_memory_entries"),
+        "remove_memory_covered_seconds": _singleton_metric(
             text, "dfkv_remove_memory_covered_seconds"),
-        "write_memory_entries": _metric(text, "dfkv_write_memory_entries"),
-        "write_memory_dropped": _metric(text, "dfkv_write_memory_dropped_total"),
-        "remove_ok": _metric(text, "dfkv_remove_ok_total"),
-        "remove_miss": _metric(text, "dfkv_remove_miss_total"),
+        "write_memory_entries": _singleton_metric(text, "dfkv_write_memory_entries"),
+        "write_memory_dropped": _singleton_metric(text, "dfkv_write_memory_dropped_total"),
+        "remove_ok": _singleton_metric(text, "dfkv_remove_ok_total"),
+        "remove_miss": _singleton_metric(text, "dfkv_remove_miss_total"),
     }
 
 
@@ -829,7 +847,9 @@ class MetricsCollector:
                 n3 if n3 is not None and n3.get("eligible") is True
                 and int(n3.get("port", 0)) == self.run.replacement_port
                 and self.run.replacement_port != 0
-                and self.run.replacement_port != self.run.kill_evidence.get("killed_port")
+                and self.run.restart_evidence.get("generation")
+                == self.run.kill_evidence.get("generation", 0) + 1
+                and self.run.restart_evidence.get("replacement_process_pid", 0) > 0
                 else None)
             if (self.run.restart_done and replacement_member is not None
                     and observed_ns > self.run.restart_begin_ns
@@ -886,6 +906,8 @@ class Remover:
         self.pending_rewrite: list[dict[str, int]] = []
         self.removed = 0
         self.rewritten = 0
+        self.rewrite_scheduled = 0
+        self.after_cutoff_rewrites = 0
         self.operation_timing: list[dict] = []
         self.remove_keys_by_actual_second: dict[int, int] = {}
         self.timing_violations: list[dict] = []
@@ -908,7 +930,7 @@ class Remover:
 
             while not self.stop_event.is_set():
                 now_ns = time.monotonic_ns()
-                if now_ns >= cutoff_ns:
+                if now_ns >= cutoff_ns and not self.pending_rewrite:
                     break
                 planned_start_ns = (origin_ns + second * 1_000_000_000
                                     if second < self.run.timing["end_s"] else cutoff_ns)
@@ -920,7 +942,7 @@ class Remover:
                     self.stop_event.wait((wake_ns - now_ns) / 1_000_000_000)
                     continue
                 now_ns = time.monotonic_ns()
-                if now_ns >= cutoff_ns:
+                if now_ns >= cutoff_ns and not self.pending_rewrite:
                     break
 
                 # Due writes wake at their absolute deadlines, independently of
@@ -941,8 +963,14 @@ class Remover:
                         self.rewrite_lateness_ns.append(lateness_ns)
                         late = lateness_ns > REWRITE_LATENESS_TOLERANCE_NS
                         observed.append({**entry, "actual_put_start_ns": rewrite_start_ns,
+                                         "after_cutoff": rewrite_start_ns >= cutoff_ns,
+                                         "deadline_before_cutoff": entry["due_ns"] < cutoff_ns,
                                          "lateness_ns": lateness_ns,
                                          "within_lateness_tolerance": not late})
+                        if entry["due_ns"] >= cutoff_ns:
+                            violation({"type": "post_cutoff_new_rewrite_forbidden",
+                                       "due_ns": entry["due_ns"],
+                                       "workload_cutoff_ns": cutoff_ns})
                         if late:
                             violation({
                                 "type": "rewrite_deadline_exceeded", "flat": entry["flat"],
@@ -952,9 +980,13 @@ class Remover:
                                 "tolerance_ns": REWRITE_LATENESS_TOLERANCE_NS,
                             })
                     self.rewritten += len(rewrite)
+                    if rewrite_start_ns >= cutoff_ns:
+                        self.after_cutoff_rewrites += len(rewrite)
                     self.run.sinks["churn"].write({
                         "event": "absolute_deadline_rewrite", "second": second,
                         "remover": self.number, "actual_now_ns": now_ns,
+                        "workload_cutoff_ns": cutoff_ns,
+                        "after_cutoff_drain": rewrite_start_ns >= cutoff_ns,
                         "entries": observed,
                         "lateness_tolerance_ns": REWRITE_LATENESS_TOLERANCE_NS,
                     })
@@ -1014,7 +1046,7 @@ class Remover:
                     second += 1
                     continue
 
-                _, remove_end_ns = self.client.remove(present, second=second)
+                remove_oks, remove_end_ns = self.client.remove(present, second=second)
                 remove_start_ns = self.client.last_flat_start_ns
                 if remove_end_ns is None:
                     raise RuntimeError("non-empty REMOVE returned no completion timestamp")
@@ -1032,9 +1064,20 @@ class Remover:
                     "actual_start_valid": remove_valid and actual_second == second,
                     "removed_keys": len(present),
                     "remove_keys_in_actual_second": actual_count,
+                    "per_key_confirmations": [
+                        {"flat": flat, "ok": ok} for flat, ok in zip(present, remove_oks)],
                     "cap": REMOVES_PER_SECOND,
                 }
                 self.operation_timing.append(remove_timing)
+                if not all(remove_oks):
+                    failures = [{"flat": flat, "ok": ok}
+                                for flat, ok in zip(present, remove_oks) if not ok]
+                    self.run.sinks["churn"].write({
+                        "event": "required_remove_unconfirmed", "second": second,
+                        "remover": self.number, "remove": remove_timing,
+                        "failures": failures,
+                    })
+                    raise RuntimeError(f"required REMOVE was not confirmed: {failures}")
                 if not remove_timing["actual_start_valid"]:
                     violation({"type": "remove_start_outside_planned_second",
                                **remove_timing})
@@ -1044,6 +1087,7 @@ class Remover:
                 rewrite_keys = [key for key in present if (key + self.number) % 2 == 0]
                 due_ns = remove_end_ns + REWRITE_DELAY_S * 1_000_000_000
                 if due_ns < cutoff_ns:
+                    self.rewrite_scheduled += len(rewrite_keys)
                     self.pending_rewrite.extend(
                         {"flat": key, "remove_end_ns": remove_end_ns, "due_ns": due_ns}
                         for key in rewrite_keys)
@@ -1060,6 +1104,15 @@ class Remover:
                 second += 1
         except BaseException as exc:
             self.run.errors.put(f"remover-{self.number}: {type(exc).__name__}: {exc}")
+
+    def join_finished(self) -> None:
+        if self.thread.ident is not None:
+            self.thread.join()
+        if self.thread.is_alive():
+            raise RuntimeError(f"remover-{self.number} did not finish its rewrite drain")
+        if self.pending_rewrite:
+            raise RuntimeError(
+                f"remover-{self.number} retained {len(self.pending_rewrite)} unexecuted rewrites")
 
     def stop_and_join(self) -> None:
         self.stop_event.set()
@@ -1360,7 +1413,11 @@ class VariantRun:
             "restart_begin_ns": started, "replacement_ready_ns": ready_ns,
             "workload_second": (started - self.origin_ns) / 1e9,
             "node": "n3", "generation": replacement.generation,
+            "previous_generation": self.kill_evidence.get("generation"),
             "replacement_port": replacement.port,
+            "replacement_process_pid": replacement.child.popen.pid,
+            "replacement_process_log": str(replacement.child.log_path),
+            "replacement_advertise": f"127.0.0.1:{replacement.port}",
             "fresh_empty_data_dir": str(replacement.data_dir),
             "killed_data_dir_retained": self.kill_evidence.get("retained_data_dir"),
             "fresh_directory_distinct": str(replacement.data_dir) != self.kill_evidence.get(
@@ -1425,7 +1482,7 @@ class VariantRun:
                                        "key": node.key}
                 try:
                     text = MetricsCollector.scrape(node.metrics_port)
-                    row["covered_seconds"] = _metric(
+                    row["covered_seconds"] = _singleton_metric(
                         text, "dfkv_remove_memory_covered_seconds")
                 except Exception as exc:
                     row["error"] = str(exc)
@@ -1589,7 +1646,7 @@ class VariantRun:
         _wait_until(self.origin_ns, self.timing["end_s"])
         self.join_readers()
         for remover in self.removers:
-            remover.stop_and_join()
+            remover.join_finished()
         self.check_errors()
         self.metrics.stop_and_join()
         self.metrics.capture("final")
@@ -1658,7 +1715,9 @@ class VariantRun:
             "removers": [{"client": remover.client.client_id,
                           "start_second": remover.start_second,
                           "removed": remover.removed,
+                          "rewrite_scheduled": remover.rewrite_scheduled,
                           "rewritten": remover.rewritten,
+                          "after_cutoff_rewrites": remover.after_cutoff_rewrites,
                           "pending_rewrite_not_run_after_end": len(remover.pending_rewrite),
                           "pending_rewrite_deadlines": remover.pending_rewrite,
                           "operation_timing": remover.operation_timing,
@@ -1670,6 +1729,8 @@ class VariantRun:
                           "actual_churn_timing_valid": (
                               bool(remover.operation_timing)
                               and not remover.timing_violations
+                              and not remover.pending_rewrite
+                              and remover.rewrite_scheduled == remover.rewritten
                               and all(row["actual_start_valid"]
                                       for row in remover.operation_timing)
                               and all(count <= REMOVES_PER_SECOND
@@ -1816,6 +1877,9 @@ def check_operations(path: Path) -> dict:
     history: dict[bytes, dict[str, list]] = {}
     events = 0
     matched = 0
+    uncertain_puts: list[dict] = []
+    explicit_failed_puts: list[dict] = []
+    unconfirmed_removes: list[dict] = []
     for raw in path.open(encoding="utf-8"):
         if not raw:
             continue
@@ -1857,21 +1921,76 @@ def check_operations(path: Path) -> dict:
             continue
         matched += 1
         item = history.setdefault(key, {"GET": [], "PUT": [], "REMOVE": []})
-        if op in item and phase == "workload":
-            item[op].append({
-                "attempt": attempt, "start_ns": start_ns,
-                "end_ns": int(event["end_ns"]), "second": second,
-                "hit": bool(event.get("hit", False)),
-                "payload_correct": event.get("payload_correct"),
-            })
+        if op not in item or phase != "workload":
+            continue
+        record = {
+            "attempt": attempt, "start_ns": start_ns,
+            "end_ns": int(event["end_ns"]), "second": second,
+            "hit": bool(event.get("hit", False)),
+            "payload_correct": event.get("payload_correct"),
+            "ok": event.get("ok"), "status": event.get("status"),
+            "status_name": event.get("status_name"), "call_rc": event.get("call_rc"),
+        }
+        if op == "PUT":
+            record["outcome"] = "missing_evidence"
+            record["witness_eligible"] = False
+            if "ok" not in event or "status" not in event or "call_rc" not in event:
+                evidence_errors.append({"type": "missing_put_outcome", "attempt": attempt,
+                                        "key": key.decode(), "end_event": event})
+            elif record["call_rc"] != 0:
+                record["outcome"] = "uncertain_transport"
+                record["witness_eligible"] = True
+            elif record["ok"] is True and record["status"] == 0:
+                record["outcome"] = "confirmed_success"
+                record["witness_eligible"] = True
+            elif record["ok"] is False and record["status"] in {1, 2, 3, 5, 8, 9, 10, 11}:
+                record["outcome"] = "explicit_failure"
+            elif record["ok"] is False and record["status"] in {4, 6, 7}:
+                record["outcome"] = "uncertain_transport"
+                record["witness_eligible"] = True
+            else:
+                evidence_errors.append({"type": "inconsistent_put_outcome",
+                                        "attempt": attempt, "key": key.decode(),
+                                        "ok": record["ok"], "status": record["status"],
+                                        "call_rc": record["call_rc"]})
+            if record["outcome"] == "uncertain_transport":
+                uncertain_puts.append({"key": key.decode(), **record})
+            elif record["outcome"] == "explicit_failure":
+                explicit_failed_puts.append({"key": key.decode(), **record})
+            item[op].append(record)
+        elif op == "REMOVE":
+            if "ok" not in event or "call_rc" not in event:
+                evidence_errors.append({"type": "missing_remove_outcome",
+                                        "attempt": attempt, "key": key.decode(),
+                                        "end_event": event})
+                unconfirmed_removes.append({"key": key.decode(),
+                                            "outcome": "missing_evidence", **record})
+            elif record["ok"] is True and record["call_rc"] == 0:
+                record["outcome"] = "confirmed_tombstone"
+                item[op].append(record)
+            else:
+                record["outcome"] = ("unconfirmed_result" if record["ok"] is False
+                                     else "inconsistent_result")
+                if record["outcome"] == "inconsistent_result":
+                    evidence_errors.append({"type": "inconsistent_remove_outcome",
+                                            "attempt": attempt, "key": key.decode(),
+                                            "ok": record["ok"],
+                                            "call_rc": record["call_rc"]})
+                unconfirmed_removes.append({"key": key.decode(), **record})
+        else:
+            item[op].append(record)
     incomplete = [{"attempt": attempt, "op": op, "key": key.decode(), "phase": phase}
                   for (attempt, key), (op, phase, _, _) in opens.items()]
     for (attempt, key), (op, phase, start_ns, second) in opens.items():
         if op == "PUT" and phase == "workload":
-            history.setdefault(key, {"GET": [], "PUT": [], "REMOVE": []})["PUT"].append({
+            record = {
                 "attempt": attempt, "start_ns": start_ns, "end_ns": None,
                 "second": second, "unknown_end_conservative": True,
-            })
+                "outcome": "unknown_end", "witness_eligible": True,
+                "ok": None, "status": None, "call_rc": None,
+            }
+            history.setdefault(key, {"GET": [], "PUT": [], "REMOVE": []})["PUT"].append(record)
+            uncertain_puts.append({"key": key.decode(), **record})
     violations = []
     checked_hits = 0
     for key, item in history.items():
@@ -1899,18 +2018,25 @@ def check_operations(path: Path) -> dict:
         "violations": violations, "violation_count": len(violations),
         "evidence_errors": evidence_errors,
         "evidence_error_count": len(evidence_errors),
+        "uncertain_puts": uncertain_puts, "uncertain_put_count": len(uncertain_puts),
+        "explicit_failed_puts": explicit_failed_puts,
+        "explicit_failed_put_count": len(explicit_failed_puts),
+        "unconfirmed_removes": unconfirmed_removes,
+        "unconfirmed_remove_count": len(unconfirmed_removes),
         "pairing_identity": "(attempt,key); duplicate starts and orphan ends are errors",
         "incomplete_attempts": incomplete, "incomplete_attempt_count": len(incomplete),
-        "rule": "latest REMOVE by start with end<read.start; violation iff no workload PUT has end>REMOVE.start and start<read.end; unknown PUT end=+infinity",
+        "rule": "only confirmed tombstones trigger the REMOVE rule; violation needs no confirmed or conservatively uncertain workload PUT with end>REMOVE.start and start<read.end; explicit PUT failures never witness",
         "initial_and_cleanup_excluded": True,
         "evaluated_after_all_workers_joined": True,
     }
 
 
 def and_condition(put: dict, remove: dict, read: dict) -> bool:
-    # Separate helper keeps the unknown-end rule explicit and auditable.
+    # Confirmed PUTs and explicitly classified uncertain transport attempts can
+    # witness; explicit refusals and missing evidence never can.
     end_ok = put["end_ns"] is None or put["end_ns"] > remove["start_ns"]
-    return end_ok and put["start_ns"] < read["end_ns"]
+    return (put.get("witness_eligible") is True and end_ok
+            and put["start_ns"] < read["end_ns"])
 
 
 def add_check(result: dict, name: str, passed: bool, detail: Any) -> None:
@@ -1932,6 +2058,17 @@ def selected_checks(result: dict, smoke: bool) -> None:
               correctness.get("evidence_error_count") == 0,
               {"count": correctness.get("evidence_error_count"),
                "first": correctness.get("evidence_errors", [])[:3]})
+    add_check(result, "all_required_puts_and_removes_confirmed",
+              correctness.get("uncertain_put_count") == 0
+              and correctness.get("explicit_failed_put_count") == 0
+              and correctness.get("unconfirmed_remove_count") == 0, {
+                  "uncertain_put_count": correctness.get("uncertain_put_count"),
+                  "explicit_failed_put_count": correctness.get("explicit_failed_put_count"),
+                  "unconfirmed_remove_count": correctness.get("unconfirmed_remove_count"),
+                  "first_uncertain_put": correctness.get("uncertain_puts", [])[:3],
+                  "first_failed_put": correctness.get("explicit_failed_puts", [])[:3],
+                  "first_unconfirmed_remove": correctness.get("unconfirmed_removes", [])[:3],
+              })
     coverage_windows = [result.get("core", {}).get("whole_run", {})] if smoke else list(
         result.get("core", {}).values())
     full_coverage = all(window.get("complete") and not window.get("errors")
@@ -1953,6 +2090,10 @@ def selected_checks(result: dict, smoke: bool) -> None:
                       "client": remover.get("client"),
                       "valid": remover.get("actual_churn_timing_valid"),
                       "max_rewrite_lateness_ns": remover.get("max_rewrite_lateness_ns"),
+                      "rewrite_scheduled": remover.get("rewrite_scheduled"),
+                      "rewritten": remover.get("rewritten"),
+                      "pending": remover.get("pending_rewrite_not_run_after_end"),
+                      "after_cutoff_rewrites": remover.get("after_cutoff_rewrites"),
                       "remove_keys_by_actual_second": remover.get(
                           "remove_keys_by_actual_second"),
                       "timing_violations": remover.get("timing_violations", [])[:5],
@@ -1994,13 +2135,29 @@ def selected_checks(result: dict, smoke: bool) -> None:
                       <= result.get("workload_origin", {}).get("monotonic_ns", 0),
                       coverage)
     metrics = result.get("metrics", {})
+    servers = metrics.get("servers", [])
+    missing_server_metrics = []
+    if variant != "base":
+        server_w = variant in ("ambw", "ambw-old", "ambw-woff")
+        for row in servers:
+            required = ["removed_within_queries", "remove_memory_entries",
+                        "remove_memory_covered_seconds"]
+            if row.get("binary_role") == "current":
+                required.append("removed_within_ages_requests")
+            if server_w and row.get("binary_role") == "current":
+                required.extend(["write_memory_entries", "write_memory_dropped"])
+            for name in required:
+                if row.get(name) is None:
+                    missing_server_metrics.append({"server": row.get("key"),
+                                                   "metric": name})
     add_check(result, "authoritative_final_and_killed_generation_metrics",
               metrics.get("final_capture_complete") is True
-              and metrics.get("every_generation_has_metrics") is True,
+              and metrics.get("every_generation_has_metrics") is True
+              and not missing_server_metrics,
               {"final_capture_complete": metrics.get("final_capture_complete"),
-               "every_generation_has_metrics": metrics.get("every_generation_has_metrics")})
+               "every_generation_has_metrics": metrics.get("every_generation_has_metrics"),
+               "missing_required_server_metrics": missing_server_metrics})
     totals = metrics.get("client_readback_totals", {})
-    servers = metrics.get("servers", [])
     ages = sum(row.get("removed_within_ages_requests") or 0 for row in servers)
     queries = sum(row.get("removed_within_queries") or 0 for row in servers)
     rewritten = totals.get("hit_rewritten", 0)
