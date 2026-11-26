@@ -2507,6 +2507,7 @@ std::unique_ptr<PublicationNode> StartPublicationNode(
   ScopedBenchEnv write_entries("DFKV_WRITE_MEMORY_ENTRIES",
                                write_memory ? "65536" : nullptr);
   ScopedBenchEnv no_ram("DFKV_RAM_TIER", nullptr);
+  ScopedBenchEnv quiet_logs("DFKV_LOG", "ERROR");
   DiskCacheGroup::Options options{{node->dir.string()}, 1ull << 30, "file"};
   options.engine_factory = std::move(factory);
   node->server = KvNodeServerWiringTestPeer::Create(std::move(options));
