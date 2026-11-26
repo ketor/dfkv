@@ -261,27 +261,25 @@ TEST(WriteMemory, FullConfiguredClearBenchmark) {
   FakeClocks clocks;
   auto w = Make(&clocks, /*window=*/600000, capacity);
 
+  const size_t per_shard =
+      (capacity + WriteMemory::kShards - 1) / WriteMemory::kShards;
+  const size_t actual_capacity = per_shard * WriteMemory::kShards;
   std::vector<BlockKey> witnesses(WriteMemory::kShards);
-  std::vector<bool> populated(WriteMemory::kShards, false);
   uint64_t serial = 0;
-  size_t recorded = 0;
-  for (; recorded < WriteMemory::kShards; ++serial) {
-    const BlockKey key{serial * 0x9E3779B97F4A7C15ull,
+  for (size_t shard = 0; shard < WriteMemory::kShards; ++shard) {
+    for (size_t i = 0; i < per_shard; ++i) {
+      BlockKey key;
+      do {
+        key = BlockKey{serial * 0x9E3779B97F4A7C15ull,
                        serial ^ 0xD1B54A32D192ED03ull, 9};
-    const size_t shard = BlockKeyMixHash{}(key) >> 60;
-    if (populated[shard]) continue;
-    w->Record(key, 100);
-    populated[shard] = true;
-    witnesses[shard] = key;
-    ++recorded;
+        ++serial;
+      } while ((BlockKeyMixHash{}(key) >> 60) != shard);
+      w->Record(key, 100);
+      // The last record in every full shard survives its oldest-entry drops.
+      witnesses[shard] = key;
+    }
   }
-  for (; recorded < capacity; ++recorded, ++serial) {
-    const BlockKey key{serial * 0x9E3779B97F4A7C15ull,
-                       serial ^ 0xD1B54A32D192ED03ull, 9};
-    w->Record(key, 100);
-  }
-  ASSERT_EQ(w->Entries(), capacity);
-  for (const bool shard_populated : populated) ASSERT_TRUE(shard_populated);
+  ASSERT_EQ(w->Entries(), actual_capacity);
   ASSERT_EQ(Ages(*w, witnesses, 5000, 200),
             std::vector<uint32_t>(WriteMemory::kShards, 100));
 
@@ -295,6 +293,6 @@ TEST(WriteMemory, FullConfiguredClearBenchmark) {
             std::vector<uint32_t>(WriteMemory::kShards, kNone));
   const auto clear_us =
       std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
-  std::printf("WRITE_CLEAR_BENCH entries=%zu clear_us=%lld\n", capacity,
-              static_cast<long long>(clear_us));
+  std::printf("WRITE_CLEAR_BENCH requested_entries=%zu entries=%zu clear_us=%lld\n",
+              capacity, actual_capacity, static_cast<long long>(clear_us));
 }

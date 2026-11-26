@@ -376,10 +376,23 @@ class KvNodeServer {
   // W has a distinct publication lock so a RAM flush can release only the
   // inner admission lock, not the PUT/REMOVE vs op-26 serialization.
   std::unique_lock<std::mutex> MemoryKey(const BlockKey& key) {
-    return std::unique_lock<std::mutex>(
-        memory_key_locks_[BlockKeyMixHash{}(key) % memory_key_locks_.size()]);
+    const size_t bucket =
+        BlockKeyMixHash{}(key) % memory_key_locks_.size();
+    if (memory_key_expected_bucket_for_test_.load(
+            std::memory_order_relaxed) == bucket) {
+      std::lock_guard<std::mutex> lk(memory_key_test_mu_);
+      memory_key_arrived_bucket_for_test_ = bucket;
+      memory_key_test_cv_.notify_all();
+    }
+    return std::unique_lock<std::mutex>(memory_key_locks_[bucket]);
   }
   std::array<std::mutex, 64> memory_key_locks_;
+  // The opt-in disk-barrier test proves op 26 reached this bucket's lock
+  // before releasing storage; 64 is no valid bucket and disarms the hook.
+  std::atomic<size_t> memory_key_expected_bucket_for_test_{64};
+  std::mutex memory_key_test_mu_;
+  std::condition_variable memory_key_test_cv_;
+  size_t memory_key_arrived_bucket_for_test_ = 64;
   // Op-26 pauses before reading its joint M/W publication snapshot in a test.
   std::atomic<bool> pause_ages_for_test_{false};
   std::mutex ages_test_mu_;

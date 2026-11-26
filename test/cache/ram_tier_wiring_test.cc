@@ -135,6 +135,25 @@ class KvNodeServerWiringTestPeer {
     return server.removed_within_ages_requests_.load(
         std::memory_order_relaxed);
   }
+  static void ExpectPublicationWait(KvNodeServer& server,
+                                    const BlockKey& key) {
+    const size_t bucket = PublicationBucket(server, key);
+    {
+      std::lock_guard<std::mutex> lk(server.memory_key_test_mu_);
+      server.memory_key_arrived_bucket_for_test_ =
+          server.memory_key_locks_.size();
+      server.memory_key_expected_bucket_for_test_.store(
+          bucket, std::memory_order_relaxed);
+    }
+    server.memory_key_test_cv_.notify_all();
+  }
+  static bool WaitPublicationWait(KvNodeServer& server,
+                                  const BlockKey& key) {
+    const size_t bucket = PublicationBucket(server, key);
+    std::unique_lock<std::mutex> lk(server.memory_key_test_mu_);
+    return server.memory_key_test_cv_.wait_for(
+        lk, 2s, [&] { return server.memory_key_arrived_bucket_for_test_ == bucket; });
+  }
   static void SetWriteBack(KvNodeServer& server, bool write_back) {
     server.ram_write_back_ = write_back;
   }
@@ -2858,6 +2877,8 @@ TEST(RamTierWiring, PublicationDiskBarrierWaitBenchmark) {
       ASSERT_TRUE(node->started);
       ASSERT_EQ(KvNodeServerWiringTestPeer::HasWriteMemory(*node->server),
                 write_memory);
+      // 200 ms below is in this fresh node's known REMOVE history.
+      std::this_thread::sleep_for(300ms);
       const BlockKey key = ToBlockKey("publication/barrier", "held");
       const std::string small(128, 's'), large(128 * 1024, 'L');
       TcpTransport writer_transport, query_transport;
@@ -2881,11 +2902,9 @@ TEST(RamTierWiring, PublicationDiskBarrierWaitBenchmark) {
         write_done.store(true, std::memory_order_release);
       })};
       ASSERT_TRUE(barrier.AwaitEntry());
-      std::atomic<size_t> held_bucket{std::numeric_limits<size_t>::max()};
-      held_bucket.store(
-          KvNodeServerWiringTestPeer::PublicationBucket(*node->server, key));
-      ASSERT_NE(held_bucket.load(), std::numeric_limits<size_t>::max());
-      const std::string payload = EncodeRemovedWithinPayload(600000, &key, 1);
+      if (write_memory)
+        KvNodeServerWiringTestPeer::ExpectPublicationWait(*node->server, key);
+      const std::string payload = EncodeRemovedWithinPayload(200, &key, 1);
       JoinBenchThread query{&barrier, std::thread([&] {
         std::string out;
         const Status status = query_transport.RemovedWithinAges(
@@ -2894,15 +2913,19 @@ TEST(RamTierWiring, PublicationDiskBarrierWaitBenchmark) {
         query_out = std::move(out);
         query_done.store(true, std::memory_order_release);
       })};
-      const bool query_finished_early = BenchFlagReady(
-          query_done, write_memory ? std::chrono::milliseconds(100)
-                                   : std::chrono::milliseconds(2000));
-      if (write_memory)
+      bool query_finished_early = false;
+      if (write_memory) {
+        ASSERT_TRUE(KvNodeServerWiringTestPeer::WaitPublicationWait(
+            *node->server, key)) << "op 26 did not reach the held bucket";
+        query_finished_early = query_done.load(std::memory_order_acquire);
         EXPECT_FALSE(query_finished_early)
             << (remove_operation ? "REMOVE" : "PUT")
-            << " held its disk but op 26 did not wait";
-      else
+            << " released op 26 while its disk barrier was still closed";
+      } else {
+        query_finished_early =
+            BenchFlagReady(query_done, std::chrono::milliseconds(2000));
         EXPECT_TRUE(query_finished_early) << "W-off op 26 waited for disk I/O";
+      }
       const auto blocked_us = BenchUs(BenchClock::now() - disk_started);
       barrier.Open();
       ASSERT_TRUE(BenchFlagReady(write_done, std::chrono::milliseconds(3000)));
