@@ -58,7 +58,6 @@ POLL_MS = 1000
 # read-back hold expires near t=140, leaving an explicit cushion before the
 # t=150 return so that view is a fresh window, not a chained second change.
 MEMORY_MS = 60000
-READBACK_MS = 50000
 MEMORY_COVERAGE_S = MEMORY_MS // 1000
 SCHEDULE_TOLERANCE_NS = 250_000_000
 REWRITE_LATENESS_TOLERANCE_NS = SCHEDULE_TOLERANCE_NS
@@ -1182,12 +1181,21 @@ class VariantRun:
         self._correctness: dict = {}
         self._cleaned_up = False
 
+    def readback_ms(self) -> int:
+        """Hold the kill view until ten seconds before the replacement.
+
+        Lease expiry is nominally 30 s; an extra 10 s is the explicit cushion
+        between expiry and the planned empty return.  Full timing gives 50 s,
+        while smoke timing remains short enough for lease-expiry mechanics.
+        """
+        return max(5000, (self.timing["restart_s"] - self.timing["kill_s"] - 40) * 1000)
+
     def client_env(self) -> dict[str, str]:
         enabled = self.variant != "base"
         rewrite = self.variant in ("ambw", "ambw-old", "ambw-now")
         return {
             "DFKV_RING_ABSENT_GRACE_MS": str(MEMORY_MS if enabled else 0),
-            "DFKV_RING_READBACK_MS": str(READBACK_MS if enabled else 0),
+            "DFKV_RING_READBACK_MS": str(self.readback_ms() if enabled else 0),
             "DFKV_RING_READBACK_REWRITE": "1" if rewrite else "0",
             "DFKV_RING_COOLDOWN_REROUTE": "0",
             "DFKV_RING_REMOVE_FANOUT": "3",
@@ -1457,9 +1465,9 @@ class VariantRun:
             "required": required,
             "required_seconds": MEMORY_COVERAGE_S if required else 0,
             "remove_memory_ms": MEMORY_MS,
-            "readback_ms": READBACK_MS if required else 0,
+            "readback_ms": self.readback_ms() if required else 0,
             "settle_ms": 10 * POLL_MS,
-            "lookback_h_ms": READBACK_MS + 10 * POLL_MS,
+            "lookback_h_ms": self.readback_ms() + 10 * POLL_MS,
             "smoke": self.args.smoke,
         }
         if not required:
@@ -2124,12 +2132,13 @@ def selected_checks(result: dict, smoke: bool) -> None:
     add_check(result, "ordered_absence_replacement_port_and_final_membership",
               member.get("chain_valid") is True, member)
     if variant != "base":
-        comparison = result.get("metrics", {}).get("metrics_comparison", {})
-        held = comparison.get("readback_changes_refused_held") or 0
-        chained = comparison.get("readback_changes_refused_chained") or 0
+        comparison = result.get("metrics_comparison", {})
+        held = comparison.get("readback_changes_refused_held")
+        chained = comparison.get("readback_changes_refused_chained")
         add_check(result, "return_opens_a_fresh_readback_window",
                   held == 0 and chained == 0,
                   {"held": held, "chained": chained,
+                   "metrics_comparison_present": bool(comparison),
                    "reason": "n3 return must not be lost as a second change in the old window"})
     coverage = result.get("memory_coverage", {})
     if variant != "base":
