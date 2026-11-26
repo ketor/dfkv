@@ -1802,9 +1802,10 @@ KVClient::Rewrite KVClient::RewriteVerdict(
     if (p == nullptr || p->written_age == kRemovedAgeNone) {
       refused = true;
     } else if (node == prev) {
-      // The server's joint M/W snapshot orders equal-ms records, so equal
-      // ages also admit the acknowledged rewrite. Inversion must not occur.
-      if (a.removed_age < p->written_age) refused = true;
+      // Equal integer ages cannot say whether a same-ms rewrite happened
+      // before or after this REMOVE. A joint snapshot orders reads, not those
+      // completed operations, so a tie must not amortize a read-back.
+      if (a.removed_age <= p->written_age) refused = true;
     } else {
       const double lhs = a.removed_age / (1 + kRho) -
                          (static_cast<double>(p->written_age) + 1) / (1 - kRho);

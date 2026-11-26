@@ -1,8 +1,7 @@
 # Unavailable owners: absent grace, cooldown reroute, recent-REMOVE memory, read-back
 
-Status: design, revision 12 (CLI-35 delta: W). Stages A, C, M and B are
-implemented; W (§3.5) is design. Each
-mechanism sits behind its own switch, off by default; none changes a released
+Status: design revision 12 is implemented by this change (CLI-35 W);
+stages A, C, M and B were implemented earlier. Each mechanism sits behind its own switch, off by default; none changes a released
 binary. A and C are client-side only. The recent-REMOVE memory (M) adds one
 wire op and server state; B depends on M and does not ship without it.
 
@@ -672,9 +671,11 @@ every REMOVE an asked node reports.
   same per-key publication locks: they cover REMOVE from before its storage
   operations through its record, the corresponding PUT path, and op 26's
   read of both tables at one RAW millisecond. Consequently a rewrite later
-  than a REMOVE never looks older, even within one millisecond; the write
-  may be read back when a_P >= b. Records do not need a global sequence or
-  a clock resolution finer than 1 ms. Unknown answers and missing W records
+  than a REMOVE never looks older, even within one millisecond, but equal
+  integer ages carry no sub-millisecond order. Equal ages are refused: they
+  may equally be a completed PUT followed by its REMOVE in the same millisecond.
+  The joint snapshot orders the tables' reads, not the completed PUT/REMOVE.
+  A valid rewrite therefore has a_P > b. Unknown answers and missing W records
   fail closed. Every W write checks for a clock jump and clears the table
   before publishing, so an acknowledged record
   cannot escape a pause check merely by racing one. With no W record at that

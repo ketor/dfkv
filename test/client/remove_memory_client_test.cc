@@ -170,6 +170,33 @@ TEST(RemoveMemoryTcp, OpTwentySixAnswersRemoveAndWriteAges) {
   EXPECT_GE(a[0].removed_age, 200u);
   EXPECT_LT(a[0].removed_age, 250u);
   EXPECT_LE(a[0].written_age, a[0].removed_age) << "the PUT came after the REMOVE";
+  EXPECT_EQ(KVClient::RewriteVerdict(node.addr, {{node.addr, a[0]}}),
+            KVClient::Rewrite::kAfterEvery);
+  std::string served(v.size(), '\0');
+  EXPECT_TRUE(c.Get("rewritten", &served[0], served.size()));
+
+  // A PUT that already completed cannot become a rewrite after a same-ms
+  // REMOVE. These raw ages are all the client sees; a tie is unsafe to
+  // interpret as either operation preceding the other. Do not require
+  // sleep-based ordering or invent a finer clock.
+  bool found_tie = false;
+  int attempts = 0;
+  for (; attempts < 16 && !found_tie; ++attempts) {
+    const std::string key = "same-ms-" + std::to_string(attempts);
+    ASSERT_TRUE(c.Put(key, v.data(), v.size()));
+    ASSERT_TRUE(c.Remove(key));
+    ASSERT_EQ(c.RemovedWithinAges(node.addr, {key}, 250, &a), Status::kOk);
+    if (a[0].removed_age == a[0].written_age) {
+      found_tie = true;
+      EXPECT_EQ(KVClient::RewriteVerdict(
+                    node.addr, {{node.addr, a[0]}}),
+                KVClient::Rewrite::kRemoved)
+          << "PUT→REMOVE at equal ages must not be misread as a rewrite";
+    }
+  }
+  if (!found_tie) GTEST_SKIP() << "no same-ms PUT→REMOVE sample";
+  EXPECT_TRUE(found_tie);
+
   EXPECT_LT(a[1].written_age, 100u) << "the duplicate PUT is the latest";
   EXPECT_EQ(a[1].removed_age, kRemovedAgeNone);
   EXPECT_LT(a[2].removed_age, 100u);
@@ -178,7 +205,8 @@ TEST(RemoveMemoryTcp, OpTwentySixAnswersRemoveAndWriteAges) {
   EXPECT_EQ(a[3].written_age, kRemovedAgeNone);
   EXPECT_LE(a[0].sent_ms, a[0].answered_ms);
   EXPECT_EQ(Counter(node.srv->MetricsText(),
-                    "dfkv_removed_within_ages_requests_total"), 1u);
+                    "dfkv_removed_within_ages_requests_total"),
+            1u + static_cast<uint64_t>(attempts));
   EXPECT_NE(node.srv->MetricsText().find("dfkv_write_memory_entries"),
             std::string::npos);
   // Beyond what the node knows: unknown.

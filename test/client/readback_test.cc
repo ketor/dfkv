@@ -981,14 +981,15 @@ TEST(ReadBackRewrite, ANegativeGapCountsAsZero) {
   EXPECT_EQ(OneRemove(1012, -50), Rewrite::kRemoved);
 }
 
-// P's own M and W records share one millisecond publication snapshot, so
-// equal ages are exact rather than an invented ordering between two tables.
+// P's own records share one millisecond snapshot, but records carry no
+// sub-millisecond ordering. Equal ages must not turn PUT→REMOVE into a
+// permissible rewrite; reject such ties conservatively.
 TEST(ReadBackRewrite, PsOwnRecordsCompareExactly) {
   const auto own = [](uint32_t removed, uint32_t written) {
     return KVClient::RewriteVerdict("p", {{"p", Ans(removed, written, 0, 1)}});
   };
   EXPECT_EQ(own(100, 99), Rewrite::kAfterEvery);
-  EXPECT_EQ(own(100, 100), Rewrite::kAfterEvery);
+  EXPECT_EQ(own(100, 100), Rewrite::kRemoved);
   EXPECT_EQ(own(99, 100), Rewrite::kRemoved);
   EXPECT_EQ(own(kNo, 100), Rewrite::kNoRemove);
 }
