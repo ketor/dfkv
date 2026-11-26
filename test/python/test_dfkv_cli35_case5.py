@@ -54,7 +54,10 @@ BLOCK_BYTES = 4096
 READS_PER_SECOND = 16
 NAMESPACE = b"dfkv/cli35/case5/native-v1"
 POLL_MS = 1000
-MEMORY_MS = 600000
+MEMORY_MS = 120000
+READBACK_MS = 110000
+MEMORY_COVERAGE_S = MEMORY_MS // 1000
+SCHEDULE_TOLERANCE_NS = 250_000_000
 WRITE_ENTRIES = 65536
 REMOVE_CANDIDATES = 32
 REMOVES_PER_SECOND = 8
@@ -509,9 +512,9 @@ class NativeClient:
                              phase="workload", second=second, prefix=None)
 
     def _flat_call(self, op: str, indices: list[int], *, second: int,
-                   phase: str = "workload") -> list[bool]:
+                   phase: str = "workload") -> tuple[list[bool], int | None]:
         if not indices:
-            return []
+            return [], None
         workload = self.operations.workload
         keys = [workload.key(i) for i in indices]
         key_array, key_lengths, key_owners = make_key_array(keys)
@@ -544,13 +547,14 @@ class NativeClient:
         del key_owners
         if call_rc != 0:
             raise RuntimeError(f"{op} native batch call rc={call_rc}")
-        return answer
+        return answer, ended
 
-    def remove(self, indices: list[int], *, second: int) -> list[bool]:
+    def remove(self, indices: list[int], *, second: int) -> tuple[list[bool], int | None]:
         return self._flat_call("REMOVE", indices, second=second)
 
     def exist(self, indices: list[int], *, second: int) -> list[bool]:
-        return self._flat_call("GET_EXIST", indices, second=second)
+        answer, _ = self._flat_call("GET_EXIST", indices, second=second)
+        return answer
 
 
 class PerSecond:
@@ -559,6 +563,25 @@ class PerSecond:
         self.expected = expected
         self.rows: dict[int, dict] = {}
         self.lock = threading.Lock()
+        self.origin_ns = 0
+        self.end_ns = 0
+
+    def configure(self, origin_ns: int, end_s: int) -> None:
+        self.origin_ns = origin_ns
+        self.end_ns = origin_ns + end_s * 1_000_000_000
+
+    def start_evidence(self, second: int, start_ns: Any) -> dict[str, Any]:
+        scheduled_start = self.origin_ns + second * 1_000_000_000
+        scheduled_end = scheduled_start + 1_000_000_000
+        valid = (isinstance(start_ns, int) and scheduled_start <= start_ns < scheduled_end
+                 and start_ns < self.end_ns)
+        return {
+            "actual_get_start_ns": start_ns,
+            "scheduled_start_ns": scheduled_start,
+            "scheduled_end_ns": scheduled_end,
+            "workload_cutoff_ns": self.end_ns,
+            "actual_start_valid": valid,
+        }
 
     def record(self, second: int, result: dict) -> None:
         with self.lock:
@@ -566,6 +589,8 @@ class PerSecond:
                 "second": second, "prefix_results": 0, "full_prefixes": 0,
                 "hit_length_sum": 0, "get_hits": 0,
                 "payload_mismatches": 0, "errors": 0, "put_keys": 0,
+                "actual_starts_in_scheduled_second": 0,
+                "invalid_actual_starts": [], "actual_start_evidence": [],
             })
             row["prefix_results"] += 1
             row["full_prefixes"] += int(result.get("full_hit", False))
@@ -574,6 +599,20 @@ class PerSecond:
             row["payload_mismatches"] += int(result.get("payload_mismatches", 0))
             row["errors"] += int(bool(result.get("error")))
             row["put_keys"] += int(result.get("put_keys", 0))
+            if result.get("actual_start_valid") is True:
+                row["actual_starts_in_scheduled_second"] += 1
+            else:
+                row["invalid_actual_starts"].append({
+                    "prefix": result.get("prefix"),
+                    "actual_get_start_ns": result.get("actual_get_start_ns"),
+                    "scheduled_start_ns": result.get("scheduled_start_ns"),
+                    "scheduled_end_ns": result.get("scheduled_end_ns"),
+                })
+            row["actual_start_evidence"].append({
+                "prefix": result.get("prefix"),
+                "actual_get_start_ns": result.get("actual_get_start_ns"),
+                "actual_start_valid": result.get("actual_start_valid"),
+            })
             if row["prefix_results"] == self.expected:
                 self._flush_locked(row)
 
@@ -583,12 +622,17 @@ class PerSecond:
         row["mean_hit_length"] = row["hit_length_sum"] / total
         row["full_prefix_ratio"] = f"{row['full_prefixes']}/{total}"
         row["mean_hit_length_ratio"] = f"{row['hit_length_sum']}/{total}"
+        row["all_16_actual_starts_valid"] = (
+            row["actual_starts_in_scheduled_second"] == self.expected
+            and not row["invalid_actual_starts"])
         self.sink.write(row)
 
     def window(self, start: int, end: int) -> dict:
         rows = [self.rows[s] for s in range(start, end) if s in self.rows]
-        complete = (len(rows) == end - start and
-                    all(row["prefix_results"] == self.expected for row in rows))
+        complete = (len(rows) == end - start and all(
+            row["prefix_results"] == self.expected
+            and row["actual_starts_in_scheduled_second"] == self.expected
+            and not row["invalid_actual_starts"] for row in rows))
         full = sum(row["full_prefixes"] for row in rows)
         total = sum(row["prefix_results"] for row in rows)
         lengths = sum(row["hit_length_sum"] for row in rows)
@@ -596,6 +640,11 @@ class PerSecond:
             "start_s": start, "end_s_exclusive": end,
             "expected_seconds": end - start, "observed_seconds": len(rows),
             "complete": complete, "full_prefixes": full, "prefixes": total,
+            "required_actual_starts_per_second": self.expected,
+            "actual_starts_in_scheduled_seconds": sum(
+                row["actual_starts_in_scheduled_second"] for row in rows),
+            "invalid_actual_start_count": sum(
+                len(row["invalid_actual_starts"]) for row in rows),
             "hit_length_sum": lengths, "payload_mismatches": sum(
                 row["payload_mismatches"] for row in rows),
             "errors": sum(row["errors"] for row in rows),
@@ -662,6 +711,8 @@ def _server_core(text: str) -> dict[str, float | None]:
             text, "dfkv_removed_within_ages_requests_total"),
         "removed_within_queries": _metric_sum(text, "dfkv_removed_within_queries_total"),
         "remove_memory_entries": _metric(text, "dfkv_remove_memory_entries"),
+        "remove_memory_covered_seconds": _metric(
+            text, "dfkv_remove_memory_covered_seconds"),
         "write_memory_entries": _metric(text, "dfkv_write_memory_entries"),
         "write_memory_dropped": _metric(text, "dfkv_write_memory_dropped_total"),
         "remove_ok": _metric(text, "dfkv_remove_ok_total"),
@@ -680,8 +731,14 @@ class MetricsCollector:
         self.last_client_raw: dict[str, str] = {}
         self.last_ring: dict = {}
         self.final_complete = False
-        self.saw_n3_absent_after_kill = False
-        self.saw_n3_return = False
+        self.absent_ns = 0
+        self.absence_record: dict = {}
+        self.replacement_eligible_ns = 0
+        self.replacement_eligible_member: dict = {}
+        self.final_ring_ns = 0
+        self.final_replacement_eligible = False
+        self.final_replacement_member: dict = {}
+        self.transitions: list[dict] = []
 
     def start(self) -> None:
         self.thread.start()
@@ -694,7 +751,8 @@ class MetricsCollector:
     def capture(self, phase: str | None) -> None:
         with self.capture_lock:
             now = time.monotonic_ns()
-            second = (now - self.origin_ns) / 1e9
+            second = ((now - self.origin_ns) / 1e9
+                      if self.origin_ns else None)
             row: dict[str, Any] = {
                 "monotonic_ns": now, "workload_second": second,
                 "phase": phase, "clients": {}, "servers": {},
@@ -734,20 +792,58 @@ class MetricsCollector:
                 path = self.run.root / "metrics" / f"client-{client_id}-last.prom"
                 path.write_text(text)
 
-    def poll_ring(self) -> None:
-        record: dict[str, Any] = {"monotonic_ns": time.monotonic_ns(),
-                                  "wall_time": _iso()}
+    def poll_ring(self, *, final: bool = False) -> None:
+        record: dict[str, Any] = {"poll_start_ns": time.monotonic_ns(),
+                                  "wall_time": _iso(), "final": final,
+                                  "transitions": []}
         try:
             ring = self.run.ring()
+            observed_ns = time.monotonic_ns()
+            record["observed_ns"] = observed_ns
             record["members"] = [
                 {"id": m["id"], "ip": m["ip"], "port": m["port"],
                  "eligible": m["eligible"]} for m in ring["members"]]
             self.last_ring = ring
-            ids = {m["id"] for m in ring["members"]}
-            if self.run.kill_done and "n3" not in ids:
-                self.saw_n3_absent_after_kill = True
-            if self.run.restart_done and "n3" in ids:
-                self.saw_n3_return = True
+            n3 = next((m for m in ring["members"] if m["id"] == "n3"), None)
+            if (self.run.kill_done and n3 is None
+                    and observed_ns >= self.run.kill_confirmed_ns
+                    and not self.run.restart_begin_ns
+                    and not self.absent_ns):
+                self.absent_ns = observed_ns
+                self.absence_record = {
+                    "transition": "n3_absent_after_confirmed_kill_before_restart",
+                    "observed_ns": observed_ns,
+                    "confirmed_kill_ns": self.run.kill_confirmed_ns,
+                    "restart_begin_ns": self.run.restart_begin_ns,
+                }
+                self.transitions.append(self.absence_record)
+                record["transitions"].append(self.absence_record)
+            replacement_member = (
+                n3 if n3 is not None and n3.get("eligible") is True
+                and int(n3.get("port", 0)) == self.run.replacement_port
+                and self.run.replacement_port != 0
+                and self.run.replacement_port != self.run.kill_evidence.get("killed_port")
+                else None)
+            if (self.run.restart_done and replacement_member is not None
+                    and observed_ns > self.run.restart_begin_ns
+                    and not self.replacement_eligible_ns):
+                self.replacement_eligible_ns = observed_ns
+                self.replacement_eligible_member = dict(replacement_member)
+                transition = {
+                    "transition": "eligible_n3_on_replacement_port",
+                    "observed_ns": observed_ns,
+                    "restart_begin_ns": self.run.restart_begin_ns,
+                    "member": dict(replacement_member),
+                }
+                self.transitions.append(transition)
+                record["transitions"].append(transition)
+            if final:
+                self.final_ring_ns = observed_ns
+                self.final_replacement_eligible = replacement_member is not None
+                self.final_replacement_member = (
+                    dict(replacement_member) if replacement_member is not None else {})
+                record["final_replacement_eligible"] = self.final_replacement_eligible
+                record["final_replacement_member"] = self.final_replacement_member
         except Exception as exc:
             record["error"] = str(exc)
         self.run.sinks["membership"].write(record)
@@ -780,7 +876,7 @@ class Remover:
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._loop,
                                        name=f"remover-{number}", daemon=True)
-        self.pending_rewrite: dict[int, list[int]] = {}
+        self.pending_rewrite: list[dict[str, int]] = []
         self.removed = 0
         self.rewritten = 0
 
@@ -789,14 +885,25 @@ class Remover:
 
     def _loop(self) -> None:
         try:
+            cutoff_ns = self.run.origin_ns + self.run.timing["end_s"] * 1_000_000_000
             for second in range(self.start_second, self.run.timing["end_s"]):
                 _wait_until(self.run.origin_ns, second)
-                if self.stop_event.is_set():
+                now_ns = time.monotonic_ns()
+                if self.stop_event.is_set() or now_ns >= cutoff_ns:
                     break
-                rewrite = self.pending_rewrite.pop(second, [])
-                if rewrite:
+                due = [entry for entry in self.pending_rewrite
+                       if entry["due_ns"] <= now_ns]
+                self.pending_rewrite = [entry for entry in self.pending_rewrite
+                                        if entry["due_ns"] > now_ns]
+                if due:
+                    rewrite = [entry["flat"] for entry in due]
                     self.client.flat_put(rewrite, second=second)
                     self.rewritten += len(rewrite)
+                    self.run.sinks["churn"].write({
+                        "event": "absolute_deadline_rewrite", "second": second,
+                        "remover": self.number, "actual_now_ns": now_ns,
+                        "entries": due,
+                    })
                 candidates = Workload.indices(
                     f"remover-{self.number}", second, REMOVE_CANDIDATES,
                     PREFIXES * BLOCKS)
@@ -805,17 +912,24 @@ class Remover:
                 present = present[:REMOVES_PER_SECOND]
                 if not present:
                     continue
-                self.client.remove(present, second=second)
+                _, remove_end_ns = self.client.remove(present, second=second)
+                if remove_end_ns is None:
+                    raise RuntimeError("non-empty REMOVE returned no completion timestamp")
                 self.removed += len(present)
-                due = second + REWRITE_DELAY_S
-                if due < self.run.timing["end_s"]:
-                    self.pending_rewrite.setdefault(due, []).extend(
-                        key for key in present if (key + self.number) % 2 == 0)
+                rewrite_keys = [key for key in present if (key + self.number) % 2 == 0]
+                due_ns = remove_end_ns + REWRITE_DELAY_S * 1_000_000_000
+                if due_ns < cutoff_ns:
+                    self.pending_rewrite.extend(
+                        {"flat": key, "remove_end_ns": remove_end_ns, "due_ns": due_ns}
+                        for key in rewrite_keys)
                 self.run.sinks["churn"].write({
-                    "second": second, "remover": self.number,
-                    "client": self.client.client_id, "candidates": candidates,
-                    "present_removed": present, "rewrite_due_s": due,
-                    "rewrite_keys": [key for key in present if (key + self.number) % 2 == 0],
+                    "event": "remove_completed", "second": second,
+                    "remover": self.number, "client": self.client.client_id,
+                    "candidates": candidates, "present_removed": present,
+                    "actual_remove_end_ns": remove_end_ns,
+                    "rewrite_due_ns": due_ns, "workload_cutoff_ns": cutoff_ns,
+                    "rewrite_keys": rewrite_keys,
+                    "rewrite_scheduled": due_ns < cutoff_ns,
                 })
         except BaseException as exc:
             self.run.errors.put(f"remover-{self.number}: {type(exc).__name__}: {exc}")
@@ -845,7 +959,8 @@ class VariantRun:
         self.sinks = {
             name: Jsonl(self.root / f"{name}.jsonl")
             for name in ("operations", "per_second", "prefix_results", "timeline",
-                         "metrics", "membership", "processes", "churn")
+                         "metrics", "membership", "processes", "churn",
+                         "memory_coverage")
         }
         self.processes = Processes(self.root, self.sinks["processes"])
         self.operations = OperationLog(self.sinks["operations"], workload)
@@ -863,9 +978,13 @@ class VariantRun:
         self.stats = PerSecond(self.sinks["per_second"], READS_PER_SECOND)
         self.origin_ns = 0
         self.kill_done = False
+        self.kill_confirmed_ns = 0
+        self.restart_begin_ns = 0
         self.restart_done = False
+        self.replacement_port = 0
         self.kill_evidence: dict = {}
         self.restart_evidence: dict = {}
+        self.second_remover_evidence: dict = {}
         self.result: dict[str, Any] = {
             "variant": variant, "acceptance_eligible": not args.smoke,
             "smoke": args.smoke, "timing": timing,
@@ -894,7 +1013,7 @@ class VariantRun:
         rewrite = self.variant in ("ambw", "ambw-old", "ambw-now")
         return {
             "DFKV_RING_ABSENT_GRACE_MS": str(MEMORY_MS if enabled else 0),
-            "DFKV_RING_READBACK_MS": str(MEMORY_MS if enabled else 0),
+            "DFKV_RING_READBACK_MS": str(READBACK_MS if enabled else 0),
             "DFKV_RING_READBACK_REWRITE": "1" if rewrite else "0",
             "DFKV_RING_COOLDOWN_REROUTE": "0",
             "DFKV_RING_REMOVE_FANOUT": "3",
@@ -1075,30 +1194,46 @@ class VariantRun:
 
     def kill_n3(self) -> None:
         started = time.monotonic_ns()
+        target = self.origin_ns + self.timing["kill_s"] * 1_000_000_000
         with self.nodes_lock:
             old = self.nodes[3]
             self.retired_nodes.append(old)
         self.processes.scenario_kill(old.child)
+        self.kill_confirmed_ns = time.monotonic_ns()
         self.kill_done = True
         self.kill_evidence = {
             "planned_second": self.timing["kill_s"], "actual_start_ns": started,
+            "planned_target_ns": target, "start_delay_ns": started - target,
+            "schedule_tolerance_ns": SCHEDULE_TOLERANCE_NS,
+            "within_schedule_tolerance": abs(started - target) <= SCHEDULE_TOLERANCE_NS,
+            "confirmed_kill_ns": self.kill_confirmed_ns,
             "workload_second": (started - self.origin_ns) / 1e9,
             "node": "n3", "returncode": old.child.popen.returncode,
-            "retained_data_dir": str(old.data_dir), "generation": old.generation,
+            "killed_port": old.port, "retained_data_dir": str(old.data_dir),
+            "generation": old.generation,
         }
         self.sinks["timeline"].write({"event": "n3_killed_empty_return_planned",
                                       **self.kill_evidence})
 
     def restart_n3(self) -> None:
         started = time.monotonic_ns()
+        self.restart_begin_ns = started
+        target = self.origin_ns + self.timing["restart_s"] * 1_000_000_000
         replacement = self.start_node(3, 1, "return-empty")
         with self.nodes_lock:
             self.nodes[3] = replacement
+        self.replacement_port = replacement.port
         self.restart_done = True
+        ready_ns = time.monotonic_ns()
         self.restart_evidence = {
             "planned_second": self.timing["restart_s"], "actual_start_ns": started,
+            "planned_target_ns": target, "start_delay_ns": started - target,
+            "schedule_tolerance_ns": SCHEDULE_TOLERANCE_NS,
+            "within_schedule_tolerance": abs(started - target) <= SCHEDULE_TOLERANCE_NS,
+            "restart_begin_ns": started, "replacement_ready_ns": ready_ns,
             "workload_second": (started - self.origin_ns) / 1e9,
             "node": "n3", "generation": replacement.generation,
+            "replacement_port": replacement.port,
             "fresh_empty_data_dir": str(replacement.data_dir),
             "killed_data_dir_retained": self.kill_evidence.get("retained_data_dir"),
             "fresh_directory_distinct": str(replacement.data_dir) != self.kill_evidence.get(
@@ -1138,6 +1273,71 @@ class VariantRun:
             "clients": sorted(expected), "monotonic_ns": time.monotonic_ns(),
         })
 
+    def wait_memory_coverage(self) -> None:
+        required = self.variant != "base"
+        common = {
+            "required": required,
+            "required_seconds": MEMORY_COVERAGE_S if required else 0,
+            "remove_memory_ms": MEMORY_MS,
+            "readback_ms": READBACK_MS if required else 0,
+            "settle_ms": 10 * POLL_MS,
+            "lookback_h_ms": READBACK_MS + 10 * POLL_MS,
+            "smoke": self.args.smoke,
+        }
+        if not required:
+            self.result["memory_coverage"] = {**common, "waited": False,
+                                               "reason": "base has M off"}
+            return
+
+        def sample() -> list[dict]:
+            observed_ns = time.monotonic_ns()
+            rows = []
+            for node in self.node_snapshot():
+                row: dict[str, Any] = {"node": node.node_id,
+                                       "generation": node.generation,
+                                       "key": node.key}
+                try:
+                    text = MetricsCollector.scrape(node.metrics_port)
+                    row["covered_seconds"] = _metric(
+                        text, "dfkv_remove_memory_covered_seconds")
+                except Exception as exc:
+                    row["error"] = str(exc)
+                rows.append(row)
+            self.sinks["memory_coverage"].write({
+                "monotonic_ns": observed_ns, "wall_time": _iso(),
+                "required_seconds": MEMORY_COVERAGE_S, "original_nodes": rows,
+            })
+            return rows
+
+        if self.args.smoke:
+            rows = sample()
+            self.result["memory_coverage"] = {
+                **common, "waited": False, "warmup_bypassed": True,
+                "non_acceptance": True, "original_nodes": rows,
+                "reason": "smoke explicitly skips the 120 s warmup; mechanics only",
+            }
+            return
+
+        latest: list[dict] = []
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            latest = sample()
+            if len(latest) == 8 and all(
+                    row.get("generation") == 0
+                    and row.get("covered_seconds") is not None
+                    and row["covered_seconds"] >= MEMORY_COVERAGE_S
+                    for row in latest):
+                self.result["memory_coverage"] = {
+                    **common, "waited": True, "warmup_bypassed": False,
+                    "ready_monotonic_ns": time.monotonic_ns(),
+                    "ready_before_workload_origin": True,
+                    "original_nodes": latest,
+                }
+                return
+            time.sleep(1.0)
+        raise RuntimeError(
+            f"original nodes did not reach {MEMORY_COVERAGE_S}s real M coverage; last={latest}")
+
     def read_task(self, second: int, prefix: int) -> None:
         result: dict[str, Any] = {}
         try:
@@ -1157,6 +1357,7 @@ class VariantRun:
             self.errors.put(f"reader second={second} prefix={prefix}: {exc}")
         result.update({"second": second, "prefix": prefix,
                        "client": self.reader.client_id if self.reader else ""})
+        result.update(self.stats.start_evidence(second, result.get("start_ns")))
         self.sinks["prefix_results"].write(result)
         self.stats.record(second, result)
 
@@ -1205,14 +1406,18 @@ class VariantRun:
         self.reader = self.open_client("reader", 0)
         remover0_client = self.open_client("remover", 0)
         self.wait_client_gate()
+        self.wait_memory_coverage()
 
+        self.metrics = MetricsCollector(self, 0)
+        self.metrics.capture("baseline")
         self.origin_ns = time.monotonic_ns()
         self.result["workload_origin"] = {
             "monotonic_ns": self.origin_ns, "wall_time_ns": time.time_ns(),
-            "wall_time": _iso(),
+            "wall_time": _iso(), "stamped_after_baseline_capture": True,
         }
-        self.metrics = MetricsCollector(self, self.origin_ns)
-        self.metrics.capture("baseline")
+        self.metrics.origin_ns = self.origin_ns
+        self.stats.configure(self.origin_ns, self.timing["end_s"])
+        self.result["schedule_tolerance_ns"] = SCHEDULE_TOLERANCE_NS
         self.metrics.start()
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=READS_PER_SECOND, thread_name_prefix="case5-reader")
@@ -1230,13 +1435,25 @@ class VariantRun:
             if second == self.timing["restart_s"]:
                 self.restart_n3()
             if second == self.timing["second_remover_s"]:
+                started_ns = time.monotonic_ns()
+                target_ns = self.origin_ns + second * 1_000_000_000
                 client = self.open_client("remover", 1)
                 remover1 = Remover(self, client, 1, second)
                 self.removers.append(remover1)
                 remover1.start()
+                ready_ns = time.monotonic_ns()
+                self.second_remover_evidence = {
+                    "planned_second": second, "actual_start_ns": started_ns,
+                    "planned_target_ns": target_ns, "start_delay_ns": started_ns - target_ns,
+                    "ready_ns": ready_ns,
+                    "schedule_tolerance_ns": SCHEDULE_TOLERANCE_NS,
+                    "within_schedule_tolerance": (
+                        abs(started_ns - target_ns) <= SCHEDULE_TOLERANCE_NS),
+                    "client": client.client_id,
+                }
                 self.sinks["timeline"].write({
                     "event": "fresh_second_remover_started", "second": second,
-                    "client": client.client_id, "monotonic_ns": time.monotonic_ns(),
+                    "client": client.client_id, **self.second_remover_evidence,
                 })
             assert self.executor is not None
             for prefix in Workload.indices("reader", second, READS_PER_SECOND, PREFIXES):
@@ -1250,7 +1467,7 @@ class VariantRun:
         self.metrics.stop_and_join()
         self.metrics.capture("final")
         self._final_captured = True
-        self.metrics.poll_ring()
+        self.metrics.poll_ring(final=True)
         self._collect_results()
 
     def _collect_results(self) -> None:
@@ -1273,19 +1490,48 @@ class VariantRun:
             }
         self.result["kill_evidence"] = self.kill_evidence
         self.result["restart_evidence"] = self.restart_evidence
+        self.result["second_remover_evidence"] = self.second_remover_evidence
+        self.result["timeline_evidence"] = {
+            "tolerance_ns": SCHEDULE_TOLERANCE_NS,
+            "kill": self.kill_evidence,
+            "restart": self.restart_evidence,
+            "second_remover": self.second_remover_evidence,
+            "all_within_tolerance": all(
+                event.get("within_schedule_tolerance") is True
+                for event in (self.kill_evidence, self.restart_evidence,
+                              self.second_remover_evidence)),
+        }
+        assert self.metrics is not None
+        membership_chain = (
+            self.kill_confirmed_ns > 0 and self.metrics.absent_ns > 0
+            and self.restart_begin_ns > 0 and self.metrics.replacement_eligible_ns > 0
+            and self.metrics.final_ring_ns > 0
+            and self.kill_confirmed_ns <= self.metrics.absent_ns < self.restart_begin_ns
+            < self.metrics.replacement_eligible_ns <= self.metrics.final_ring_ns
+            and self.metrics.final_replacement_eligible)
         self.result["membership_evidence"] = {
             "real_etcd_lease_expiry_required": True,
-            "n3_absent_observed_after_kill": self.metrics.saw_n3_absent_after_kill
-                if self.metrics else False,
-            "n3_return_observed": self.metrics.saw_n3_return if self.metrics else False,
+            "proof": "ordered MDS observations on confirmed-kill/replacement-port/final-ring timestamps",
+            "confirmed_kill_ns": self.kill_confirmed_ns,
+            "n3_absent_ns_before_restart": self.metrics.absent_ns,
+            "n3_absence": self.metrics.absence_record,
+            "restart_begin_ns": self.restart_begin_ns,
+            "replacement_port": self.replacement_port,
+            "replacement_eligible_ns": self.metrics.replacement_eligible_ns,
+            "replacement_eligible_member": self.metrics.replacement_eligible_member,
+            "final_ring_ns": self.metrics.final_ring_ns,
+            "final_replacement_eligible": self.metrics.final_replacement_eligible,
+            "final_replacement_member": self.metrics.final_replacement_member,
+            "transitions": self.metrics.transitions,
+            "chain_valid": membership_chain,
         }
         self.result["churn"] = {
             "removers": [{"client": remover.client.client_id,
                           "start_second": remover.start_second,
                           "removed": remover.removed,
                           "rewritten": remover.rewritten,
-                          "pending_rewrite_not_run_after_end": sum(
-                              map(len, remover.pending_rewrite.values()))}
+                          "pending_rewrite_not_run_after_end": len(remover.pending_rewrite),
+                          "pending_rewrite_deadlines": remover.pending_rewrite}
                          for remover in self.removers]
         }
         assert self.metrics is not None
@@ -1326,6 +1572,7 @@ class VariantRun:
             "prefix_results": "prefix_results.jsonl", "timeline": "timeline.jsonl",
             "metrics": "metrics.jsonl and metrics/*.prom",
             "membership": "membership.jsonl", "processes": "processes.jsonl",
+            "memory_coverage": "memory_coverage.jsonl",
             "logs": "logs/ (retained, including killed n3)",
             "killed_n3_data": self.kill_evidence.get("retained_data_dir"),
             "returned_n3_data": self.restart_evidence.get("fresh_empty_data_dir"),
@@ -1419,9 +1666,12 @@ def check_operations(path: Path) -> dict:
     conservatively treated as ending at +infinity.  Such incomplete evidence
     is separately reported and prevents acceptance.
     """
-    opens: dict[int, list[tuple[str, bytes, str, int, int | None]]] = {}
+    opens: dict[tuple[int, bytes], tuple[str, str, int, int | None]] = {}
+    seen_starts: set[tuple[int, bytes]] = set()
+    evidence_errors: list[dict] = []
     history: dict[bytes, dict[str, list]] = {}
     events = 0
+    matched = 0
     for raw in path.open(encoding="utf-8"):
         if not raw:
             continue
@@ -1430,17 +1680,38 @@ def check_operations(path: Path) -> dict:
         key = event["key"].encode()
         attempt = int(event["attempt"])
         op = event["op"]
+        identity = (attempt, key)
         if event["event"] == "start":
-            opens.setdefault(attempt, []).append(
-                (op, key, event["phase"], int(event["start_ns"]), event.get("second")))
+            if identity in seen_starts:
+                evidence_errors.append({
+                    "type": "duplicate_start", "attempt": attempt,
+                    "key": key.decode(), "op": op,
+                    "start_ns": int(event["start_ns"]),
+                })
+                continue
+            seen_starts.add(identity)
+            opens[identity] = (op, event["phase"], int(event["start_ns"]),
+                               event.get("second"))
             continue
-        if event["event"] != "end" or attempt not in opens:
+        if event["event"] != "end":
+            evidence_errors.append({"type": "unknown_operation_event",
+                                    "attempt": attempt, "key": key.decode(),
+                                    "event": event["event"]})
             continue
-        start_op, start_key, phase, start_ns, second = opens[attempt].pop(0)
-        if not opens[attempt]:
-            del opens[attempt]
-        if start_op != op or start_key != key:
-            raise RuntimeError(f"operation {attempt} start/end identity mismatch")
+        if identity not in opens:
+            evidence_errors.append({
+                "type": "orphan_end", "attempt": attempt, "key": key.decode(),
+                "op": op, "end_ns": int(event["end_ns"]),
+            })
+            continue
+        start_op, phase, start_ns, second = opens.pop(identity)
+        if start_op != op:
+            evidence_errors.append({
+                "type": "start_end_op_mismatch", "attempt": attempt,
+                "key": key.decode(), "start_op": start_op, "end_op": op,
+            })
+            continue
+        matched += 1
         item = history.setdefault(key, {"GET": [], "PUT": [], "REMOVE": []})
         if op in item and phase == "workload":
             item[op].append({
@@ -1450,15 +1721,13 @@ def check_operations(path: Path) -> dict:
                 "payload_correct": event.get("payload_correct"),
             })
     incomplete = [{"attempt": attempt, "op": op, "key": key.decode(), "phase": phase}
-                  for attempt, entries in opens.items()
-                  for op, key, phase, _, _ in entries]
-    for attempt, entries in opens.items():
-        for op, key, phase, start_ns, second in entries:
-            if op == "PUT" and phase == "workload":
-                history.setdefault(key, {"GET": [], "PUT": [], "REMOVE": []})["PUT"].append({
-                    "attempt": attempt, "start_ns": start_ns, "end_ns": None,
-                    "second": second, "unknown_end_conservative": True,
-                })
+                  for (attempt, key), (op, phase, _, _) in opens.items()]
+    for (attempt, key), (op, phase, start_ns, second) in opens.items():
+        if op == "PUT" and phase == "workload":
+            history.setdefault(key, {"GET": [], "PUT": [], "REMOVE": []})["PUT"].append({
+                "attempt": attempt, "start_ns": start_ns, "end_ns": None,
+                "second": second, "unknown_end_conservative": True,
+            })
     violations = []
     checked_hits = 0
     for key, item in history.items():
@@ -1481,8 +1750,12 @@ def check_operations(path: Path) -> dict:
                 violations.append({"type": "removed_value_hit", "key": key.decode(),
                                    "remove": remove, "read": read})
     return {
-        "events": events, "checked_hit_reads": checked_hits,
+        "events": events, "matched_attempt_key_pairs": matched,
+        "checked_hit_reads": checked_hits,
         "violations": violations, "violation_count": len(violations),
+        "evidence_errors": evidence_errors,
+        "evidence_error_count": len(evidence_errors),
+        "pairing_identity": "(attempt,key); duplicate starts and orphan ends are errors",
         "incomplete_attempts": incomplete, "incomplete_attempt_count": len(incomplete),
         "rule": "latest REMOVE by start with end<read.start; violation iff no workload PUT has end>REMOVE.start and start<read.end; unknown PUT end=+infinity",
         "initial_and_cleanup_excluded": True,
@@ -1511,6 +1784,10 @@ def selected_checks(result: dict, smoke: bool) -> None:
     add_check(result, "complete_operation_intervals",
               correctness.get("incomplete_attempt_count") == 0,
               correctness.get("incomplete_attempts", [])[:3])
+    add_check(result, "operation_identity_evidence_clean",
+              correctness.get("evidence_error_count") == 0,
+              {"count": correctness.get("evidence_error_count"),
+               "first": correctness.get("evidence_errors", [])[:3]})
     coverage_windows = [result.get("core", {}).get("whole_run", {})] if smoke else list(
         result.get("core", {}).values())
     full_coverage = all(window.get("complete") and not window.get("errors")
@@ -1524,11 +1801,34 @@ def selected_checks(result: dict, smoke: bool) -> None:
               and restart.get("node") == "n3"
               and restart.get("fresh_directory_distinct") is True,
               {"kill": kill, "restart": restart})
-    if not smoke:
-        member = result.get("membership_evidence", {})
-        add_check(result, "real_etcd_absence_and_return_observed",
-                  member.get("n3_absent_observed_after_kill") is True
-                  and member.get("n3_return_observed") is True, member)
+    timeline = result.get("timeline_evidence", {})
+    add_check(result, "kill_return_second_remover_within_schedule_tolerance",
+              timeline.get("all_within_tolerance") is True
+              and timeline.get("tolerance_ns") == SCHEDULE_TOLERANCE_NS,
+              timeline)
+    member = result.get("membership_evidence", {})
+    add_check(result, "ordered_absence_replacement_port_and_final_membership",
+              member.get("chain_valid") is True, member)
+    coverage = result.get("memory_coverage", {})
+    if variant != "base":
+        if smoke:
+            add_check(result, "smoke_memory_warmup_bypass_is_explicitly_non_acceptance",
+                      coverage.get("warmup_bypassed") is True
+                      and coverage.get("non_acceptance") is True
+                      and coverage.get("required_seconds") == MEMORY_COVERAGE_S,
+                      coverage)
+        else:
+            original_ready = coverage.get("original_nodes", [])
+            add_check(result, "original_nodes_have_full_real_memory_coverage_before_origin",
+                      coverage.get("waited") is True
+                      and coverage.get("warmup_bypassed") is False
+                      and len(original_ready) == 8
+                      and all(row.get("generation") == 0
+                              and (row.get("covered_seconds") or 0) >= MEMORY_COVERAGE_S
+                              for row in original_ready)
+                      and coverage.get("ready_monotonic_ns", 0)
+                      <= result.get("workload_origin", {}).get("monotonic_ns", 0),
+                      coverage)
     metrics = result.get("metrics", {})
     add_check(result, "authoritative_final_and_killed_generation_metrics",
               metrics.get("final_capture_complete") is True
@@ -1733,8 +2033,8 @@ def main(argv: list[str] | None = None) -> int:
     args.lib_handle = load_library(args.lib)
     version = args.lib_handle.dfkv_version()
     workload = Workload()
-    timing = ({"kill_s": 6, "restart_s": 11, "end_s": 16,
-               "down_s": 5, "post_return_s": 5, "second_remover_s": 8}
+    timing = ({"kill_s": 3, "restart_s": 48, "end_s": 58,
+               "down_s": 45, "post_return_s": 10, "second_remover_s": 25}
               if args.smoke else
               {"kill_s": 60, "restart_s": 150, "end_s": 240,
                "down_s": 90, "post_return_s": 90, "second_remover_s": 90})
