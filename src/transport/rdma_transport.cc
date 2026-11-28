@@ -1531,16 +1531,6 @@ void RdmaTransport::InvalidateCapabilities(const std::string& node,
     peer_capabilities_.erase(found);
 }
 
-void RdmaTransport::NoteNegotiatedDepth(const std::string& node, Lane lane,
-                                        uint16_t remote_depth) {
-  if (remote_depth == 0) return;
-  std::lock_guard<std::mutex> lk(depth_mu_);
-  auto& map =
-      lane == Lane::kControl ? learned_control_depth_ : learned_data_depth_;
-  const auto it = map.find(node);
-  if (it == map.end() || remote_depth < it->second) map[node] = remote_depth;
-}
-
 bool RdmaTransport::SessionClosed(const Conn& conn) {
   if (conn.session_fd < 0) return false;
   char byte;

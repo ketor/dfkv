@@ -197,4 +197,14 @@ uint16_t RdmaTransport::LearnedDepth(const std::string& node, Lane lane) {
   return it == map.end() ? full : std::min(full, it->second);
 }
 
+void RdmaTransport::NoteNegotiatedDepth(const std::string& node, Lane lane,
+                                        uint16_t remote_depth) {
+  if (remote_depth == 0) return;
+  std::lock_guard<std::mutex> lk(depth_mu_);
+  auto& map =
+      lane == Lane::kControl ? learned_control_depth_ : learned_data_depth_;
+  const auto it = map.find(node);
+  if (it == map.end() || remote_depth < it->second) map[node] = remote_depth;
+}
+
 }  // namespace dfkv
