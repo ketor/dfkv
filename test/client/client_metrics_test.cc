@@ -478,6 +478,7 @@ TEST(ClientMetrics, CountsServedErrorsTransitionsAndRenders) {
 
   std::string t = h.Render();
   EXPECT_NE(t.find("dfkv_client_ops_served_total 2"), std::string::npos) << t;
+  EXPECT_NE(t.find("dfkv_client_health_checks_total 2"), std::string::npos) << t;
   EXPECT_NE(t.find("dfkv_client_io_errors_total 1"), std::string::npos) << t;
   EXPECT_NE(t.find("dfkv_client_unhealthy_skips_total 1"), std::string::npos) << t;
   EXPECT_NE(t.find("dfkv_client_peer_marked_bad_total 1"), std::string::npos) << t;

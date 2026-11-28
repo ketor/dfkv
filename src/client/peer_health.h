@@ -99,8 +99,12 @@ class PeerHealth {
   // or MarkBad; for a peer whose cooldown has just ended the caller is the one
   // trial (see above).
   bool Healthy(const std::string& peer, uint64_t now_ms) const {
-    std::lock_guard<std::mutex> lk(mu_);
     checks_.fetch_add(1, std::memory_order_relaxed);
+    // With no cooldowns there is no shared map state to inspect or update.
+    // Use the same empty-map gate as Cooling; any recorded cooldown takes the
+    // mutex below, which preserves admission of the single recovery trial.
+    if (until_count_.load(std::memory_order_relaxed) == 0) return true;
+    std::lock_guard<std::mutex> lk(mu_);
     auto it = until_.find(peer);
     if (it == until_.end()) return true;
     if (it->second <= now_ms) {
