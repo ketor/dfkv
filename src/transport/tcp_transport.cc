@@ -192,7 +192,7 @@ void TcpTransport::RetireIdleLocked(NodePool* pool, Clock::time_point now) {
   }
 }
 
-bool TcpTransport::Acquire(const std::string& node, Lease* lease) {
+Status TcpTransport::Acquire(const std::string& node, Lease* lease) {
   const auto deadline =
       Clock::now() + std::chrono::milliseconds(options_.acquire_timeout_ms);
   for (;;) {
@@ -219,7 +219,7 @@ bool TcpTransport::Acquire(const std::string& node, Lease* lease) {
         lease->started = now;
         pool_inflight_.fetch_add(1, std::memory_order_relaxed);
         pool_selections_.fetch_add(1, std::memory_order_relaxed);
-        return true;
+        return Status::kOk;
       }
 
       if (pool.connections.size() + pool.creating <
@@ -230,9 +230,9 @@ bool TcpTransport::Acquire(const std::string& node, Lease* lease) {
       } else {
         if (pool.connections.empty() && now < pool.backoff_until) {
           pool_backoff_suppressed_.fetch_add(1, std::memory_order_relaxed);
-          return false;
+          return Status::kIOError;
         }
-        if (now >= deadline) return false;
+        if (now >= deadline) return Status::kResourceExhausted;
         auto wake = deadline;
         if (now < pool.backoff_until)
           wake = std::min(wake, pool.backoff_until);
@@ -267,8 +267,8 @@ bool TcpTransport::Acquire(const std::string& node, Lease* lease) {
       }
     }
     cv_.notify_all();
-    if (fd >= 0) return true;
-    if (empty_after_failure) return false;
+    if (fd >= 0) return Status::kOk;
+    if (empty_after_failure) return Status::kIOError;
   }
 }
 
@@ -318,7 +318,8 @@ Status TcpTransport::RoundTrip(const std::string& node, WireOp op,
   // starts endpoint dial backoff and is returned immediately.
   for (int attempt = 0; attempt < 2; ++attempt) {
     Lease lease;
-    if (!Acquire(node, &lease)) return Status::kIOError;
+    const Status acquired = Acquire(node, &lease);
+    if (acquired != Status::kOk) return acquired;
     Status st = Status::kIOError;
     if (OneShot(lease.connection->fd, op, k, offset, length, payload,
                 payload_len, &st, out, max_data, value_len)) {
@@ -338,7 +339,8 @@ Status TcpTransport::RoundTripInto(const std::string& node,
                                    uint64_t* value_len, bool exact) {
   for (int attempt = 0; attempt < 2; ++attempt) {
     Lease lease;
-    if (!Acquire(node, &lease)) return Status::kIOError;
+    const Status acquired = Acquire(node, &lease);
+    if (acquired != Status::kOk) return acquired;
     Status st = Status::kIOError;
     if (OneShotInto(lease.connection->fd, key, offset, length, dst, dst_cap,
                     &st, value_len, exact)) {

@@ -63,6 +63,120 @@ int UnusedLoopbackPort() {
   ::close(fd);
   return port;
 }
+
+// A real keep-alive TCP peer whose valid Range replies are released explicitly
+// after each complete request arrives. This makes pool occupancy deterministic
+// without delaying or replacing any transport code under test.
+class GatedRangeServer {
+ public:
+  GatedRangeServer() {
+    lfd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(lfd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+      return;
+    if (::listen(lfd_, 4) != 0) return;
+    socklen_t len = sizeof(addr);
+    if (::getsockname(lfd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
+      return;
+    port_ = ntohs(addr.sin_port);
+    thread_ = std::thread([this] { Serve(); });
+  }
+
+  ~GatedRangeServer() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      stopping_ = true;
+    }
+    cv_.notify_all();
+    if (lfd_ >= 0) {
+      ::shutdown(lfd_, SHUT_RDWR);
+      ::close(lfd_);
+    }
+    {
+      std::lock_guard<std::mutex> lk(connection_mu_);
+      if (fd_ >= 0) ::shutdown(fd_, SHUT_RDWR);
+    }
+    if (thread_.joinable()) thread_.join();
+    if (fd_ >= 0) ::close(fd_);
+  }
+
+  int port() const { return port_; }
+
+  bool WaitForRequest(size_t count) {
+    std::unique_lock<std::mutex> lk(mu_);
+    return cv_.wait_for(lk, std::chrono::seconds(5),
+                        [&] { return requests_ >= count || stopping_; }) &&
+           requests_ >= count;
+  }
+
+  void ReleaseNext() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++releases_;
+    }
+    cv_.notify_all();
+  }
+
+  size_t RequestCount() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return requests_;
+  }
+
+ private:
+  void Serve() {
+    const int accepted = ::accept(lfd_, nullptr, nullptr);
+    if (accepted < 0) return;
+    {
+      std::lock_guard<std::mutex> lk(connection_mu_);
+      std::lock_guard<std::mutex> state_lk(mu_);
+      if (stopping_) {
+        ::close(accepted);
+        return;
+      }
+      fd_ = accepted;
+    }
+
+    for (;;) {
+      char prefix[kReqPrefix];
+      if (!net::ReadAll(accepted, prefix, kReqPrefix)) return;
+      ReqFields request;
+      if (!DecodeReq(prefix, &request) ||
+          request.op != static_cast<uint8_t>(WireOp::kRange) ||
+          request.payload_len != 0)
+        return;
+
+      size_t number = 0;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        number = ++requests_;
+        cv_.notify_all();
+        cv_.wait(lk, [&] { return stopping_ || releases_ >= number; });
+        if (stopping_) return;
+      }
+
+      const std::string body(request.length, 'r');
+      char response[kRespPrefix];
+      EncodeResp(response, Status::kOk, body.size(), body.size());
+      if (!net::WriteAll(accepted, response, kRespPrefix) ||
+          !net::WriteAll(accepted, body.data(), body.size()))
+        return;
+    }
+  }
+
+  int lfd_ = -1;
+  int port_ = 0;
+  int fd_ = -1;
+  std::thread thread_;
+  mutable std::mutex mu_;
+  std::mutex connection_mu_;
+  std::condition_variable cv_;
+  size_t requests_ = 0;
+  size_t releases_ = 0;
+  bool stopping_ = false;
+};
 }  // namespace
 
 TEST(ConnectionPool, SequentialRequestsReuseOneConnection) {
@@ -313,6 +427,107 @@ TEST(ConnectionPool, IdleConnectionsRetireDownToTheWarmMinimum) {
           "dfkv_transport_pool_retirements_total{reason=\"idle\"}"),
       accepts_after_burst - options.min_connections);
   n->srv->Stop();
+}
+
+TEST(ConnectionPool, AcquireDeadlineIsLocalResourceExhaustionForBothReadShapes) {
+  GatedRangeServer server;
+  const std::string node = "127.0.0.1:" + std::to_string(server.port());
+  EndpointPoolOptions options;
+  options.max_connections = 1;
+  options.acquire_timeout_ms = 200;
+  TcpTransport t(options);
+  t.set_timeouts(1000, 5000);
+  const BlockKey key = ToBlockKey("test/model", "acquire-deadline");
+  const std::string expected(16, 'r');
+
+  Status held_status = Status::kIOError;
+  std::string held_out;
+  std::thread held([&] {
+    held_status = t.Range(node, key, 0, expected.size(), &held_out);
+  });
+  const bool string_request_received = server.WaitForRequest(1);
+  EXPECT_TRUE(string_request_received);
+  Status string_deadline_status = Status::kIOError;
+  auto started = std::chrono::steady_clock::now();
+  if (string_request_received) {
+    std::string blocked_out;
+    string_deadline_status = t.Range(node, key, 0, expected.size(), &blocked_out);
+  }
+  const auto string_wait = std::chrono::steady_clock::now() - started;
+  EXPECT_EQ(server.RequestCount(), 1u);
+  EXPECT_EQ(MetricValue(t.MetricsText(), "dfkv_transport_pool_inflight"), 1u);
+  server.ReleaseNext();
+  held.join();
+  ASSERT_TRUE(string_request_received);
+  EXPECT_EQ(string_deadline_status, Status::kResourceExhausted);
+  EXPECT_GE(string_wait, std::chrono::milliseconds(200));
+  EXPECT_EQ(held_status, Status::kOk);
+  EXPECT_EQ(held_out, expected);
+
+  Status held_into_status = Status::kIOError;
+  std::string held_into_out(expected.size(), '!');
+  std::vector<uint64_t> held_into_lengths;
+  std::thread held_into([&] {
+    const auto statuses = t.RangeInto(
+        node, {key}, {RangeDst{held_into_out.data(), held_into_out.size()}},
+        &held_into_lengths);
+    if (statuses.size() == 1) held_into_status = statuses[0];
+  });
+  const bool into_request_received = server.WaitForRequest(2);
+  EXPECT_TRUE(into_request_received);
+  std::vector<Status> into_deadline_statuses;
+  std::vector<uint64_t> into_deadline_lengths;
+  std::string into_deadline_out(expected.size(), '!');
+  started = std::chrono::steady_clock::now();
+  if (into_request_received) {
+    into_deadline_statuses = t.RangeInto(
+        node, {key},
+        {RangeDst{into_deadline_out.data(), into_deadline_out.size()}},
+        &into_deadline_lengths);
+  }
+  const auto into_wait = std::chrono::steady_clock::now() - started;
+  EXPECT_EQ(server.RequestCount(), 2u);
+  server.ReleaseNext();
+  held_into.join();
+  ASSERT_TRUE(into_request_received);
+  ASSERT_EQ(into_deadline_statuses.size(), 1u);
+  EXPECT_EQ(into_deadline_statuses[0], Status::kResourceExhausted);
+  EXPECT_GE(into_wait, std::chrono::milliseconds(200));
+  ASSERT_EQ(into_deadline_lengths.size(), 1u);
+  EXPECT_EQ(into_deadline_lengths[0], 0u);
+  EXPECT_EQ(into_deadline_out, std::string(expected.size(), '!'));
+  EXPECT_EQ(held_into_status, Status::kOk);
+  ASSERT_EQ(held_into_lengths.size(), 1u);
+  EXPECT_EQ(held_into_lengths[0], expected.size());
+  EXPECT_EQ(held_into_out, expected);
+
+  Status recovery_status = Status::kIOError;
+  std::string recovery_out;
+  std::thread recovery([&] {
+    recovery_status = t.Range(node, key, 0, expected.size(), &recovery_out);
+  });
+  const bool recovery_request_received = server.WaitForRequest(3);
+  EXPECT_TRUE(recovery_request_received);
+  server.ReleaseNext();
+  recovery.join();
+  ASSERT_TRUE(recovery_request_received);
+  EXPECT_EQ(recovery_status, Status::kOk);
+  EXPECT_EQ(recovery_out, expected);
+  EXPECT_EQ(server.RequestCount(), 3u);
+
+  const std::string metrics = t.MetricsText();
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_connections"), 1u);
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_inflight"), 0u);
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_selections_total"), 3u);
+  EXPECT_EQ(MetricValue(
+                metrics,
+                "dfkv_transport_pool_retirements_total{reason=\"error\"}"),
+            0u);
+  EXPECT_EQ(MetricValue(metrics, "dfkv_transport_pool_backoff_events_total"),
+            0u);
+  EXPECT_EQ(
+      MetricValue(metrics, "dfkv_transport_pool_backoff_suppressed_total"),
+      0u);
 }
 
 TEST(ConnectionPool, FailedDialEntersBackoffAndSuppressesImmediateRetry) {

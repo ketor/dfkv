@@ -95,7 +95,7 @@ class TcpTransport : public Transport {
                        uint64_t offset, uint64_t length, void* dst,
                        size_t dst_cap, uint64_t* value_len,
                        bool exact = false);
-  bool Acquire(const std::string& node, Lease* lease);
+  Status Acquire(const std::string& node, Lease* lease);
   void Complete(const std::string& node, Lease lease, bool healthy,
                 bool apply_backoff);
   void RetireIdleLocked(NodePool* pool, Clock::time_point now);
