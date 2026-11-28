@@ -188,4 +188,13 @@ size_t RdmaTransport::ConnectionDepth(const std::string& node, Lane lane,
   return depth_class < wanted ? learned : std::min(depth_class, learned);
 }
 
+uint16_t RdmaTransport::LearnedDepth(const std::string& node, Lane lane) {
+  const uint16_t full = static_cast<uint16_t>(std::min<size_t>(depth_, 256));
+  std::lock_guard<std::mutex> lk(depth_mu_);
+  const auto& map =
+      lane == Lane::kControl ? learned_control_depth_ : learned_data_depth_;
+  const auto it = map.find(node);
+  return it == map.end() ? full : std::min(full, it->second);
+}
+
 }  // namespace dfkv
